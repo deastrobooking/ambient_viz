@@ -130,6 +130,67 @@
     z-index: 5;
   }
   #drop-overlay.active { opacity: 1; }
+  #dev-overlay {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    width: 230px;
+    background: rgba(0,0,0,0.78);
+    border: 1px solid #444;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #ddd;
+    z-index: 20;
+    user-select: none;
+  }
+  #dev-overlay.hidden { display: none; }
+  #dev-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 8px 5px 10px;
+    background: rgba(255,255,255,0.05);
+    cursor: move;
+    border-bottom: 1px solid #333;
+    text-transform: lowercase;
+    letter-spacing: 0.05em;
+    color: #aaa;
+    touch-action: none;
+  }
+  #dev-close {
+    background: transparent;
+    border: none;
+    color: #888;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  #dev-close:hover { color: #fff; }
+  #dev-body { padding: 4px 10px; }
+  .dev-section {
+    padding: 4px 0;
+    border-bottom: 1px solid #222;
+  }
+  .dev-section:last-child { border-bottom: none; }
+  .dev-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .dev-row .k { color: #777; flex: 0 0 auto; min-width: 80px; }
+  .dev-row .v { color: #ddd; flex: 1; text-align: right; }
+  .dev-swatch {
+    width: 12px;
+    height: 12px;
+    border: 1px solid #555;
+    border-radius: 2px;
+    display: inline-block;
+    flex: 0 0 auto;
+  }
 </style>
 </head>
 <body>
@@ -152,6 +213,37 @@
     <button id="mic">mic</button>
     <button id="playpause" disabled>play</button>
     <span id="status">no audio</span>
+  </div>
+</div>
+<div id="dev-overlay">
+  <div id="dev-header">
+    <span>debug</span>
+    <button id="dev-close" type="button" aria-label="close">×</button>
+  </div>
+  <div id="dev-body">
+    <div class="dev-section">
+      <div class="dev-row"><span class="k">tint</span><span class="dev-swatch" id="dev-tint-sw"></span><span class="v" id="dev-tint">0,0,0</span></div>
+      <div class="dev-row"><span class="k">target</span><span class="dev-swatch" id="dev-target-sw"></span><span class="v" id="dev-target">— [0]</span></div>
+      <div class="dev-row"><span class="k">kicks</span><span class="v" id="dev-kicks">0/0</span></div>
+    </div>
+    <div class="dev-section">
+      <div class="dev-row"><span class="k">bass</span><span class="v" id="dev-bass">0.00</span></div>
+      <div class="dev-row"><span class="k">bassFast</span><span class="v" id="dev-bf">0.00</span></div>
+      <div class="dev-row"><span class="k">mid</span><span class="v" id="dev-mid">0.00</span></div>
+      <div class="dev-row"><span class="k">treble</span><span class="v" id="dev-treble">0.00</span></div>
+      <div class="dev-row"><span class="k">level</span><span class="v" id="dev-level">0.00</span></div>
+      <div class="dev-row"><span class="k">bassPulse</span><span class="v" id="dev-bp">0.00</span></div>
+      <div class="dev-row"><span class="k">bassDev</span><span class="v" id="dev-bd">0.00</span></div>
+    </div>
+    <div class="dev-section">
+      <div class="dev-row"><span class="k">slices</span><span class="v" id="dev-slices">0</span></div>
+      <div class="dev-row"><span class="k">bars inv/mono</span><span class="v" id="dev-bars">0/0</span></div>
+      <div class="dev-row"><span class="k">slice angle</span><span class="v" id="dev-slice-ang">0°</span></div>
+      <div class="dev-row"><span class="k">freeze</span><span class="v" id="dev-freeze">0</span></div>
+    </div>
+    <div class="dev-section">
+      <div class="dev-row"><span class="k">fps</span><span class="v" id="dev-fps">--</span></div>
+    </div>
   </div>
 </div>
 
@@ -205,6 +297,12 @@
   let analyser = null;
   let freqData = null;
   let timeData = null;
+  // Parallel analyser with low smoothing — used only for transient (kick)
+  // detection. The main `analyser` smooths heavily (0.85) for visual
+  // stability, which flattens kick attacks below the slice trigger
+  // threshold during sustained loud passages. This one preserves them.
+  let transientAnalyser = null;
+  let transientFreqData = null;
   let currentSource = null;     // MediaElementSource or MediaStreamSource
   let currentEl = null;         // HTMLAudioElement when in file mode
   let micStream = null;
@@ -217,6 +315,10 @@
       analyser.smoothingTimeConstant = 0.85;
       freqData = new Uint8Array(analyser.frequencyBinCount);
       timeData = new Uint8Array(analyser.fftSize);
+      transientAnalyser = audioCtx.createAnalyser();
+      transientAnalyser.fftSize = 1024;          // smaller window = faster response
+      transientAnalyser.smoothingTimeConstant = 0.3;
+      transientFreqData = new Uint8Array(transientAnalyser.frequencyBinCount);
     }
     if (audioCtx.state === 'suspended') audioCtx.resume();
   }
@@ -244,6 +346,7 @@
     currentEl = audio;
     const src = audioCtx.createMediaElementSource(audio);
     src.connect(analyser);
+    src.connect(transientAnalyser);
     analyser.connect(audioCtx.destination);
     currentSource = src;
     statusEl.textContent = file.name;
@@ -326,6 +429,7 @@
       });
       const src = audioCtx.createMediaStreamSource(micStream);
       src.connect(analyser);
+      src.connect(transientAnalyser);
       // do NOT connect mic to destination — would feedback
       currentSource = src;
       statusEl.textContent = 'mic';
@@ -373,33 +477,94 @@
   // --- audio band extraction ---
   // returns 0..1 averaged energies over coarse bands
   function bands() {
-    if (!analyser) return { bass: 0, mid: 0, treble: 0, level: 0 };
+    if (!analyser) return { bass: 0, mid: 0, treble: 0, level: 0, bassFast: 0 };
     analyser.getByteFrequencyData(freqData);
     const n = freqData.length;
     // analyser bins map linearly to 0..nyquist; for 48k sample rate that's 0..24k, bin = index/n * nyquist
     const sr = audioCtx.sampleRate;
     const nyq = sr / 2;
-    function avgRange(loHz, hiHz) {
-      const lo = Math.max(0, Math.floor(loHz / nyq * n));
-      const hi = Math.min(n, Math.ceil(hiHz / nyq * n));
+    function avgRange(data, dataN, loHz, hiHz) {
+      const lo = Math.max(0, Math.floor(loHz / nyq * dataN));
+      const hi = Math.min(dataN, Math.ceil(hiHz / nyq * dataN));
       let s = 0, c = 0;
-      for (let i = lo; i < hi; i++) { s += freqData[i]; c++; }
+      for (let i = lo; i < hi; i++) { s += data[i]; c++; }
       return c ? s / c / 255 : 0;
     }
-    const bass = avgRange(20, 200);
-    const mid = avgRange(200, 2000);
-    const treble = avgRange(2000, 12000);
+    const bass = avgRange(freqData, n, 20, 200);
+    const mid = avgRange(freqData, n, 200, 2000);
+    const treble = avgRange(freqData, n, 2000, 12000);
     let level = 0;
     for (let i = 0; i < n; i++) level += freqData[i];
     level = level / n / 255;
-    return { bass, mid, treble, level };
+    let bassFast = 0;
+    if (transientAnalyser) {
+      transientAnalyser.getByteFrequencyData(transientFreqData);
+      bassFast = avgRange(transientFreqData, transientFreqData.length, 20, 200);
+    }
+    return { bass, mid, treble, level, bassFast };
   }
+
+  // --- car silhouette ---
+  // Auto-generated from irocz.svg by preprocess.js. 47 subpaths of flattened
+  // polylines, normalized so the longest axis spans [-0.5, 0.5]. The flyout
+  // layer renders this with even-odd fill so the inner cutouts (windshield,
+  // headlights, grille slots) read as holes.
+  const CAR_ASPECT = 1.4755;
+  const CAR_SUBPATHS = [
+    [-0.2963,0.3389,-0.4688,0.3324,-0.4886,0.3189,-0.4932,0.3083,-0.4958,0.3032,-0.4996,0.2805,-0.4875,0.0143,-0.4827,0.0258,-0.4793,0.0465,-0.4759,0.0469,-0.4589,0.053,-0.4441,0.056,-0.4349,0.0563,-0.2669,0.0693,0.0885,0.0682,0.3704,0.0641,0.4171,0.0604,0.435,0.0541,0.4396,0.054,0.4455,0.0562,0.4779,0.038,0.4794,0.0411,0.4848,0.1498,0.4892,0.2858,0.4852,0.3091,0.4758,0.3232,0.4588,0.3329,0.4209,0.3377,-0.2963,0.3389],
+    [-0.3476,0.2975,-0.3433,0.247,-0.3462,0.2566,-0.3526,0.3009,-0.3525,0.3056,-0.3476,0.2975],
+    [0.3522,0.2901,0.348,0.2614,0.3441,0.246,0.3493,0.297,0.3532,0.3022,0.3522,0.2901],
+    [-0.3078,0.2339,-0.3151,0.2291,-0.3213,0.2351,-0.314,0.2399,-0.3078,0.2339],
+    [0.0143,0.2392,0.3263,0.2266,0.431,0.2215,0.4355,0.2239,0.4437,0.224,0.4422,0.1964,0.4406,0.1689,0.4477,0.1656,0.4532,0.1609,0.4484,0.1619,0.3124,0.1714,0.2206,0.1749,0.2146,0.1826,0.1995,0.196,0.126,0.2037,-0.1344,0.2037,-0.192,0.1988,-0.2141,0.1826,-0.2201,0.1749,-0.3106,0.1714,-0.4474,0.1623,-0.4518,0.1601,-0.4379,0.1677,-0.4292,0.1704,-0.4337,0.1733,-0.439,0.1709,-0.4402,0.1798,-0.4418,0.2067,-0.4437,0.224,-0.4352,0.2239,-0.4306,0.2214,-0.4229,0.2188,-0.2655,0.2315,-0.2328,0.2324,-0.2056,0.234,-0.1768,0.2348,-0.1416,0.2367,-0.1084,0.2386,-0.0737,0.2396,-0.0462,0.2406,0.0143,0.2392],
+    [0.4285,0.1727,0.4324,0.1703,0.4362,0.1713,0.4324,0.1737,0.4285,0.1727],
+    [0.3211,0.2367,0.3147,0.2316,0.3084,0.2353,0.3141,0.24,0.3205,0.2415,0.3211,0.2367],
+    [0.3458,0.2335,0.3446,0.2367,0.3458,0.2399,0.3458,0.2335],
+    [-0.359,0.229,-0.4011,0.2273,-0.4242,0.2275,-0.3999,0.2291,-0.3577,0.2307,-0.3398,0.2308],
+    [0.4552,0.2069,0.4532,0.1946,0.4514,0.2073,0.4508,0.2213,0.4547,0.2218,0.4552,0.2069],
+    [-0.4485,0.2195,-0.451,0.2137,-0.4535,0.2156,-0.451,0.2214,-0.4485,0.2195],
+    [-0.2171,0.1315,-0.2121,0.0998,-0.2114,0.0961,-0.2186,0.1028,-0.2211,0.1247,-0.2238,0.1351,-0.2299,0.1268,-0.2337,0.1203,-0.2351,0.115,-0.2433,0.1155,-0.2606,0.1206,-0.2646,0.1299,-0.2651,0.1362,-0.2671,0.1319,-0.2689,0.1278,-0.2686,0.1337,-0.2698,0.1407,-0.2735,0.1424,-0.3242,0.1436,-0.3775,0.1405,-0.3857,0.1324,-0.3895,0.1302,-0.3861,0.1408,-0.3761,0.1449,-0.373,0.147,-0.4027,0.1478,-0.4273,0.1467,-0.4287,0.1259,-0.4356,0.0875,-0.4412,0.07,-0.4484,0.0769,-0.4577,0.0821,-0.4625,0.0731,-0.467,0.0637,-0.4678,0.0721,-0.456,0.1101,-0.4433,0.1429,-0.4504,0.1435,-0.4557,0.1427,-0.4531,0.1462,-0.347,0.1551,-0.2324,0.1605,-0.2183,0.1605,-0.2171,0.1315],
+    [0.345,0.1552,0.4511,0.1462,0.4537,0.1427,0.4481,0.1436,0.4421,0.1406,0.4467,0.1249,0.4518,0.114,0.4669,0.064,0.4646,0.0555,0.4609,0.0649,0.4556,0.0796,0.4514,0.083,0.4446,0.0776,0.4372,0.0706,0.4313,0.0865,0.4241,0.1246,0.4227,0.1466,0.3993,0.1483,0.3696,0.1475,0.3653,0.1453,0.3715,0.1449,0.3824,0.1397,0.3848,0.1316,0.3788,0.1354,0.36,0.1421,0.3088,0.1438,0.2701,0.1455,0.2665,0.1371,0.2616,0.1322,0.26,0.1287,0.2557,0.1204,0.2387,0.1155,0.2291,0.1138,0.2289,0.1235,0.2265,0.1281,0.2242,0.1263,0.2214,0.1281,0.2189,0.1337,0.2164,0.1495,0.2149,0.1598,0.2295,0.1606,0.345,0.1552],
+    [-0.1171,0.1355,-0.1186,0.1221,-0.1186,0.1126,-0.1429,0.1119,-0.1672,0.1112,-0.1677,0.1247,-0.1681,0.1383,-0.1691,0.1247,-0.1708,0.1134,-0.1757,0.1119,-0.182,0.1262,-0.1828,0.1396,-0.1492,0.1396,-0.1171,0.1355],
+    [0.1831,0.1258,0.1831,0.112,0.1581,0.1124,0.1332,0.1127,0.1317,0.1255,0.1302,0.1383,0.1298,0.1249,0.1285,0.1135,0.123,0.1115,0.1175,0.1135,0.1166,0.1255,0.1166,0.1396,0.1498,0.1396,0.1831,0.1396],
+    [-0.2835,0.1281,-0.2899,0.1173,-0.2963,0.1141,-0.2904,0.114,-0.2853,0.1057,-0.2876,0.0985,-0.2963,0.0956,-0.3378,0.0937,-0.3719,0.0989,-0.3727,0.1083,-0.3622,0.1118,-0.3526,0.1122,-0.3628,0.1137,-0.3733,0.1191,-0.3719,0.1293,-0.3065,0.136,-0.2835,0.1357],
+    [-0.3097,0.1148,-0.302,0.1149,-0.3065,0.1161,-0.3097,0.1148],
+    [0.3569,0.1323,0.371,0.1306,0.3718,0.1134,0.3725,0.0961,0.3301,0.0961,0.2878,0.0961,0.2853,0.1027,0.2843,0.1351,0.3569,0.1323],
+    [-0.132,0.107,-0.1666,0.107,-0.1493,0.1079,-0.132,0.107],
+    [0.1671,0.107,0.1326,0.107,0.1498,0.1079,0.1671,0.107],
+    [0.0966,0.0942,-0.0977,0.0942,0.0003,0.0949,0.0966,0.0942],
+    [-0.2942,0.056,-0.328,0.0551,-0.329,0.0468,-0.33,0.0386,-0.3304,0.0469,-0.3331,0.0549,-0.3373,0.0499,-0.3478,0.0419,-0.3796,0.0399,-0.4075,0.0437,-0.4109,0.0475,-0.416,0.0455,-0.4133,0.0409,-0.4129,0.0343,-0.423,-0.0236,-0.42,-0.0607,-0.4179,-0.1123,-0.4156,-0.0784,-0.4152,-0.0292,-0.2088,-0.0285,0.2067,-0.0286,0.4157,-0.0292,0.4158,-0.0707,0.4206,-0.1314,0.423,-0.0784,0.4265,-0.0237,0.419,0.0317,0.4181,0.0409,0.4143,0.0475,0.4116,0.0434,0.3825,0.0397,0.3473,0.0439,0.3419,0.05,0.3486,0.0534,0.2871,0.0548,0.2136,0.0525,0.2103,0.0494,0.2157,0.0437,0.2209,0.0383,0.2171,0.0374,0.2088,0.0418,0.2062,0.039,0.2102,0.0277,0.2123,0.0145,0.2103,-0.008,0.2103,-0.0214,0.104,-0.0221,-0.1063,-0.0221,-0.2103,-0.0214,-0.2103,-0.0093,-0.212,0.0133,-0.2081,0.0291,-0.2043,0.04,-0.2077,0.0432,-0.2193,0.0391,-0.2142,0.0456,-0.2098,0.0528,-0.2942,0.056],
+    [0.3339,0.045,0.3314,0.0373,0.3288,0.045,0.3314,0.0526,0.3339,0.045],
+    [-0.3407,0.0296,-0.3232,0.0296,-0.3232,0.0028,-0.3232,-0.0241,-0.3679,-0.0241,-0.4127,-0.0241,-0.4127,0.0014,-0.4127,0.0269,-0.4043,0.0295,-0.3771,0.0309,-0.3407,0.0296],
+    [-0.226,0.0028,-0.226,-0.0241,-0.2708,-0.0241,-0.3155,-0.0241,-0.3155,0.0028,-0.3155,0.0296,-0.2708,0.0296,-0.226,0.0296],
+    [0.3211,0.0028,0.3211,-0.0241,0.2751,-0.0241,0.2291,-0.0241,0.2291,0.0028,0.2291,0.0296,0.2751,0.0296,0.3211,0.0296],
+    [0.4155,0.0261,0.4178,-0.0002,0.417,-0.0228,0.3723,-0.0228,0.3275,-0.0228,0.3268,0,0.3273,0.0262,0.3706,0.03,0.4155,0.0261],
+    [-0.4441,0.0269,-0.4417,0.0043,-0.4432,0.0448,-0.4441,0.0269],
+    [0.437,0.0207,0.4381,0.0124,0.438,0.0303,0.437,0.0207],
+    [-0.0061,0.0194,-0.0051,0.0108,0.0003,0.0092,0.0056,0.0108,0.0067,0.0194,0.0056,0.028,0.0003,0.0296,-0.0051,0.028,-0.0061,0.0194],
+    [-0.4793,0.0141,-0.4828,-0.0202,-0.4849,-0.0517,-0.4593,-0.0706,-0.4781,0.0192,-0.4793,0.0141],
+    [0.4774,0.016,0.4681,-0.0272,0.4598,-0.0706,0.4728,-0.0644,0.4852,-0.056,0.4835,-0.0292,0.4774,0.016],
+    [-0.2313,-0.072,-0.2468,-0.1097,-0.2591,-0.1387,-0.2697,-0.1489,-0.304,-0.1532,-0.3663,-0.1477,-0.4044,-0.1454,-0.3762,-0.2017,-0.3273,-0.2771,-0.2946,-0.3111,-0.2592,-0.318,0.024,-0.325,0.2776,-0.3154,0.3009,-0.3052,0.3268,-0.2757,0.4045,-0.1449,0.3641,-0.1477,0.2709,-0.1511,0.2574,-0.1392,0.2444,-0.1099,0.2215,-0.0602,0.2279,-0.0791,0.2444,-0.1251,0.2543,-0.1538,0.2449,-0.1554,0.176,-0.157,0.1166,-0.1597,0.1288,-0.1806,0.15,-0.1923,0.184,-0.1949,0.2207,-0.1879,0.2434,-0.1702,0.2534,-0.1591,0.2572,-0.161,0.2428,-0.1853,0.2123,-0.2042,0.1746,-0.2079,0.1406,-0.2011,0.1239,-0.188,0.1127,-0.1686,0.1082,-0.157,-0.0685,-0.1567,-0.252,-0.1548,-0.2589,-0.1532,-0.2461,-0.1199,-0.2247,-0.0598,-0.2313,-0.072],
+    [-0.243,-0.1711,-0.2223,-0.1879,-0.1936,-0.1957,-0.1472,-0.1926,-0.1199,-0.171,-0.1113,-0.16,-0.1095,-0.1663,-0.1335,-0.1992,-0.1738,-0.2099,-0.2183,-0.2028,-0.244,-0.1836,-0.2567,-0.1622,-0.243,-0.1711],
+    [-0.2951,-0.2171,-0.2669,-0.268,-0.2727,-0.2652,-0.2814,-0.261,-0.306,-0.232,-0.3258,-0.1916,-0.3308,-0.1775,-0.3357,-0.168,-0.3296,-0.1668,-0.2951,-0.2171],
+    [0.339,-0.166,0.3325,-0.1778,0.3271,-0.1894,0.3153,-0.2222,0.2833,-0.2618,0.2816,-0.2586,0.2779,-0.2615,0.304,-0.2076,0.3312,-0.1664,0.339,-0.166],
+    [0.2867,-0.2481,0.2851,-0.2531,0.2921,-0.2414,0.2867,-0.2481],
+    [-0.2731,-0.1723,-0.2594,-0.184,-0.2511,-0.1956,-0.2535,-0.2236,-0.2576,-0.2534,-0.2876,-0.211,-0.3066,-0.1729,-0.2918,-0.1707,-0.2731,-0.1723],
+    [0.3084,-0.1733,0.2625,-0.2516,0.2583,-0.2535,0.2523,-0.2107,0.26,-0.1839,0.2784,-0.1721,0.3084,-0.1733],
+    [0.1008,-0.177,0.1159,-0.2032,0.1397,-0.2352,0.1875,-0.2413,0.2137,-0.2414,0.224,-0.2321,0.2342,-0.2229,0.2342,-0.2461,0.2323,-0.268,0.2112,-0.2745,0.138,-0.2771,0.0763,-0.2772,0.0721,-0.2708,0.0679,-0.2644,0.0001,-0.2644,-0.0677,-0.2644,-0.0737,-0.2708,-0.0796,-0.2772,-0.1406,-0.2771,-0.2132,-0.2745,-0.2343,-0.268,-0.2362,-0.2464,-0.2352,-0.2235,-0.2252,-0.2324,-0.2163,-0.2414,-0.1898,-0.2413,-0.1419,-0.2352,-0.1182,-0.2037,-0.1084,-0.1846,-0.0945,-0.1754,0.0006,-0.1723,0.1008,-0.177],
+    [-0.1252,-0.1087,-0.1563,-0.1294,-0.1797,-0.1444,-0.1066,-0.1467,-0.0396,-0.1443,-0.0323,-0.1362,-0.0304,-0.1193,-0.0286,-0.1008,-0.0748,-0.1008,-0.121,-0.1008],
+    [0.0322,-0.1142,0.0349,-0.1372,0.0376,-0.1468,0.1089,-0.1468,0.1816,-0.1445,0.1514,-0.1262,0.1273,-0.1091,0.1233,-0.1008,0.0778,-0.1008,0.0322,-0.1008],
+    [-0.4459,-0.113,-0.4431,-0.1178,-0.4463,-0.1298,-0.4535,-0.1377,-0.4663,-0.1392,-0.4906,-0.1412,-0.4994,-0.1441,-0.5,-0.1532,-0.4969,-0.1656,-0.4944,-0.162,-0.4881,-0.1489,-0.4606,-0.1448,-0.4344,-0.1437,-0.4285,-0.1586,-0.4174,-0.18,-0.4122,-0.1864,-0.4136,-0.1784,-0.4228,-0.1543,-0.4306,-0.1374,-0.4248,-0.1365,-0.4271,-0.1313,-0.4383,-0.1186,-0.4459,-0.113],
+    [0.4365,-0.1232,0.4279,-0.1315,0.4253,-0.1365,0.4311,-0.1382,0.4235,-0.1554,0.4142,-0.1785,0.4161,-0.1833,0.4274,-0.1629,0.4361,-0.1437,0.4611,-0.1456,0.4892,-0.1513,0.4941,-0.1659,0.4928,-0.1736,0.4963,-0.166,0.5,-0.1515,0.4955,-0.144,0.4702,-0.1402,0.4477,-0.1323,0.4414,-0.1276,0.438,-0.1244,0.4365,-0.1232],
+    [0.339,-0.2687,0.317,-0.3002,0.3556,-0.251,0.339,-0.2687],
+    [-0.3492,-0.2606,-0.328,-0.2874,-0.3384,-0.2708,-0.3565,-0.2486,-0.3492,-0.2606],
+    [-0.2905,-0.3238,-0.1928,-0.3389,0.1933,-0.3389,0.291,-0.3238,0.2822,-0.3214,0.1816,-0.3302,0.0003,-0.3321,-0.1811,-0.3302,-0.2817,-0.3214,-0.2905,-0.3238],
+  ];
 
   // --- particles / shapes ---
   // Two layers:
-  //   "flyout": rectangular outlines that fly toward the camera from a vanishing
-  //             point at the center, growing/rotating as they approach. Trail
-  //             fade gives them ghost echoes.
+  //   "flyout": car silhouettes that fly toward the camera from a vanishing
+  //             point, growing/rotating as they approach. Trail fade gives
+  //             them ghost echoes.
   //   "spark":  short-lived particles spawned by transients (bass / treble).
   const flyout = [];
   const sparks = [];
@@ -411,14 +576,18 @@
 
   function spawnFlyout(s) {
     s = s || {};
-    s.wx = rand(-0.7, 0.7);           // world x offset from vanishing point
-    s.wy = rand(-0.55, 0.55);
+    // world offset from the vanishing point. Wide ranges so cars spawn
+    // distributed across the viewport rather than clustered at the center;
+    // off-center spawns will fly outward and leave the frame faster.
+    s.wx = rand(-2.5, 2.5);
+    s.wy = rand(-1.8, 1.8);
     s.z = Z_FAR;
     s.vz = rand(0.0006, 0.0024);      // approach speed
-    s.size = rand(60, 240);           // base world size
-    s.aspect = rand(0.35, 1.8);       // rectangle aspect ratio
-    s.rot = Math.random() * Math.PI * 2;
-    s.rotSpeed = rand(-0.018, 0.018);
+    s.size = rand(80, 280);           // longest-axis size in world units
+    // rotation: each car settles to a random target angle in ±90°. The
+    // displayed rotation is interpolated from 0 to rotTarget as the car
+    // grows, reaching the target at 75% of size-progress and locking there.
+    s.rotTarget = rand(-Math.PI / 2, Math.PI / 2);
     s.fillAlpha = rand(0.16, 0.42);   // per-shape fill density
     s.visThresh = rand(0, 0.15);      // overall energy needed for this shape to appear
     return s;
@@ -481,6 +650,8 @@
   const SLICE_TRIGGER = 0.07;         // bass rising-edge above which a tear is spawned
   const SLICE_BURST_MIN = 5;
   const SLICE_BURST_MAX = 12;
+  const MONO_BAR_CHANCE = 1 / 8;      // per-slice chance to desaturate (B&W) instead of invert
+  const SLICE_ANGLE_JITTER = 8 * Math.PI / 180; // ±radians of per-slice angle offset around currentSliceAngle
   const ROW_CORRUPT_AMOUNT = 2.6;     // px of row shift per unit of bassPulse (* rectW)
   const ONSET_THRESHOLD = 0.07;       // level deviation above running avg to trigger
   const ONSET_COOLDOWN_MIN = 12;      // frames between onset events
@@ -491,6 +662,25 @@
   const FREEZE_FRAMES_MAX = 12;
   const DITHER_TILES_X = 8;           // dither pattern tile (Bayer 8x8)
   const DITHER_TILES_Y = 8;
+  // Color overlay applied AFTER dither. The dithered image is pure B&W, so
+  // multiplying by a saturated color tints whites to that color and leaves
+  // blacks black. Slice bars then invert (`difference` with white) within
+  // their footprint, flipping the tint toward its complement and black→white.
+  //
+  // The tint cycles through this palette over time. We have no BPM detector,
+  // so we count bass leading-edge transients (the same `bassRise` trigger
+  // that fires slices) as a beat proxy. 64 transients ≈ 32 bars in 4/4 with
+  // a kick on 1 & 3; tracks with a four-on-the-floor pattern will cycle
+  // about twice as fast. Per-frame lerp toward the target slowly crossfades
+  // between palette entries (~5s to settle at COLOR_LERP=0.01).
+  const COLOR_PALETTE = [
+    [  0, 255,  65],  // matrix phosphor green
+    [255,  40,  60],  // crimson red
+    [180,  30, 255],  // electric purple
+    [ 60, 110, 255],  // electric blue
+  ];
+  const KICKS_PER_COLOR_CYCLE = 64;
+  const COLOR_LERP = 0.01;            // per-dt lerp toward target tint
 
   // pre-allocated noise canvas + image for grain overlay
   const noiseCanvas = document.createElement('canvas');
@@ -513,6 +703,13 @@
   }
 
   const slices = [];
+  // Per-frame log of slice destination rects (CSS px + rotation about screen
+  // center). Populated as slices render; consumed by the post-dither overlay
+  // pass. Inversion bars flip the tint to its complement within their
+  // footprint; mono bars instead repaint the pre-tint B&W there, punching a
+  // colorless slot through the tinted field.
+  const inversionRegions = [];
+  const monoRegions = [];
   // Slice orientation drifts clockwise. Holds for a few beats (counted by bass
   // onsets), then advances by a random 20–45° step. New slices are spawned at
   // the current orientation so a burst all reads as the same diagonal cut.
@@ -528,7 +725,8 @@
         h: 6 + Math.random() * 110,
         dx: (Math.random() - 0.5) * W * (0.20 + intensity * 0.55),
         life: 5 + Math.floor(Math.random() * 16), // 5-20 frames
-        angle: currentSliceAngle,
+        angle: currentSliceAngle + (Math.random() * 2 - 1) * SLICE_ANGLE_JITTER,
+        mono: Math.random() < MONO_BAR_CHANCE,
       });
     }
   }
@@ -602,13 +800,19 @@
   resizeFreeze();
   window.addEventListener('resize', resizeFreeze);
   let freezeFrames = 0;
+  // 1/8 of freezes drop the color overlay for their duration — the world
+  // briefly returns to pure B&W, which lands as a quiet exhale against the
+  // tinted majority of the visual.
+  let freezeMono = false;
+  const FREEZE_MONO_CHANCE = 1 / 8;
   function captureFreeze() {
     freezeCtx.clearRect(0, 0, freezeCanvas.width, freezeCanvas.height);
     freezeCtx.drawImage(canvas, 0, 0);
     const base = FREEZE_FRAMES_MIN +
       Math.floor(Math.random() * (FREEZE_FRAMES_MAX - FREEZE_FRAMES_MIN + 1));
-    // each freeze randomly lasts 2x or 4x the base duration
-    freezeFrames = base * (Math.random() < 0.5 ? 2 : 4);
+    // each freeze randomly lasts 1x or 2x the base duration
+    freezeFrames = base * (Math.random() < 0.5 ? 1 : 2);
+    freezeMono = Math.random() < FREEZE_MONO_CHANCE;
   }
   function restoreFreeze() {
     ctx.save();
@@ -678,6 +882,7 @@
   // Discrete events (slices, flashes) use the rising-edge derivative below.
   let bassPulse = 0;
   let prevBass = 0;
+  let bassBaseline = 0;
   let sliceCool = 0;
   // mid-band envelope (independent slice trigger stream)
   let midBaseline = 0;
@@ -696,10 +901,112 @@
   // dither pattern phase shifts continuously, faster on treble
   let ditherPhaseX = 0;
   let ditherPhaseY = 0;
+  // active color tint — lerped toward COLOR_PALETTE[colorIndex] each frame.
+  // colorIndex advances every KICKS_PER_COLOR_CYCLE bass transients.
+  let colorIndex = 0;
+  let kickCount = 0;
+  let tintR = COLOR_PALETTE[0][0];
+  let tintG = COLOR_PALETTE[0][1];
+  let tintB = COLOR_PALETTE[0][2];
+
+  // --- dev overlay (draggable debug panel) ---
+  // 'd' toggles. Header is the drag handle; close button hides. The overlay
+  // reads visualizer state at end-of-frame so counters reflect the current
+  // frame's slice render rather than the previous one.
+  const devOverlay = document.getElementById('dev-overlay');
+  const devHeader = document.getElementById('dev-header');
+  const devClose = document.getElementById('dev-close');
+  const devEls = {
+    tint: document.getElementById('dev-tint'),
+    tintSw: document.getElementById('dev-tint-sw'),
+    target: document.getElementById('dev-target'),
+    targetSw: document.getElementById('dev-target-sw'),
+    kicks: document.getElementById('dev-kicks'),
+    bass: document.getElementById('dev-bass'),
+    bf: document.getElementById('dev-bf'),
+    mid: document.getElementById('dev-mid'),
+    treble: document.getElementById('dev-treble'),
+    level: document.getElementById('dev-level'),
+    bp: document.getElementById('dev-bp'),
+    bd: document.getElementById('dev-bd'),
+    slices: document.getElementById('dev-slices'),
+    bars: document.getElementById('dev-bars'),
+    sliceAng: document.getElementById('dev-slice-ang'),
+    freeze: document.getElementById('dev-freeze'),
+    fps: document.getElementById('dev-fps'),
+  };
+  const PALETTE_NAMES = ['green', 'red', 'purple', 'blue'];
+
+  let devDrag = null;
+  devHeader.addEventListener('pointerdown', e => {
+    if (e.target === devClose) return; // let the close button handle clicks
+    e.preventDefault();
+    const rect = devOverlay.getBoundingClientRect();
+    devDrag = { offX: e.clientX - rect.left, offY: e.clientY - rect.top, pid: e.pointerId };
+    try { devHeader.setPointerCapture(e.pointerId); } catch(_){}
+  });
+  devHeader.addEventListener('pointermove', e => {
+    if (!devDrag || devDrag.pid !== e.pointerId) return;
+    const x = e.clientX - devDrag.offX;
+    const y = e.clientY - devDrag.offY;
+    devOverlay.style.left = Math.max(0, Math.min(window.innerWidth - 40, x)) + 'px';
+    devOverlay.style.top = Math.max(0, Math.min(window.innerHeight - 24, y)) + 'px';
+    devOverlay.style.right = 'auto';
+  });
+  function endDevDrag(e) {
+    if (!devDrag || devDrag.pid !== e.pointerId) return;
+    try { devHeader.releasePointerCapture(e.pointerId); } catch(_){}
+    devDrag = null;
+  }
+  devHeader.addEventListener('pointerup', endDevDrag);
+  devHeader.addEventListener('pointercancel', endDevDrag);
+  devClose.addEventListener('click', () => devOverlay.classList.add('hidden'));
+  window.addEventListener('keydown', e => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'd' || e.key === 'D') devOverlay.classList.toggle('hidden');
+  });
+
+  // FPS: averaged over a ~500ms window so the readout doesn't flicker
+  let fpsAccumStart = performance.now();
+  let fpsAccumCount = 0;
+  let fpsValue = 0;
+
+  function updateDebug(b, bassDev) {
+    if (devOverlay.classList.contains('hidden')) return;
+    const r = tintR | 0, g = tintG | 0, bl = tintB | 0;
+    devEls.tintSw.style.background = `rgb(${r},${g},${bl})`;
+    devEls.tint.textContent = `${r},${g},${bl}`;
+    const tgt = COLOR_PALETTE[colorIndex];
+    devEls.targetSw.style.background = `rgb(${tgt[0]},${tgt[1]},${tgt[2]})`;
+    devEls.target.textContent = `${PALETTE_NAMES[colorIndex] || '?'} [${colorIndex}]`;
+    devEls.kicks.textContent = `${kickCount}/${KICKS_PER_COLOR_CYCLE}`;
+    devEls.bass.textContent = b.bass.toFixed(2);
+    devEls.bf.textContent = b.bassFast.toFixed(2);
+    devEls.mid.textContent = b.mid.toFixed(2);
+    devEls.treble.textContent = b.treble.toFixed(2);
+    devEls.level.textContent = b.level.toFixed(2);
+    devEls.bp.textContent = bassPulse.toFixed(2);
+    devEls.bd.textContent = bassDev.toFixed(2);
+    devEls.slices.textContent = slices.length;
+    devEls.bars.textContent = `${inversionRegions.length}/${monoRegions.length}`;
+    devEls.sliceAng.textContent = ((currentSliceAngle * 180 / Math.PI) | 0) + '°';
+    devEls.freeze.textContent = freezeFrames > 0
+      ? freezeFrames.toFixed(1) + (freezeMono ? ' mono' : '')
+      : '0';
+    devEls.fps.textContent = fpsValue.toFixed(0);
+  }
 
   function frame(now) {
     const dt = Math.min(50, now - last) / 16.67; // normalize to ~60fps units
     last = now;
+    inversionRegions.length = 0;
+    monoRegions.length = 0;
+    fpsAccumCount++;
+    if (now - fpsAccumStart >= 500) {
+      fpsValue = fpsAccumCount * 1000 / (now - fpsAccumStart);
+      fpsAccumStart = now;
+      fpsAccumCount = 0;
+    }
 
     const b = bands();
     smoothLevel += (b.level - smoothLevel) * 0.08;
@@ -707,10 +1014,22 @@
     smoothMid += (b.mid - smoothMid) * 0.20;
     smoothTreble += (b.treble - smoothTreble) * 0.30;
 
-    // rising-edge derivative — used directly for discrete event triggers
-    // (slices, flash) so each kick onset fires once.
-    const bassRise = Math.max(0, b.bass - prevBass);
-    prevBass = b.bass;
+    // crossfade the active tint toward the current palette entry
+    const tintTarget = COLOR_PALETTE[colorIndex];
+    const tintLerp = Math.min(1, COLOR_LERP * dt);
+    tintR += (tintTarget[0] - tintR) * tintLerp;
+    tintG += (tintTarget[1] - tintG) * tintLerp;
+    tintB += (tintTarget[2] - tintB) * tintLerp;
+
+    // Kick detection runs on the parallel low-smoothing analyser (bassFast)
+    // rather than on the heavily-smoothed b.bass — the main analyser's 0.85
+    // smoothing flattens kick attacks below threshold during sustained loud
+    // passages. The fast signal preserves per-kick spikes so both rising
+    // edge and deviation-from-baseline behave as expected.
+    const bassRise = Math.max(0, b.bassFast - prevBass);
+    prevBass = b.bassFast;
+    bassBaseline = bassBaseline * 0.97 + b.bassFast * 0.03;
+    const bassDev = Math.max(0, b.bassFast - bassBaseline);
 
     // bassPulse: peak follower over a hard-kneed bass curve. Bass below 0.5
     // contributes nothing — the lattice stays at baseline. Above 0.5 the
@@ -720,10 +1039,17 @@
     const bassAmp = Math.pow(Math.max(0, (b.bass - 0.5) * 2), 2);
     bassPulse = Math.max(bassAmp, bassPulse * Math.pow(0.88, dt));
 
-    // bass-triggered slice tears — fire on the rising edge directly.
-    // Each bass beat also counts toward the slice-orientation rotation timer.
+    // bass-triggered slice tears — fire on either rising edge OR deviation
+    // from the slow baseline (whichever is larger). Each bass beat also
+    // counts toward the slice-orientation rotation timer and the color cycle.
     sliceCool = Math.max(0, sliceCool - dt);
-    if (bassRise > SLICE_TRIGGER && sliceCool <= 0) {
+    const bassOnset = Math.max(bassRise, bassDev);
+    if (bassOnset > SLICE_TRIGGER && sliceCool <= 0) {
+      kickCount++;
+      if (kickCount >= KICKS_PER_COLOR_CYCLE) {
+        colorIndex = (colorIndex + 1) % COLOR_PALETTE.length;
+        kickCount = 0;
+      }
       beatsAtOrientation++;
       if (beatsAtOrientation >= nextRotateBeats) {
         const rotRad = (20 + Math.random() * 25) * Math.PI / 180; // 20–45° CW
@@ -731,7 +1057,7 @@
         beatsAtOrientation = 0;
         nextRotateBeats = 3 + Math.floor(Math.random() * 6);
       }
-      spawnSliceBurst(Math.min(1, bassRise * 4));
+      spawnSliceBurst(Math.min(1, bassOnset * 4));
       sliceCool = 3 + Math.random() * 6;
     }
 
@@ -817,11 +1143,14 @@
     const cx = W * 0.5, cy = H * 0.5;
     const flyAxis = Math.min(W, H) * 0.5;
     const speedScale = 1 + smoothMid * 5;
-    const rotScale = 1 + smoothMid * 2.5;
+    // size-progress is linear in apparent-size (1/z) over the spawn→despawn
+    // range; rotation reaches its target at 75% of this progress.
+    const minSc = 1 / Z_FAR;
+    const maxSc = 1 / Z_NEAR;
+    const scRange = maxSc - minSc;
     for (let i = 0; i < flyout.length; i++) {
       const s = flyout[i];
       s.z -= s.vz * dt * speedScale;
-      s.rot += s.rotSpeed * dt * rotScale;
       if (s.z <= Z_NEAR) {
         spawnFlyout(s);
         continue;
@@ -829,10 +1158,13 @@
       const sc = 1 / s.z;
       const sx = cx + s.wx * flyAxis * sc;
       const sy = cy + s.wy * flyAxis * sc;
-      // bass throb — scale rectangles outward with bassPulse
+      // bass throb — scale silhouette outward with bassPulse
       const sizeBoost = 1 + bassPulse * 0.45;
-      const w = s.size * sc * sizeBoost;
-      const h = s.size * s.aspect * sc * sizeBoost;
+      const drawScale = s.size * sc * sizeBoost;
+      // rotation: lerp 0 → rotTarget over 0..75% of size progress, lock after
+      const sizeProgress = (sc - minSc) / scRange;
+      const rotProgress = Math.min(1, sizeProgress / 0.75);
+      const rot = s.rotTarget * rotProgress;
 
       // alpha curve: emerge from the void, peak at mid depth, fade as it passes
       let a;
@@ -858,17 +1190,31 @@
 
       ctx.save();
       ctx.translate(sx, sy);
-      ctx.rotate(s.rot);
-      // translucent fill — dither will stipple it into a density pattern
+      ctx.rotate(rot);
+      // build the silhouette path at the current draw scale. Done inline
+      // (rather than ctx.scale) so stroke widths stay in pixel units.
+      ctx.beginPath();
+      for (let k = 0; k < CAR_SUBPATHS.length; k++) {
+        const sub = CAR_SUBPATHS[k];
+        for (let j = 0; j < sub.length; j += 2) {
+          const px = sub[j] * drawScale;
+          const py = sub[j + 1] * drawScale;
+          if (j === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+      }
+      // translucent fill — dither will stipple it into a density pattern.
+      // even-odd makes inner subpaths render as holes (windshield, grille).
       ctx.fillStyle = `rgba(255,255,255,${a * s.fillAlpha})`;
-      ctx.fillRect(-w * 0.5, -h * 0.5, w, h);
+      ctx.fill('evenodd');
       // outer glow stroke (wider, dimmer) + crisp inner stroke
       ctx.strokeStyle = `rgba(255,255,255,${a * 0.35})`;
       ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2);
-      ctx.strokeRect(-w * 0.5, -h * 0.5, w, h);
+      ctx.stroke();
       ctx.strokeStyle = `rgba(255,255,255,${a * 0.95})`;
       ctx.lineWidth = Math.max(1, 1 + sc * 0.3);
-      ctx.strokeRect(-w * 0.5, -h * 0.5, w, h);
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -933,6 +1279,14 @@
         if (s.life <= 0) { slices.splice(i, 1); continue; }
         const sy = Math.max(0, Math.min(H - 1, s.y)) * dpr;
         const sh = Math.max(1, Math.min(H * dpr - sy, s.h * dpr));
+        const region = {
+          x: s.dx,
+          y: sy / dpr,
+          w: W,
+          h: sh / dpr,
+          angle: s.angle || 0,
+        };
+        (s.mono ? monoRegions : inversionRegions).push(region);
         if (s.angle) {
           ctx.save();
           ctx.translate(cxd, cyd);
@@ -982,6 +1336,59 @@
     // pattern offset shifts continuously, accelerating with treble.
     applyDither(Math.floor(ditherPhaseX), Math.floor(ditherPhaseY));
 
+    // --- color overlay: tint the dithered B&W to the active palette color,
+    // then invert color inside each slice-bar footprint (tint → complement,
+    // black → white). Done after dither so the tint operates on pure B&W.
+    // Skipped on monochrome freeze frames so the freeze reads as a B&W beat.
+    const tintActive = !(freezeFrames > 0 && freezeMono);
+    if (tintActive) {
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.fillStyle = `rgb(${tintR | 0},${tintG | 0},${tintB | 0})`;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+      // mono bars: repaint the pre-tint B&W (still in ditherCanvas) inside
+      // each region, clipped to the rotated rect. Punches a colorless slot
+      // through the tinted field.
+      if (monoRegions.length) {
+        const dw = ditherCanvas.width;
+        const dh = ditherCanvas.height;
+        for (let i = 0; i < monoRegions.length; i++) {
+          const r = monoRegions[i];
+          ctx.save();
+          if (r.angle) {
+            ctx.translate(W * 0.5, H * 0.5);
+            ctx.rotate(r.angle);
+            ctx.translate(-W * 0.5, -H * 0.5);
+          }
+          ctx.beginPath();
+          ctx.rect(r.x, r.y, r.w, r.h);
+          ctx.clip();
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(ditherCanvas, 0, 0, dw, dh, 0, 0, W, H);
+          ctx.imageSmoothingEnabled = true;
+          ctx.restore();
+        }
+      }
+    }
+    if (inversionRegions.length) {
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = '#fff';
+      for (let i = 0; i < inversionRegions.length; i++) {
+        const r = inversionRegions[i];
+        if (r.angle) {
+          ctx.save();
+          ctx.translate(W * 0.5, H * 0.5);
+          ctx.rotate(r.angle);
+          ctx.translate(-W * 0.5, -H * 0.5);
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+          ctx.restore();
+        } else {
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+        }
+      }
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
     // --- single-frame flash effect after dither.
     // 'strobe' = full white frame. 'invert' = composite difference flip.
     if (pendingFlash) {
@@ -998,6 +1405,8 @@
       ctx.restore();
       pendingFlash = null;
     }
+
+    updateDebug(b, bassDev);
 
     requestAnimationFrame(frame);
   }
