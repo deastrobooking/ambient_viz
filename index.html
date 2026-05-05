@@ -1,0 +1,1008 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ambient viz</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #000;
+    color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  #ui {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 10;
+    background: rgba(0,0,0,0.4);
+    padding: 10px 12px;
+    border-radius: 8px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    text-transform: lowercase;
+    transition: opacity 0.6s ease;
+  }
+  #ui-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  #ui.faded { opacity: 0.15; }
+  #ui:hover { opacity: 1; }
+  #timeline-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  #timeline-wrap.hidden { display: none; }
+  #timeline {
+    position: relative;
+    flex: 1;
+    height: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+  }
+  #timeline-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: #333;
+    border-radius: 1px;
+  }
+  #timeline-fill {
+    position: absolute;
+    left: 0;
+    height: 2px;
+    background: #eee;
+    border-radius: 1px;
+    pointer-events: none;
+  }
+  #timeline-head {
+    position: absolute;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #eee;
+    transform: translate(-50%, 0);
+    pointer-events: none;
+  }
+  #timeline:hover #timeline-head { width: 10px; height: 10px; }
+  .time {
+    color: #aaa;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    min-width: 36px;
+    text-align: center;
+  }
+  button, label.filebtn {
+    background: transparent;
+    color: #eee;
+    border: 1px solid #555;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+    text-transform: lowercase;
+  }
+  button:hover, label.filebtn:hover { border-color: #eee; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  input[type=file] { display: none; }
+  #status { color: #888; margin-left: 8px; }
+  #drophint {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    color: #444;
+    font-size: 14px;
+    letter-spacing: 0.2em;
+    text-transform: lowercase;
+  }
+  #drophint.hidden { display: none; }
+  #drop-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(255,255,255,0.05);
+    border: 2px dashed #888;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 5;
+  }
+  #drop-overlay.active { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="drophint">drop an audio file or click play</div>
+<div id="drop-overlay"></div>
+<div id="ui">
+  <div id="timeline-wrap" class="hidden">
+    <span id="time-cur" class="time">0:00</span>
+    <div id="timeline">
+      <div id="timeline-track"></div>
+      <div id="timeline-fill"></div>
+      <div id="timeline-head"></div>
+    </div>
+    <span id="time-dur" class="time">0:00</span>
+  </div>
+  <div id="ui-row">
+    <label class="filebtn" for="file">file</label>
+    <input id="file" type="file" accept="audio/*" />
+    <button id="mic">mic</button>
+    <button id="playpause" disabled>play</button>
+    <span id="status">no audio</span>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const fileInput = document.getElementById('file');
+  const micBtn = document.getElementById('mic');
+  const playBtn = document.getElementById('playpause');
+  const statusEl = document.getElementById('status');
+  const dropHint = document.getElementById('drophint');
+  const dropOverlay = document.getElementById('drop-overlay');
+  const ui = document.getElementById('ui');
+  const timelineWrap = document.getElementById('timeline-wrap');
+  const timeline = document.getElementById('timeline');
+  const timelineFill = document.getElementById('timeline-fill');
+  const timelineHead = document.getElementById('timeline-head');
+  const timeCur = document.getElementById('time-cur');
+  const timeDur = document.getElementById('time-dur');
+
+  function fmtTime(s) {
+    if (!isFinite(s) || s < 0) s = 0;
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+  function setTimelineProgress(frac) {
+    frac = Math.max(0, Math.min(1, frac));
+    const pct = frac * 100;
+    timelineFill.style.width = pct + '%';
+    timelineHead.style.left = pct + '%';
+  }
+  setTimelineProgress(0);
+
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let W = 0, H = 0;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = canvas.clientWidth = window.innerWidth;
+    H = canvas.clientHeight = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // --- audio graph ---
+  let audioCtx = null;
+  let analyser = null;
+  let freqData = null;
+  let timeData = null;
+  let currentSource = null;     // MediaElementSource or MediaStreamSource
+  let currentEl = null;         // HTMLAudioElement when in file mode
+  let micStream = null;
+
+  function ensureCtx() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.85;
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      timeData = new Uint8Array(analyser.fftSize);
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  function teardownSource() {
+    if (currentSource) { try { currentSource.disconnect(); } catch(e){} currentSource = null; }
+    if (currentEl) { currentEl.pause(); currentEl.src = ''; currentEl = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    playBtn.disabled = true;
+    playBtn.textContent = 'play';
+    timelineWrap.classList.add('hidden');
+    setTimelineProgress(0);
+    timeCur.textContent = '0:00';
+    timeDur.textContent = '0:00';
+  }
+
+  function loadFile(file) {
+    ensureCtx();
+    teardownSource();
+    const url = URL.createObjectURL(file);
+    const audio = new Audio();
+    audio.src = url;
+    audio.crossOrigin = 'anonymous';
+    audio.loop = false;
+    currentEl = audio;
+    const src = audioCtx.createMediaElementSource(audio);
+    src.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    currentSource = src;
+    statusEl.textContent = file.name;
+    playBtn.disabled = false;
+    audio.addEventListener('play', () => playBtn.textContent = 'pause');
+    audio.addEventListener('pause', () => playBtn.textContent = 'play');
+    audio.addEventListener('ended', () => playBtn.textContent = 'play');
+    audio.addEventListener('loadedmetadata', () => {
+      timeDur.textContent = fmtTime(audio.duration);
+      timelineWrap.classList.remove('hidden');
+    });
+    audio.addEventListener('timeupdate', () => {
+      if (scrubbing) return;
+      timeCur.textContent = fmtTime(audio.currentTime);
+      const dur = audio.duration;
+      if (isFinite(dur) && dur > 0) setTimelineProgress(audio.currentTime / dur);
+    });
+    audio.play().catch(() => {});
+    dropHint.classList.add('hidden');
+  }
+
+  // --- timeline scrubbing ---
+  let scrubbing = false;
+  let wasPlayingBeforeScrub = false;
+
+  function fracFromEvent(e) {
+    const rect = timeline.getBoundingClientRect();
+    const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    return Math.max(0, Math.min(1, x / rect.width));
+  }
+  function applyScrub(frac, commit) {
+    if (!currentEl || !isFinite(currentEl.duration) || currentEl.duration <= 0) return;
+    setTimelineProgress(frac);
+    const t = frac * currentEl.duration;
+    timeCur.textContent = fmtTime(t);
+    if (commit) currentEl.currentTime = t;
+  }
+  timeline.addEventListener('pointerdown', e => {
+    if (!currentEl) return;
+    e.preventDefault();
+    timeline.setPointerCapture(e.pointerId);
+    scrubbing = true;
+    wasPlayingBeforeScrub = !currentEl.paused;
+    applyScrub(fracFromEvent(e), true);
+  });
+  timeline.addEventListener('pointermove', e => {
+    if (!scrubbing) return;
+    applyScrub(fracFromEvent(e), true);
+  });
+  function endScrub(e) {
+    if (!scrubbing) return;
+    scrubbing = false;
+    try { timeline.releasePointerCapture(e.pointerId); } catch(_) {}
+    if (wasPlayingBeforeScrub && currentEl && currentEl.paused) currentEl.play().catch(() => {});
+  }
+  timeline.addEventListener('pointerup', endScrub);
+  timeline.addEventListener('pointercancel', endScrub);
+
+  // arrow keys: seek ±5s, shift = ±15s
+  window.addEventListener('keydown', e => {
+    if (!currentEl) return;
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const step = (e.shiftKey ? 15 : 5) * (e.key === 'ArrowRight' ? 1 : -1);
+      currentEl.currentTime = Math.max(0, Math.min((currentEl.duration || 0), currentEl.currentTime + step));
+    } else if (e.code === 'Space') {
+      e.preventDefault();
+      if (currentEl.paused) currentEl.play().catch(() => {});
+      else currentEl.pause();
+    }
+  });
+
+  async function startMic() {
+    ensureCtx();
+    teardownSource();
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      const src = audioCtx.createMediaStreamSource(micStream);
+      src.connect(analyser);
+      // do NOT connect mic to destination — would feedback
+      currentSource = src;
+      statusEl.textContent = 'mic';
+      playBtn.disabled = true;
+      dropHint.classList.add('hidden');
+    } catch (e) {
+      statusEl.textContent = 'mic denied';
+    }
+  }
+
+  fileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (f) loadFile(f);
+  });
+  micBtn.addEventListener('click', startMic);
+  playBtn.addEventListener('click', () => {
+    if (!currentEl) return;
+    if (currentEl.paused) currentEl.play();
+    else currentEl.pause();
+  });
+
+  // drag & drop
+  window.addEventListener('dragenter', e => { e.preventDefault(); dropOverlay.classList.add('active'); });
+  window.addEventListener('dragover', e => { e.preventDefault(); });
+  window.addEventListener('dragleave', e => {
+    if (e.target === document.documentElement) dropOverlay.classList.remove('active');
+  });
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    dropOverlay.classList.remove('active');
+    const f = e.dataTransfer.files[0];
+    if (f && f.type.startsWith('audio')) loadFile(f);
+  });
+
+  // fade UI when idle
+  let idleTimer;
+  function poke() {
+    ui.classList.remove('faded');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => ui.classList.add('faded'), 2500);
+  }
+  window.addEventListener('mousemove', poke);
+  poke();
+
+  // --- audio band extraction ---
+  // returns 0..1 averaged energies over coarse bands
+  function bands() {
+    if (!analyser) return { bass: 0, mid: 0, treble: 0, level: 0 };
+    analyser.getByteFrequencyData(freqData);
+    const n = freqData.length;
+    // analyser bins map linearly to 0..nyquist; for 48k sample rate that's 0..24k, bin = index/n * nyquist
+    const sr = audioCtx.sampleRate;
+    const nyq = sr / 2;
+    function avgRange(loHz, hiHz) {
+      const lo = Math.max(0, Math.floor(loHz / nyq * n));
+      const hi = Math.min(n, Math.ceil(hiHz / nyq * n));
+      let s = 0, c = 0;
+      for (let i = lo; i < hi; i++) { s += freqData[i]; c++; }
+      return c ? s / c / 255 : 0;
+    }
+    const bass = avgRange(20, 200);
+    const mid = avgRange(200, 2000);
+    const treble = avgRange(2000, 12000);
+    let level = 0;
+    for (let i = 0; i < n; i++) level += freqData[i];
+    level = level / n / 255;
+    return { bass, mid, treble, level };
+  }
+
+  // --- particles / shapes ---
+  // Two layers:
+  //   "flyout": rectangular outlines that fly toward the camera from a vanishing
+  //             point at the center, growing/rotating as they approach. Trail
+  //             fade gives them ghost echoes.
+  //   "spark":  short-lived particles spawned by transients (bass / treble).
+  const flyout = [];
+  const sparks = [];
+  const FLYOUT_COUNT = 10;
+  const Z_FAR = 2.0;                  // spawn z (deep background)
+  const Z_NEAR = 0.04;                // z at which a shape passes the camera
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  function spawnFlyout(s) {
+    s = s || {};
+    s.wx = rand(-0.7, 0.7);           // world x offset from vanishing point
+    s.wy = rand(-0.55, 0.55);
+    s.z = Z_FAR;
+    s.vz = rand(0.0006, 0.0024);      // approach speed
+    s.size = rand(60, 240);           // base world size
+    s.aspect = rand(0.35, 1.8);       // rectangle aspect ratio
+    s.rot = Math.random() * Math.PI * 2;
+    s.rotSpeed = rand(-0.018, 0.018);
+    s.fillAlpha = rand(0.16, 0.42);   // per-shape fill density
+    s.visThresh = rand(0, 0.15);      // overall energy needed for this shape to appear
+    return s;
+  }
+
+  function initFlyout() {
+    flyout.length = 0;
+    for (let i = 0; i < FLYOUT_COUNT; i++) {
+      const s = spawnFlyout();
+      // stagger initial z so they don't all fly past at the same time
+      s.z = rand(Z_NEAR + 0.05, Z_FAR);
+      flyout.push(s);
+    }
+  }
+  initFlyout();
+
+  function spawnSpark(intensity, kind) {
+    // kind: 'bass' big slow, 'treble' small fast
+    const cx = W * 0.5, cy = H * 0.5;
+    const count = kind === 'bass'
+      ? Math.floor(intensity * 28)
+      : Math.floor(intensity * 14);
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = kind === 'bass' ? rand(0.6, 2.2) * (0.6 + intensity) : rand(1.5, 4.5) * (0.6 + intensity);
+      const r = kind === 'bass' ? rand(1.2, 3.2) : rand(0.4, 1.2);
+      // origin: bass from center, treble from random points (shimmer)
+      const ox = kind === 'bass' ? cx + rand(-40, 40) : Math.random() * W;
+      const oy = kind === 'bass' ? cy + rand(-40, 40) : Math.random() * H;
+      sparks.push({
+        x: ox, y: oy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        decay: kind === 'bass' ? rand(0.004, 0.010) : rand(0.012, 0.025),
+        r,
+        kind,
+      });
+    }
+  }
+
+  // transient detection: track moving avg of bass and treble, spawn when crossing
+  let bassAvg = 0, trebleAvg = 0;
+  let bassCool = 0, trebleCool = 0;
+
+  // --- geometric lattice ---
+  // A single centered rectangle filled with a hex lattice of uniform-size
+  // particles. Particle radius pulses with bass *transients* (deviation from
+  // a slow running baseline), so steady bass doesn't pin the size at peak.
+  const LATTICE_SPACING = 24;          // px between adjacent particles
+  const PARTICLE_BASE_R = 1.0;        // baseline particle radius
+  const PARTICLE_PULSE_AMOUNT = 12;   // px added to radius at peak transient
+
+  // --- glitch / CRT constants ---
+  const JITTER_PX = 26;               // max per-particle displacement at peak treble
+  const SCANLINE_ALPHA = 0.42;        // strength of dark scanline rows
+  const SCANLINE_PERIOD = 2;          // 1 of every N rows is darkened
+  const GRAIN_ALPHA = 0.46;           // intensity of full-canvas grain overlay
+  const GRAIN_RES = 320;              // noise canvas size (square); scaled to viewport
+  const SLICE_TRIGGER = 0.07;         // bass rising-edge above which a tear is spawned
+  const SLICE_BURST_MIN = 5;
+  const SLICE_BURST_MAX = 12;
+  const ROW_CORRUPT_AMOUNT = 2.6;     // px of row shift per unit of bassPulse (* rectW)
+  const ONSET_THRESHOLD = 0.07;       // level deviation above running avg to trigger
+  const ONSET_COOLDOWN_MIN = 12;      // frames between onset events
+  const ONSET_COOLDOWN_MAX = 35;
+  const MID_SLICE_TRIGGER = 0.09;     // mid-pulse threshold for additional tears
+  const FLASH_TRIGGER = 0.18;         // bass rising-edge threshold for invert/strobe flash
+  const FREEZE_FRAMES_MIN = 4;
+  const FREEZE_FRAMES_MAX = 12;
+  const DITHER_TILES_X = 8;           // dither pattern tile (Bayer 8x8)
+  const DITHER_TILES_Y = 8;
+
+  // pre-allocated noise canvas + image for grain overlay
+  const noiseCanvas = document.createElement('canvas');
+  noiseCanvas.width = GRAIN_RES;
+  noiseCanvas.height = GRAIN_RES;
+  const noiseCtx = noiseCanvas.getContext('2d');
+  const noiseImg = noiseCtx.createImageData(GRAIN_RES, GRAIN_RES);
+
+  function regenNoise(density) {
+    // sparse bright pixels on black — phosphor-static look. density 0..1.
+    const data = noiseImg.data;
+    const thresh = 0.04 + density * 0.20;
+    for (let i = 0; i < data.length; i += 4) {
+      let v = 0;
+      if (Math.random() < thresh) v = 160 + Math.floor(Math.random() * 95);
+      data[i] = data[i + 1] = data[i + 2] = v;
+      data[i + 3] = 255;
+    }
+    noiseCtx.putImageData(noiseImg, 0, 0);
+  }
+
+  const slices = [];
+  // Slice orientation drifts clockwise. Holds for a few beats (counted by bass
+  // onsets), then advances by a random 20–45° step. New slices are spawned at
+  // the current orientation so a burst all reads as the same diagonal cut.
+  let currentSliceAngle = 0;
+  let beatsAtOrientation = 0;
+  let nextRotateBeats = 3 + Math.floor(Math.random() * 6); // 3–8 beats
+
+  function spawnSliceBurst(intensity) {
+    const count = SLICE_BURST_MIN + Math.floor(Math.random() * (SLICE_BURST_MAX - SLICE_BURST_MIN + 1));
+    for (let i = 0; i < count; i++) {
+      slices.push({
+        y: Math.random() * H,
+        h: 6 + Math.random() * 110,
+        dx: (Math.random() - 0.5) * W * (0.20 + intensity * 0.55),
+        life: 5 + Math.floor(Math.random() * 16), // 5-20 frames
+        angle: currentSliceAngle,
+      });
+    }
+  }
+
+  // --- 1-bit Bayer dither ---
+  // Standard 8x8 ordered dither matrix, values 0..63.
+  const BAYER8 = new Uint8Array([
+     0, 32,  8, 40,  2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44,  4, 36, 14, 46,  6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+     3, 35, 11, 43,  1, 33,  9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47,  7, 39, 13, 45,  5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21,
+  ]);
+
+  // Dither runs at CSS resolution (not device res) for speed and chunkier
+  // pixel-art look. Result is then nearest-neighbor scaled back to the main
+  // canvas so dither cells appear ~dpr device-pixels wide.
+  const ditherCanvas = document.createElement('canvas');
+  const ditherCtx = ditherCanvas.getContext('2d');
+  function resizeDither() {
+    ditherCanvas.width = Math.max(1, Math.ceil(W));
+    ditherCanvas.height = Math.max(1, Math.ceil(H));
+  }
+  resizeDither();
+  window.addEventListener('resize', resizeDither);
+
+  function applyDither(offX, offY) {
+    const dw = ditherCanvas.width;
+    const dh = ditherCanvas.height;
+    if (dw <= 0 || dh <= 0) return;
+    // downsample current frame onto the dither canvas
+    ditherCtx.imageSmoothingEnabled = true;
+    ditherCtx.drawImage(canvas, 0, 0, dw, dh);
+    const img = ditherCtx.getImageData(0, 0, dw, dh);
+    const data = img.data;
+    const data32 = new Uint32Array(data.buffer);
+    const ox = offX & 7, oy = offY & 7;
+    for (let y = 0; y < dh; y++) {
+      const by = ((y + oy) & 7) << 3;
+      for (let x = 0; x < dw; x++) {
+        const idx = y * dw + x;
+        const lum = data[idx << 2]; // R channel; content is grayscale
+        const t = (BAYER8[by + ((x + ox) & 7)] << 2) + 2; // 2..254
+        data32[idx] = lum > t ? 0xFFFFFFFF : 0xFF000000;
+      }
+    }
+    ditherCtx.putImageData(img, 0, 0);
+    // copy back nearest-neighbor at full canvas resolution
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(ditherCanvas, 0, 0, dw, dh, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+
+  // --- frame freeze ---
+  // capture a snapshot of the current canvas into an offscreen backing canvas;
+  // replay it for several frames so underlying content "sticks" while overlays
+  // (grain, dither) keep animating. drawImage is GPU-accelerated, much faster
+  // than getImageData/putImageData.
+  const freezeCanvas = document.createElement('canvas');
+  const freezeCtx = freezeCanvas.getContext('2d');
+  function resizeFreeze() {
+    freezeCanvas.width = canvas.width;
+    freezeCanvas.height = canvas.height;
+  }
+  resizeFreeze();
+  window.addEventListener('resize', resizeFreeze);
+  let freezeFrames = 0;
+  function captureFreeze() {
+    freezeCtx.clearRect(0, 0, freezeCanvas.width, freezeCanvas.height);
+    freezeCtx.drawImage(canvas, 0, 0);
+    const base = FREEZE_FRAMES_MIN +
+      Math.floor(Math.random() * (FREEZE_FRAMES_MAX - FREEZE_FRAMES_MIN + 1));
+    // each freeze randomly lasts 2x or 4x the base duration
+    freezeFrames = base * (Math.random() < 0.5 ? 2 : 4);
+  }
+  function restoreFreeze() {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(freezeCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  // --- block shuffle ---
+  // chunk the canvas into a tile grid; randomly copy some tiles over others.
+  // Single-frame application; trail fade absorbs it over the next few frames.
+  function applyBlockShuffle() {
+    const tilesX = 5 + Math.floor(Math.random() * 6);  // 5..10
+    const tilesY = 3 + Math.floor(Math.random() * 5);  // 3..7
+    const tileW = (canvas.width) / tilesX;
+    const tileH = (canvas.height) / tilesY;
+    const count = 4 + Math.floor(Math.random() * 6);   // 4..9 swaps
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    for (let i = 0; i < count; i++) {
+      const ax = Math.floor(Math.random() * tilesX);
+      const ay = Math.floor(Math.random() * tilesY);
+      const bx = Math.floor(Math.random() * tilesX);
+      const by = Math.floor(Math.random() * tilesY);
+      ctx.drawImage(canvas,
+        ax * tileW, ay * tileH, tileW, tileH,
+        bx * tileW, by * tileH, tileW, tileH);
+    }
+    ctx.restore();
+  }
+
+  function pushFilledRectPoints(out, cx, cy, width, height, spacing, rowCorrupt) {
+    const halfW = width / 2;
+    const halfH = height / 2;
+    const rowH = spacing * Math.sqrt(3) / 2;
+    const rows = Math.floor(height / rowH);
+    const yStart = -rows * rowH / 2;
+    const corrupt = rowCorrupt || 0;
+    for (let r = 0; r <= rows; r++) {
+      const ly = yStart + r * rowH;
+      if (ly < -halfH || ly > halfH) continue;
+      const xOffset = (r & 1) ? spacing / 2 : 0;
+      const cols = Math.floor((width - xOffset * 2) / spacing);
+      const xStart = -cols * spacing / 2;
+      // per-row horizontal shift — drives bass-triggered lattice corruption
+      const rowShift = corrupt > 0 ? (Math.random() - 0.5) * corrupt : 0;
+      for (let c = 0; c <= cols; c++) {
+        const lx = xStart + c * spacing + rowShift;
+        // looser bounds during corruption so rows can spill past the rectangle
+        if (lx < -halfW * 1.6 || lx > halfW * 1.6) continue;
+        out.push(cx + lx, cy + ly);
+      }
+    }
+  }
+
+  // --- render loop ---
+  let last = performance.now();
+  let smoothLevel = 0;
+  let smoothBass = 0;
+  let smoothMid = 0;
+  let smoothTreble = 0;
+  // bass amplitude envelope: peak-follower over a power-shaped bass signal.
+  // Tracks absolute loudness (silent kick = tiny pulse, thumping kick = huge
+  // pulse), with fast release so each kick clearly cycles down between hits.
+  // Discrete events (slices, flashes) use the rising-edge derivative below.
+  let bassPulse = 0;
+  let prevBass = 0;
+  let sliceCool = 0;
+  // mid-band envelope (independent slice trigger stream)
+  let midBaseline = 0;
+  let midPulse = 0;
+  let prevMid = 0;
+  let midSliceCool = 0;
+  // overall-energy onset detection (drives freeze + block shuffle)
+  let energyAvg = 0;
+  let prevLevel = 0;
+  let onsetCool = 0;
+  // single-frame flash (invert or strobe) on big bass pulses
+  let flashCool = 0;
+  let pendingFlash = null;            // null | 'invert' | 'strobe'
+  let pendingFreeze = false;
+  let pendingShuffle = false;
+  // dither pattern phase shifts continuously, faster on treble
+  let ditherPhaseX = 0;
+  let ditherPhaseY = 0;
+
+  function frame(now) {
+    const dt = Math.min(50, now - last) / 16.67; // normalize to ~60fps units
+    last = now;
+
+    const b = bands();
+    smoothLevel += (b.level - smoothLevel) * 0.08;
+    smoothBass += (b.bass - smoothBass) * 0.15;
+    smoothMid += (b.mid - smoothMid) * 0.20;
+    smoothTreble += (b.treble - smoothTreble) * 0.30;
+
+    // rising-edge derivative — used directly for discrete event triggers
+    // (slices, flash) so each kick onset fires once.
+    const bassRise = Math.max(0, b.bass - prevBass);
+    prevBass = b.bass;
+
+    // bassPulse: peak follower over a hard-kneed bass curve. Bass below 0.5
+    // contributes nothing — the lattice stays at baseline. Above 0.5 the
+    // signal ramps quadratically and only reaches 1.0 (max pulse) when bass
+    // is truly thumping. Instant attack + fast release lets each kick spike
+    // up and cleanly decay between hits.
+    const bassAmp = Math.pow(Math.max(0, (b.bass - 0.5) * 2), 2);
+    bassPulse = Math.max(bassAmp, bassPulse * Math.pow(0.88, dt));
+
+    // bass-triggered slice tears — fire on the rising edge directly.
+    // Each bass beat also counts toward the slice-orientation rotation timer.
+    sliceCool = Math.max(0, sliceCool - dt);
+    if (bassRise > SLICE_TRIGGER && sliceCool <= 0) {
+      beatsAtOrientation++;
+      if (beatsAtOrientation >= nextRotateBeats) {
+        const rotRad = (20 + Math.random() * 25) * Math.PI / 180; // 20–45° CW
+        currentSliceAngle = (currentSliceAngle + rotRad) % (Math.PI * 2);
+        beatsAtOrientation = 0;
+        nextRotateBeats = 3 + Math.floor(Math.random() * 6);
+      }
+      spawnSliceBurst(Math.min(1, bassRise * 4));
+      sliceCool = 3 + Math.random() * 6;
+    }
+
+    // mid-band envelope — same derivative + baseline scheme as bass
+    midBaseline = midBaseline * 0.97 + b.mid * 0.03;
+    const midDev = Math.max(0, b.mid - midBaseline);
+    const midRise = Math.max(0, b.mid - prevMid);
+    prevMid = b.mid;
+    const midTrigger = Math.max(midDev, midRise * 2.0);
+    midPulse = Math.max(midTrigger, midPulse * Math.pow(0.91, dt));
+
+    // mid-triggered slice tears (independent stream — adds chaos density)
+    midSliceCool = Math.max(0, midSliceCool - dt);
+    if (midPulse > MID_SLICE_TRIGGER && midSliceCool <= 0) {
+      spawnSliceBurst(Math.min(1, midPulse * 1.6));
+      midSliceCool = 4 + Math.random() * 7;
+    }
+
+    // single-frame flash on very strong bass onsets (50/50 invert vs strobe)
+    flashCool = Math.max(0, flashCool - dt);
+    if (bassRise > FLASH_TRIGGER && flashCool <= 0) {
+      pendingFlash = Math.random() < 0.5 ? 'invert' : 'strobe';
+      flashCool = 14 + Math.random() * 28;
+    }
+
+    // energy onset detection — combines fast baseline deviation and rising
+    // edge so repeated transients keep firing instead of decaying out.
+    // freeze and shuffle now fire independently so they can both hit at once.
+    energyAvg = energyAvg * 0.95 + b.level * 0.05;
+    const levelRise = Math.max(0, b.level - prevLevel);
+    prevLevel = b.level;
+    onsetCool = Math.max(0, onsetCool - dt);
+    const onsetSig = Math.max(b.level - energyAvg, levelRise * 1.8);
+    if (onsetSig > ONSET_THRESHOLD && onsetCool <= 0) {
+      if (Math.random() < 0.55) pendingFreeze = true;
+      if (Math.random() < 0.55) pendingShuffle = true;
+      // guarantee at least one
+      if (!pendingFreeze && !pendingShuffle) {
+        if (Math.random() < 0.5) pendingFreeze = true;
+        else pendingShuffle = true;
+      }
+      onsetCool = ONSET_COOLDOWN_MIN +
+        Math.random() * (ONSET_COOLDOWN_MAX - ONSET_COOLDOWN_MIN);
+    }
+
+    // dither pattern phase — drifts slowly, accelerates hard on treble
+    ditherPhaseX += dt * (0.35 + smoothTreble * 8.0);
+    ditherPhaseY += dt * (0.25 + smoothTreble * 5.5);
+
+    // moving averages
+    bassAvg = bassAvg * 0.96 + b.bass * 0.04;
+    trebleAvg = trebleAvg * 0.95 + b.treble * 0.05;
+    bassCool = Math.max(0, bassCool - dt);
+    trebleCool = Math.max(0, trebleCool - dt);
+
+    if (b.bass > bassAvg * 1.35 + 0.05 && bassCool <= 0) {
+      spawnSpark(Math.min(1, b.bass), 'bass');
+      bassCool = 6;
+    }
+    if (b.treble > trebleAvg * 1.4 + 0.04 && trebleCool <= 0) {
+      spawnSpark(Math.min(1, b.treble), 'treble');
+      trebleCool = 4;
+    }
+
+    if (freezeFrames > 0) {
+      // ---- frame freeze branch: replay captured snapshot ----
+      restoreFreeze();
+      freezeFrames -= dt;
+    } else {
+      // ---- normal render branch ----
+    // motion-blur trail: paint translucent black over the canvas
+    // lighter alpha = longer trails. tie slightly to level so loud passages crisp up.
+    const fade = 0.06 + 0.05 * (1 - smoothLevel);
+    ctx.fillStyle = `rgba(0,0,0,${fade})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // additive white drawing
+    ctx.globalCompositeOperation = 'lighter';
+
+    // flyout shapes — rectangles approaching the viewer from a center
+    // vanishing point. Mid energy speeds up approach + rotation.
+    // The frame's trail-fade pass gives each shape a ghost echo each frame.
+    const cx = W * 0.5, cy = H * 0.5;
+    const flyAxis = Math.min(W, H) * 0.5;
+    const speedScale = 1 + smoothMid * 5;
+    const rotScale = 1 + smoothMid * 2.5;
+    for (let i = 0; i < flyout.length; i++) {
+      const s = flyout[i];
+      s.z -= s.vz * dt * speedScale;
+      s.rot += s.rotSpeed * dt * rotScale;
+      if (s.z <= Z_NEAR) {
+        spawnFlyout(s);
+        continue;
+      }
+      const sc = 1 / s.z;
+      const sx = cx + s.wx * flyAxis * sc;
+      const sy = cy + s.wy * flyAxis * sc;
+      // bass throb — scale rectangles outward with bassPulse
+      const sizeBoost = 1 + bassPulse * 0.45;
+      const w = s.size * sc * sizeBoost;
+      const h = s.size * s.aspect * sc * sizeBoost;
+
+      // alpha curve: emerge from the void, peak at mid depth, fade as it passes
+      let a;
+      if (s.z > Z_FAR * 0.65) {
+        a = (Z_FAR - s.z) / (Z_FAR * 0.35);
+      } else if (s.z < 0.18) {
+        a = s.z / 0.18;
+      } else {
+        a = 1;
+      }
+      a = Math.max(0, Math.min(1, a)) * 0.7;
+
+      // energy gating: each shape has a per-shape level threshold and ramps
+      // linearly from 0 at threshold to full at threshold+~0.17. At very low
+      // levels the always-visible shapes (thresh=0) are also faint because
+      // their above-threshold value is tiny.
+      const above = Math.max(0, smoothLevel - s.visThresh);
+      const energyMult = Math.min(1, above * 6);
+      if (energyMult < 0.01) continue;
+      a *= energyMult;
+      // bass throb — brighten alpha on each kick so shapes pulse with bass
+      a = Math.min(1, a * (1 + bassPulse * 0.7));
+
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(s.rot);
+      // translucent fill — dither will stipple it into a density pattern
+      ctx.fillStyle = `rgba(255,255,255,${a * s.fillAlpha})`;
+      ctx.fillRect(-w * 0.5, -h * 0.5, w, h);
+      // outer glow stroke (wider, dimmer) + crisp inner stroke
+      ctx.strokeStyle = `rgba(255,255,255,${a * 0.35})`;
+      ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2);
+      ctx.strokeRect(-w * 0.5, -h * 0.5, w, h);
+      ctx.strokeStyle = `rgba(255,255,255,${a * 0.95})`;
+      ctx.lineWidth = Math.max(1, 1 + sc * 0.3);
+      ctx.strokeRect(-w * 0.5, -h * 0.5, w, h);
+      ctx.restore();
+    }
+
+    // sparks
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.vx *= s.kind === 'bass' ? 0.985 : 0.97;
+      s.vy *= s.kind === 'bass' ? 0.985 : 0.97;
+      s.life -= s.decay * dt;
+      if (s.life <= 0 || s.x < -20 || s.x > W + 20 || s.y < -20 || s.y > H + 20) {
+        sparks.splice(i, 1);
+        continue;
+      }
+      const a = Math.max(0, s.life);
+      const radius = s.r * (s.kind === 'bass' ? 1 + (1 - s.life) * 0.4 : 1);
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, radius * 5);
+      g.addColorStop(0, `rgba(255,255,255,${0.9 * a})`);
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, radius * 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // viewport-filling hex-lattice of particles.
+    // particle radius pulses with the bass-transient envelope.
+    // each particle is jittered per-frame by treble (high-freq shimmer);
+    // each row is also shifted by an amount driven by the bass-pulse envelope
+    // (lattice corruption on bass hits).
+    const rectW = W;
+    const rectH = H;
+    const pulseR = PARTICLE_BASE_R + bassPulse * PARTICLE_PULSE_AMOUNT;
+    const jitter = JITTER_PX * smoothTreble;
+    const rowCorrupt = bassPulse * rectW * ROW_CORRUPT_AMOUNT;
+    const pts = [];
+    pushFilledRectPoints(pts, W * 0.5, H * 0.5, rectW, rectH, LATTICE_SPACING, rowCorrupt);
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i += 2) {
+      const x = pts[i] + (Math.random() - 0.5) * jitter;
+      const y = pts[i + 1] + (Math.random() - 0.5) * jitter;
+      ctx.moveTo(x + pulseR, y);
+      ctx.arc(x, y, pulseR, 0, Math.PI * 2);
+    }
+    ctx.fill();
+
+    // --- slice tears: copy horizontal bands of the canvas to shifted x,
+    // additive composite for ghost-double-image. operate in device pixels.
+    // Each slice carries its own angle (rotated about the canvas center)
+    // so a burst can read as a diagonal tear instead of horizontal.
+    if (slices.length) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalCompositeOperation = 'lighter';
+      const cxd = canvas.width / 2;
+      const cyd = canvas.height / 2;
+      for (let i = slices.length - 1; i >= 0; i--) {
+        const s = slices[i];
+        s.life -= dt;
+        if (s.life <= 0) { slices.splice(i, 1); continue; }
+        const sy = Math.max(0, Math.min(H - 1, s.y)) * dpr;
+        const sh = Math.max(1, Math.min(H * dpr - sy, s.h * dpr));
+        if (s.angle) {
+          ctx.save();
+          ctx.translate(cxd, cyd);
+          ctx.rotate(s.angle);
+          ctx.translate(-cxd, -cyd);
+          ctx.drawImage(canvas, 0, sy, W * dpr, sh, s.dx * dpr, sy, W * dpr, sh);
+          ctx.restore();
+        } else {
+          ctx.drawImage(canvas, 0, sy, W * dpr, sh, s.dx * dpr, sy, W * dpr, sh);
+        }
+      }
+      ctx.restore();
+    }
+
+    // capture-for-freeze happens BEFORE overlays so they keep animating
+    // while content is paused
+    if (pendingFreeze) {
+      captureFreeze();
+      pendingFreeze = false;
+    }
+    // block shuffle is a one-shot effect on the rendered scene
+    if (pendingShuffle) {
+      applyBlockShuffle();
+      pendingShuffle = false;
+    }
+    } // end normal render branch
+
+    // --- scanlines: dark rows every SCANLINE_PERIOD CSS px
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = `rgba(0,0,0,${SCANLINE_ALPHA})`;
+    for (let y = 0; y < H; y += SCANLINE_PERIOD) {
+      ctx.fillRect(0, y, W, 1);
+    }
+
+    // --- film grain / TV snow: regenerated every frame, additive overlay.
+    // density rises with treble for shimmery hi-hat fizz.
+    regenNoise(0.25 + smoothTreble * 0.45);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalAlpha = GRAIN_ALPHA;
+    ctx.drawImage(noiseCanvas, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.imageSmoothingEnabled = true;
+    ctx.globalCompositeOperation = 'source-over';
+
+    // --- 1-bit Bayer dither — final pass, threshold to pure B&W.
+    // pattern offset shifts continuously, accelerating with treble.
+    applyDither(Math.floor(ditherPhaseX), Math.floor(ditherPhaseY));
+
+    // --- single-frame flash effect after dither.
+    // 'strobe' = full white frame. 'invert' = composite difference flip.
+    if (pendingFlash) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      if (pendingFlash === 'strobe') {
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = 'white';
+      } else {
+        ctx.globalCompositeOperation = 'difference';
+        ctx.fillStyle = 'white';
+      }
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+      pendingFlash = null;
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
