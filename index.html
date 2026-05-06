@@ -130,6 +130,58 @@
     z-index: 5;
   }
   #drop-overlay.active { opacity: 1; }
+  #editor {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 190px;
+    background: rgba(0,0,0,0.92);
+    border-top: 1px solid #2a2a2a;
+    z-index: 6;
+    user-select: none;
+  }
+  #editor.hidden { display: none; }
+  #editor canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+  }
+  body.editor-visible #ui { bottom: 206px; }
+  #editor-menu {
+    position: fixed;
+    background: #161616;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 2px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #ddd;
+    z-index: 30;
+    min-width: 110px;
+    user-select: none;
+  }
+  #editor-menu.hidden { display: none; }
+  #editor-menu div {
+    padding: 4px 12px;
+    cursor: pointer;
+  }
+  #editor-menu div:hover { background: #262626; }
+  #editor-menu div.selected {
+    color: #fff;
+    background: rgba(255,255,255,0.08);
+  }
+  #editor-menu .sep {
+    height: 1px;
+    border-top: 1px solid #2a2a2a;
+    padding: 0;
+    margin: 2px 0;
+    cursor: default;
+  }
+  #editor-menu .sep:hover { background: transparent; }
+  #editor-menu .danger { color: #f88; }
+  #editor-menu .danger:hover { background: rgba(255,80,80,0.15); }
   #dev-overlay {
     position: fixed;
     top: 16px;
@@ -365,6 +417,18 @@
     <button id="playpause" disabled>play</button>
     <span id="status">no audio</span>
   </div>
+</div>
+<div id="editor">
+  <canvas id="editor-canvas"></canvas>
+</div>
+<div id="editor-menu" class="hidden">
+  <div data-curve="linear">linear</div>
+  <div data-curve="easeOut">ease out</div>
+  <div data-curve="easeIn">ease in</div>
+  <div data-curve="easeInOut">ease in/out</div>
+  <div data-curve="step">step</div>
+  <div class="sep"></div>
+  <div data-action="delete" class="danger">delete</div>
 </div>
 <div id="dev-overlay">
   <div id="dev-header">
@@ -1359,6 +1423,17 @@
     armed[n] = false;
   }
 
+  // Per-segment easing. The curve on key k0 governs the segment from k0 to
+  // the next key. Discrete lanes ignore curves (they always step).
+  const EASE = {
+    linear: f => f,
+    easeIn: f => f * f,
+    easeOut: f => 1 - (1 - f) * (1 - f),
+    easeInOut: f => f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2,
+    step: () => 0,
+  };
+  const CURVE_NAMES = ['linear', 'easeOut', 'easeIn', 'easeInOut', 'step'];
+
   function evalLane(type, keys, t) {
     if (!keys || !keys.length) return undefined;
     if (t <= keys[0].t) return keys[0].v;
@@ -1368,7 +1443,9 @@
     const k0 = keys[i], k1 = keys[i + 1];
     if (type === 'discrete') return k0.v;
     const span = k1.t - k0.t;
-    const f = span > 0 ? (t - k0.t) / span : 0;
+    let f = span > 0 ? (t - k0.t) / span : 0;
+    const ease = EASE[k0.curve] || EASE.linear;
+    f = ease(f);
     return k0.v + (k1.v - k0.v) * f;
   }
 
@@ -1398,12 +1475,11 @@
     let i = 0;
     while (i < lane.length && lane[i].t < t - KEY_MERGE_DT) i++;
     if (i < lane.length && Math.abs(lane[i].t - t) <= KEY_MERGE_DT) {
-      lane[i] = { t, v };
+      lane[i] = { t, v, curve: lane[i].curve || 'linear' };
     } else {
-      // find insert position (first index where lane[i].t > t)
       let j = 0;
       while (j < lane.length && lane[j].t <= t) j++;
-      lane.splice(j, 0, { t, v });
+      lane.splice(j, 0, { t, v, curve: 'linear' });
     }
     onLanesMutated();
   }
@@ -1588,14 +1664,16 @@
   function serialize() {
     const out = { version: 1, audioRef: (currentEl && currentEl.src) ? statusEl.textContent : '', lanes: {} };
     for (const name of PARAM_NAMES) {
-      out.lanes[name] = lanes[name].map(k => ({ t: k.t, v: k.v }));
+      out.lanes[name] = lanes[name].map(k => ({ t: k.t, v: k.v, curve: k.curve || 'linear' }));
     }
     return out;
   }
   function loadFromObject(obj) {
     if (!obj || !obj.lanes) return false;
     for (const name of PARAM_NAMES) {
-      lanes[name] = Array.isArray(obj.lanes[name]) ? obj.lanes[name].slice() : [];
+      const arr = Array.isArray(obj.lanes[name]) ? obj.lanes[name] : [];
+      // legacy keys may lack `curve` — default to linear
+      lanes[name] = arr.map(k => ({ t: k.t, v: k.v, curve: k.curve || 'linear' }));
     }
     renderKeys();
     return true;
@@ -1760,6 +1838,466 @@
       : '0';
     devEls.fps.textContent = fpsValue.toFixed(0);
   }
+
+  // --- visual automation editor (bottom strip) ---
+  // Canvas-based timeline. Lanes are grouped: continuous params first
+  // (slider-style with y-axis encoding value), then discrete (markers with
+  // text labels). Mouse: click a key to drag it in time (and value, if
+  // continuous); click empty lane area to add a key; right-click a key to
+  // delete; drag the ruler to scrub audio; wheel to zoom. The strip shares
+  // the same `lanes` state as the dev panel — mutations route through the
+  // same recordKey/deleteKey paths so autosave stays consistent.
+  const editorEl = document.getElementById('editor');
+  const editorCanvas = document.getElementById('editor-canvas');
+  const ectx = editorCanvas.getContext('2d');
+  let edpr = 1;
+  function resizeEditor() {
+    edpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = editorEl.clientWidth;
+    const cssH = editorEl.clientHeight;
+    editorCanvas.width = Math.floor(cssW * edpr);
+    editorCanvas.height = Math.floor(cssH * edpr);
+    ectx.setTransform(edpr, 0, 0, edpr, 0, 0);
+  }
+  window.addEventListener('resize', resizeEditor);
+  resizeEditor();
+
+  let editorVisible = true;
+  document.body.classList.add('editor-visible');
+  function setEditorVisible(v) {
+    editorVisible = v;
+    editorEl.classList.toggle('hidden', !v);
+    document.body.classList.toggle('editor-visible', v);
+    if (v) resizeEditor();
+  }
+
+  // Visible time window in seconds. Defaults to 0..60; wheel zooms; ruler
+  // drag scrubs. Each frame the window slides to keep the playhead centered
+  // (when audio is loaded), so wheel-zoom only adjusts span.
+  let editorTStart = 0;
+  let editorTEnd = 60;
+  // Hovered key for highlight + tooltip rendering. Null when cursor is not
+  // on a key (or is dragging — drag tooltip is handled separately).
+  let editorHover = null; // { name, keyIdx } | null
+
+  function autoCenterEditor() {
+    if (!currentEl || !isFinite(currentEl.currentTime)) return;
+    const span = editorTEnd - editorTStart;
+    const t = currentEl.currentTime;
+    let s = t - span / 2;
+    let e = s + span;
+    if (s < 0) { e -= s; s = 0; }
+    if (isFinite(currentEl.duration) && e > currentEl.duration) {
+      s -= (e - currentEl.duration);
+      e = currentEl.duration;
+      if (s < 0) s = 0;
+    }
+    editorTStart = s;
+    editorTEnd = e;
+  }
+
+  // Layout constants (CSS px)
+  const ED_TOOLBAR_H = 0;       // reserved for future toolbar; kept 0 for now
+  const ED_RULER_H = 18;
+  const ED_LANE_H_CONT = 30;
+  const ED_LANE_H_DISC = 22;
+  const ED_LABEL_W = 100;
+  const ED_KEY_R = 4;
+  const ED_HIT_PX = 6;          // hit-test slop around keys
+
+  function getLaneOrder() {
+    const cont = [], disc = [];
+    for (const name of PARAM_NAMES) {
+      if (PARAMS[name].type === 'continuous') cont.push(name);
+      else disc.push(name);
+    }
+    return [...cont, ...disc];
+  }
+  function laneRect(name) {
+    let y = ED_TOOLBAR_H + ED_RULER_H;
+    for (const n of getLaneOrder()) {
+      const h = PARAMS[n].type === 'continuous' ? ED_LANE_H_CONT : ED_LANE_H_DISC;
+      if (n === name) return { y0: y, y1: y + h, h };
+      y += h;
+    }
+    return null;
+  }
+  function editorCssSize() {
+    return { w: editorCanvas.width / edpr, h: editorCanvas.height / edpr };
+  }
+  function timeToX(t) {
+    const { w } = editorCssSize();
+    return ED_LABEL_W + (t - editorTStart) / (editorTEnd - editorTStart) * (w - ED_LABEL_W);
+  }
+  function xToTime(x) {
+    const { w } = editorCssSize();
+    return editorTStart + (x - ED_LABEL_W) / (w - ED_LABEL_W) * (editorTEnd - editorTStart);
+  }
+  function valueToY(v, name) {
+    const p = PARAMS[name];
+    const r = laneRect(name);
+    const pad = 5;
+    return r.y0 + pad + (1 - (v - p.min) / (p.max - p.min)) * (r.h - 2 * pad);
+  }
+  function yToValue(y, name) {
+    const p = PARAMS[name];
+    const r = laneRect(name);
+    const pad = 5;
+    let f = 1 - (y - r.y0 - pad) / (r.h - 2 * pad);
+    f = Math.max(0, Math.min(1, f));
+    let v = p.min + f * (p.max - p.min);
+    v = Math.round(v / p.step) * p.step;
+    return Math.max(p.min, Math.min(p.max, v));
+  }
+
+  function renderEditor() {
+    if (!editorVisible) return;
+    const { w, h } = editorCssSize();
+    ectx.fillStyle = 'rgba(0,0,0,0.92)';
+    ectx.fillRect(0, 0, w, h);
+
+    // ruler
+    ectx.fillStyle = 'rgba(255,255,255,0.04)';
+    ectx.fillRect(0, ED_TOOLBAR_H, w, ED_RULER_H);
+    ectx.font = '10px ui-monospace, Menlo, monospace';
+    const span = editorTEnd - editorTStart;
+    let tickInt;
+    if (span <= 20) tickInt = 2;
+    else if (span <= 60) tickInt = 5;
+    else if (span <= 300) tickInt = 30;
+    else if (span <= 1200) tickInt = 60;
+    else tickInt = 300;
+    ectx.fillStyle = '#777';
+    for (let t = Math.ceil(editorTStart / tickInt) * tickInt; t <= editorTEnd; t += tickInt) {
+      const x = timeToX(t);
+      if (x < ED_LABEL_W - 1) continue;
+      ectx.fillStyle = '#3a3a3a';
+      ectx.fillRect(x, ED_TOOLBAR_H + ED_RULER_H - 5, 1, 5);
+      const m = Math.floor(t / 60);
+      const s = Math.round(t - m * 60);
+      ectx.fillStyle = '#888';
+      ectx.fillText(m + ':' + (s < 10 ? '0' : '') + s, x + 3, ED_TOOLBAR_H + 11);
+    }
+
+    // lanes
+    for (const name of getLaneOrder()) {
+      const r = laneRect(name);
+      const p = PARAMS[name];
+      // band background
+      ectx.fillStyle = 'rgba(255,255,255,0.015)';
+      ectx.fillRect(0, r.y0, w, r.h);
+      // separator at the top of each lane
+      ectx.fillStyle = '#1a1a1a';
+      ectx.fillRect(0, r.y0, w, 1);
+      // label
+      ectx.fillStyle = armed[name] ? '#f88' : '#aaa';
+      ectx.fillText(name, 6, r.y0 + r.h / 2 + 4);
+      // label/lane separator
+      ectx.fillStyle = '#222';
+      ectx.fillRect(ED_LABEL_W - 1, r.y0, 1, r.h);
+
+      const lane = lanes[name];
+      if (!lane.length) continue;
+
+      if (p.type === 'continuous') {
+        // segment polyline — sample easing per segment so the actual curve
+        // shape is visible. linear is one lineTo; step draws the corner;
+        // eased curves sample 24 substeps.
+        ectx.strokeStyle = '#555';
+        ectx.lineWidth = 1;
+        ectx.beginPath();
+        ectx.moveTo(timeToX(lane[0].t), valueToY(lane[0].v, name));
+        for (let i = 0; i < lane.length - 1; i++) {
+          const k0 = lane[i], k1 = lane[i + 1];
+          const x0 = timeToX(k0.t), x1 = timeToX(k1.t);
+          const y0 = valueToY(k0.v, name), y1 = valueToY(k1.v, name);
+          const curve = k0.curve || 'linear';
+          if (curve === 'linear') {
+            ectx.lineTo(x1, y1);
+          } else if (curve === 'step') {
+            ectx.lineTo(x1, y0);
+            ectx.lineTo(x1, y1);
+          } else {
+            const ease = EASE[curve];
+            const SUB = 24;
+            for (let j = 1; j <= SUB; j++) {
+              const f = j / SUB;
+              const ef = ease(f);
+              ectx.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * ef);
+            }
+          }
+        }
+        ectx.stroke();
+        // dots — highlight on hover or while being dragged
+        for (let i = 0; i < lane.length; i++) {
+          const k = lane[i];
+          const x = timeToX(k.t);
+          const y = valueToY(k.v, name);
+          if (x < ED_LABEL_W - ED_KEY_R) continue;
+          const hot = (editorHover && editorHover.name === name && editorHover.keyIdx === i) ||
+                      (editorDrag && editorDrag.kind === 'key' && editorDrag.name === name && editorDrag.keyIdx === i);
+          ectx.fillStyle = hot ? '#fff' : '#ddd';
+          ectx.beginPath();
+          ectx.arc(x, y, hot ? ED_KEY_R + 1.5 : ED_KEY_R, 0, Math.PI * 2);
+          ectx.fill();
+        }
+      } else {
+        // triangle markers + text
+        for (let i = 0; i < lane.length; i++) {
+          const k = lane[i];
+          const x = timeToX(k.t);
+          if (x < ED_LABEL_W - 6) continue;
+          const y = r.y0 + 4;
+          const hot = (editorHover && editorHover.name === name && editorHover.keyIdx === i) ||
+                      (editorDrag && editorDrag.kind === 'key' && editorDrag.name === name && editorDrag.keyIdx === i);
+          const sz = hot ? 6 : 5;
+          ectx.fillStyle = hot ? '#fff' : '#ddd';
+          ectx.beginPath();
+          ectx.moveTo(x, y);
+          ectx.lineTo(x - sz, y + sz + 3);
+          ectx.lineTo(x + sz, y + sz + 3);
+          ectx.closePath();
+          ectx.fill();
+          ectx.fillStyle = hot ? '#ddd' : '#aaa';
+          ectx.fillText(String(k.v), x + 6, y + 13);
+        }
+      }
+    }
+
+    // playhead
+    if (currentEl && isFinite(currentEl.currentTime)) {
+      const px = timeToX(currentEl.currentTime);
+      if (px >= ED_LABEL_W - 1 && px <= w) {
+        ectx.fillStyle = '#f55';
+        ectx.fillRect(px - 0.5, ED_TOOLBAR_H, 1, h - ED_TOOLBAR_H);
+      }
+    }
+
+    // left-margin overlay so labels never clip under keys when editor is narrow
+    ectx.fillStyle = 'rgba(0,0,0,0.92)';
+    ectx.fillRect(0, ED_TOOLBAR_H + ED_RULER_H, ED_LABEL_W - 1, h - ED_TOOLBAR_H - ED_RULER_H);
+    for (const name of getLaneOrder()) {
+      const r = laneRect(name);
+      ectx.fillStyle = armed[name] ? '#f88' : '#aaa';
+      ectx.fillText(name, 6, r.y0 + r.h / 2 + 4);
+    }
+
+    // tooltip for hovered or dragged key — drawn last so it sits on top
+    let ttKey = null;
+    if (editorDrag && editorDrag.kind === 'key') {
+      ttKey = { name: editorDrag.name, idx: editorDrag.keyIdx };
+    } else if (editorHover) {
+      ttKey = { name: editorHover.name, idx: editorHover.keyIdx };
+    }
+    if (ttKey) {
+      const lane = lanes[ttKey.name];
+      const k = lane[ttKey.idx];
+      if (k) {
+        const p = PARAMS[ttKey.name];
+        const r = laneRect(ttKey.name);
+        const kx = timeToX(k.t);
+        const ky = p.type === 'continuous' ? valueToY(k.v, ttKey.name) : r.y0 + 4;
+        const m = Math.floor(k.t / 60);
+        const s = k.t - m * 60;
+        const tStr = `${m}:${s.toFixed(1).padStart(4, '0')}`;
+        const label = `${tStr}  ${ttKey.name}=${p.fmt(k.v)}`;
+        ectx.font = '10px ui-monospace, Menlo, monospace';
+        const tw = ectx.measureText(label).width;
+        const padX = 5, padY = 2, th = 14;
+        let tx = kx + 9, ty = ky - th - 6;
+        if (tx + tw + padX * 2 > w - 4) tx = kx - tw - padX * 2 - 9;
+        if (ty < ED_TOOLBAR_H + ED_RULER_H + 2) ty = ky + 8;
+        ectx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+        ectx.fillRect(tx, ty, tw + padX * 2, th);
+        ectx.strokeStyle = '#444';
+        ectx.lineWidth = 1;
+        ectx.strokeRect(tx + 0.5, ty + 0.5, tw + padX * 2 - 1, th - 1);
+        ectx.fillStyle = '#fff';
+        ectx.fillText(label, tx + padX, ty + th - padY - 2);
+      }
+    }
+  }
+
+  // --- editor input ---
+  function editorMouse(e) {
+    const rect = editorCanvas.getBoundingClientRect();
+    return {
+      mx: e.clientX - rect.left,
+      my: e.clientY - rect.top,
+    };
+  }
+  function hitTest(mx, my) {
+    if (mx < ED_LABEL_W) return { kind: 'label' };
+    if (my < ED_TOOLBAR_H + ED_RULER_H) return { kind: 'ruler' };
+    for (const name of getLaneOrder()) {
+      const r = laneRect(name);
+      if (my < r.y0 || my >= r.y1) continue;
+      const lane = lanes[name];
+      const p = PARAMS[name];
+      // closest key by x
+      let bestI = -1, bestDx = ED_HIT_PX + 1;
+      for (let i = 0; i < lane.length; i++) {
+        const dx = Math.abs(timeToX(lane[i].t) - mx);
+        if (dx < bestDx) {
+          if (p.type === 'continuous') {
+            const dy = Math.abs(valueToY(lane[i].v, name) - my);
+            if (dy <= ED_HIT_PX) { bestI = i; bestDx = dx; }
+          } else {
+            bestI = i; bestDx = dx;
+          }
+        }
+      }
+      if (bestI >= 0) return { kind: 'key', name, keyIdx: bestI };
+      const t = Math.max(0, xToTime(mx));
+      const v = p.type === 'continuous' ? yToValue(my, name) : manual[name];
+      return { kind: 'lane', name, t, v };
+    }
+    return { kind: 'none' };
+  }
+
+  let editorDrag = null;
+  editorCanvas.addEventListener('pointerdown', (e) => {
+    if (e.button === 2) return; // right-click handled by contextmenu
+    const { mx, my } = editorMouse(e);
+    const hit = hitTest(mx, my);
+    if (hit.kind === 'ruler') {
+      if (currentEl && isFinite(currentEl.duration)) {
+        currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, xToTime(mx)));
+      }
+      editorDrag = { kind: 'scrub' };
+    } else if (hit.kind === 'key') {
+      editorDrag = { kind: 'key', name: hit.name, keyIdx: hit.keyIdx };
+    } else if (hit.kind === 'lane') {
+      // click-add: insert (or merge) and pick up the new key for drag
+      recordKey(hit.name, hit.t, hit.v);
+      const idx = lanes[hit.name].findIndex(k => Math.abs(k.t - hit.t) < 0.0005);
+      if (idx >= 0) editorDrag = { kind: 'key', name: hit.name, keyIdx: idx };
+    } else {
+      return;
+    }
+    editorCanvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  editorCanvas.addEventListener('pointermove', (e) => {
+    const { mx, my } = editorMouse(e);
+    if (editorDrag) {
+      if (editorDrag.kind === 'scrub') {
+        if (currentEl && isFinite(currentEl.duration)) {
+          currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, xToTime(mx)));
+        }
+        return;
+      }
+      if (editorDrag.kind === 'key') {
+        const lane = lanes[editorDrag.name];
+        const k = lane[editorDrag.keyIdx];
+        if (!k) { editorDrag = null; return; }
+        const p = PARAMS[editorDrag.name];
+        const dur = (currentEl && isFinite(currentEl.duration)) ? currentEl.duration : Infinity;
+        k.t = Math.max(0, Math.min(dur, xToTime(mx)));
+        if (p.type === 'continuous') k.v = yToValue(my, editorDrag.name);
+        lane.sort((a, b) => a.t - b.t);
+        editorDrag.keyIdx = lane.indexOf(k);
+        onLanesMutated();
+      }
+      return;
+    }
+    // not dragging — update hover + cursor
+    const hit = hitTest(mx, my);
+    if (hit.kind === 'key') {
+      editorHover = { name: hit.name, keyIdx: hit.keyIdx };
+      editorCanvas.style.cursor = 'pointer';
+    } else {
+      editorHover = null;
+      if (hit.kind === 'ruler') editorCanvas.style.cursor = 'ew-resize';
+      else if (hit.kind === 'lane') editorCanvas.style.cursor = 'crosshair';
+      else editorCanvas.style.cursor = 'default';
+    }
+  });
+  editorCanvas.addEventListener('pointerleave', () => {
+    if (!editorDrag) editorHover = null;
+  });
+  function endEditorDrag(e) {
+    if (!editorDrag) return;
+    try { editorCanvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    editorDrag = null;
+  }
+  editorCanvas.addEventListener('pointerup', endEditorDrag);
+  editorCanvas.addEventListener('pointercancel', endEditorDrag);
+  // Right-click on a key opens a small context menu: pick the segment curve
+  // (governing this key → next key) or delete. Click anywhere else dismisses.
+  const editorMenu = document.getElementById('editor-menu');
+  let menuTarget = null;
+  function showEditorMenu(clientX, clientY, name, keyIdx) {
+    menuTarget = { name, keyIdx };
+    const k = lanes[name][keyIdx];
+    if (!k) return;
+    const cur = k.curve || 'linear';
+    for (const item of editorMenu.querySelectorAll('[data-curve]')) {
+      item.classList.toggle('selected', item.dataset.curve === cur);
+    }
+    editorMenu.classList.remove('hidden');
+    editorMenu.style.left = clientX + 'px';
+    editorMenu.style.top = clientY + 'px';
+    // Reflow to get measured size, then clamp to viewport.
+    const r = editorMenu.getBoundingClientRect();
+    if (r.right > window.innerWidth - 4) {
+      editorMenu.style.left = (window.innerWidth - r.width - 4) + 'px';
+    }
+    if (r.bottom > window.innerHeight - 4) {
+      editorMenu.style.top = (clientY - r.height) + 'px';
+    }
+  }
+  function hideEditorMenu() {
+    editorMenu.classList.add('hidden');
+    menuTarget = null;
+  }
+  editorMenu.addEventListener('click', (e) => {
+    const item = e.target.closest('[data-curve], [data-action]');
+    if (!item || !menuTarget) { hideEditorMenu(); return; }
+    const k = lanes[menuTarget.name] && lanes[menuTarget.name][menuTarget.keyIdx];
+    if (!k) { hideEditorMenu(); return; }
+    if (item.dataset.curve) {
+      k.curve = item.dataset.curve;
+      onLanesMutated();
+    } else if (item.dataset.action === 'delete') {
+      deleteKey(menuTarget.name, k.t);
+    }
+    hideEditorMenu();
+  });
+  // dismiss menu on outside click / scroll / escape
+  window.addEventListener('mousedown', (e) => {
+    if (editorMenu.classList.contains('hidden')) return;
+    if (editorMenu.contains(e.target)) return;
+    hideEditorMenu();
+  }, true);
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideEditorMenu();
+  });
+  editorCanvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    const { mx, my } = editorMouse(e);
+    const hit = hitTest(mx, my);
+    if (hit.kind === 'key') {
+      showEditorMenu(e.clientX, e.clientY, hit.name, hit.keyIdx);
+    } else {
+      hideEditorMenu();
+    }
+  });
+  editorCanvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 1.25 : 0.8;
+    const newSpan = Math.max(2, Math.min(7200, (editorTEnd - editorTStart) * factor));
+    // preserve current center; auto-center will re-snap to playhead next frame
+    const center = (editorTStart + editorTEnd) / 2;
+    editorTStart = center - newSpan / 2;
+    editorTEnd = center + newSpan / 2;
+  }, { passive: false });
+
+  // 't' toggles the editor strip
+  window.addEventListener('keydown', (e) => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT')) return;
+    if (e.key === 't' || e.key === 'T') setEditorVisible(!editorVisible);
+  });
 
   function frame(now) {
     const dt = Math.min(50, now - last) / 16.67; // normalize to ~60fps units
@@ -2201,6 +2739,8 @@
     }
 
     updateDebug(b, bassDev);
+    autoCenterEditor();
+    renderEditor();
 
     requestAnimationFrame(frame);
   }
