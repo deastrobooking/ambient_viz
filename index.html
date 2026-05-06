@@ -134,8 +134,10 @@
     position: fixed;
     top: 16px;
     right: 16px;
-    width: 230px;
-    background: rgba(0,0,0,0.78);
+    width: 280px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    background: rgba(0,0,0,0.82);
     border: 1px solid #444;
     border-radius: 4px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -226,13 +228,120 @@
     color: #ddd;
     font-variant-numeric: tabular-nums;
   }
-  .dev-thresh-val {
-    text-align: center;
+  .dev-auto-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 0 6px;
+  }
+  .dev-auto-title {
+    flex: 1;
+    color: #aaa;
+    text-transform: lowercase;
+    letter-spacing: 0.05em;
+  }
+  .dev-btn {
+    background: transparent;
+    color: #ccc;
+    border: 1px solid #444;
+    padding: 2px 6px;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 10px;
+    text-transform: lowercase;
+  }
+  .dev-btn:hover { border-color: #888; color: #fff; }
+  .dev-btn.armed { border-color: #f55; color: #f55; }
+  .dev-btn.armed.flashing { background: rgba(255, 60, 60, 0.25); }
+  .dev-load-btn { display: inline-block; }
+  .dev-mini {
+    background: transparent;
+    color: #777;
+    border: none;
+    padding: 0 4px;
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .dev-mini:hover { color: #ddd; }
+  .dev-param {
+    padding: 3px 0;
+    border-top: 1px solid #1d1d1d;
+  }
+  .dev-param-top {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .dev-param-top input[type=checkbox] {
+    margin: 0 4px 0 0;
+    accent-color: #f55;
+  }
+  .dev-param-top .lbl {
+    flex: 1;
+    color: #aaa;
+  }
+  .dev-param-top .val {
     color: #ddd;
     font-variant-numeric: tabular-nums;
-    padding: 2px 0 4px;
+    min-width: 38px;
+    text-align: right;
+  }
+  .dev-param-ctrl {
+    display: flex;
+    align-items: center;
+    padding: 2px 0 0 18px;
+  }
+  .dev-param-ctrl .dev-slider {
+    margin: 0;
+  }
+  .dev-param-ctrl select {
+    flex: 1;
+    background: #1a1a1a;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 2px;
+    padding: 1px 2px;
+    font: inherit;
     font-size: 11px;
   }
+  .dev-keys-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0 2px;
+    color: #777;
+  }
+  .dev-keys {
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid #1d1d1d;
+    border-radius: 2px;
+    padding: 2px;
+  }
+  .dev-keys.hidden { display: none; }
+  .dev-key {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 2px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .dev-key:hover { background: rgba(255,255,255,0.04); }
+  .dev-key .t { color: #888; min-width: 38px; }
+  .dev-key .p { color: #aaa; flex: 1; }
+  .dev-key .v { color: #ddd; }
+  .dev-key .x {
+    background: transparent;
+    color: #666;
+    border: none;
+    padding: 0 4px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .dev-key .x:hover { color: #f55; }
 </style>
 </head>
 <body>
@@ -268,6 +377,9 @@
       <div class="dev-row"><span class="k">target</span><span class="dev-swatch" id="dev-target-sw"></span><span class="v" id="dev-target">— [0]</span></div>
       <div class="dev-row"><span class="k">kicks</span><span class="v" id="dev-kicks">0/0</span></div>
       <div class="dev-row"><span class="k">shape</span><span class="v" id="dev-shape">— 0/0</span></div>
+      <div class="dev-row"><span class="k">silhouette</span><span class="v" id="dev-silh">car</span></div>
+      <div class="dev-row"><span class="k">saturation</span><span class="v" id="dev-sat">1.00</span></div>
+      <div class="dev-row"><span class="k">time</span><span class="v" id="dev-time">0:00 / 0:00</span></div>
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">bass</span><span class="v" id="dev-bass">0.00</span></div>
@@ -277,17 +389,26 @@
       <div class="dev-row"><span class="k">level</span><span class="v" id="dev-level">0.00</span></div>
       <div class="dev-row"><span class="k">bassPulse</span><span class="v" id="dev-bp">0.00</span></div>
       <div class="dev-row"><span class="k">bassDev</span><span class="v" id="dev-bd">0.00</span></div>
-      <div class="dev-row">
-        <span class="k">kick thresh</span>
-        <input type="range" id="dev-kthresh" class="dev-slider" min="0.005" max="0.25" step="0.005" value="0.07">
-      </div>
-      <div class="dev-thresh-val" id="dev-kthresh-val">0.070</div>
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">slices</span><span class="v" id="dev-slices">0</span></div>
       <div class="dev-row"><span class="k">bars inv/mono</span><span class="v" id="dev-bars">0/0</span></div>
       <div class="dev-row"><span class="k">slice angle</span><span class="v" id="dev-slice-ang">0°</span></div>
       <div class="dev-row"><span class="k">freeze</span><span class="v" id="dev-freeze">0</span></div>
+    </div>
+    <div class="dev-section dev-auto">
+      <div class="dev-auto-header">
+        <span class="dev-auto-title">automation</span>
+        <button id="dev-rec" class="dev-btn">● rec</button>
+        <button id="dev-save" class="dev-btn">save</button>
+        <label class="dev-btn dev-load-btn">load<input type="file" id="dev-load" accept=".json" style="display:none"></label>
+      </div>
+      <div id="dev-params"></div>
+      <div class="dev-keys-header">
+        <span>keypoints (<span id="dev-keys-count">0</span>)</span>
+        <button id="dev-keys-toggle" class="dev-mini">hide</button>
+      </div>
+      <div id="dev-keys" class="dev-keys"></div>
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">fps</span><span class="v" id="dev-fps">--</span></div>
@@ -412,7 +533,6 @@
       const dur = audio.duration;
       if (isFinite(dur) && dur > 0) setTimelineProgress(audio.currentTime / dur);
     });
-    audio.play().catch(() => {});
     dropHint.classList.add('hidden');
   }
 
@@ -608,6 +728,139 @@
     [-0.2905,-0.3238,-0.1928,-0.3389,0.1933,-0.3389,0.291,-0.3238,0.2822,-0.3214,0.1816,-0.3302,0.0003,-0.3321,-0.1811,-0.3302,-0.2817,-0.3214,-0.2905,-0.3238],
   ];
 
+  // --- silhouette registry ---
+  // Each entry is the same shape format as CAR_SUBPATHS — a list of subpaths,
+  // each a flat [x,y,...] polyline. Coordinates are normalized so the longest
+  // axis spans [-0.5, 0.5]. Fill mode is 'evenodd' so nested subpaths produce
+  // alternating fill/hole regions.
+  //
+  // The vibe brief: a paranoid, sketchy walk home through a rainy nightclub
+  // city — bass thump bleeding from the next venue, pedestrians, surveillance,
+  // car headlights. These five placeholders cover that ground until you ship
+  // the curated SVG set.
+  function _circle(cx, cy, r, n) {
+    const o = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      o.push(cx + r * Math.cos(a), cy + r * Math.sin(a));
+    }
+    return o;
+  }
+  function _arc(cx, cy, r, a0, a1, n) {
+    const o = [];
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + (a1 - a0) * (i / n);
+      o.push(cx + r * Math.cos(a), cy + r * Math.sin(a));
+    }
+    return o;
+  }
+  function _rect(x0, y0, x1, y1) {
+    return [x0, y0, x1, y0, x1, y1, x0, y1];
+  }
+  function _ringSeg(cx, cy, rOut, rIn, a0, a1, n) {
+    const o = [];
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + (a1 - a0) * (i / n);
+      o.push(cx + rOut * Math.cos(a), cy + rOut * Math.sin(a));
+    }
+    for (let i = n; i >= 0; i--) {
+      const a = a0 + (a1 - a0) * (i / n);
+      o.push(cx + rIn * Math.cos(a), cy + rIn * Math.sin(a));
+    }
+    return o;
+  }
+  // walker — single pedestrian mid-stride. You, walking home.
+  function _buildWalker() {
+    return {
+      aspect: 0.42,
+      subpaths: [
+        _circle(0, -0.40, 0.075, 16),       // head
+        _rect(-0.07, -0.32, 0.07, 0.05),    // torso
+        _rect(-0.10, -0.30, -0.07, 0.10),   // left arm
+        _rect( 0.07, -0.30,  0.10, 0.10),   // right arm
+        _rect(-0.06, 0.05, -0.01, 0.45),    // back leg (slightly shorter)
+        _rect( 0.04, 0.05,  0.09, 0.50),    // forward leg
+      ],
+    };
+  }
+  // umbrella — the small shelter, the rain.
+  function _buildUmbrella() {
+    return {
+      aspect: 1.25,
+      subpaths: [
+        _arc(0, 0, 0.5, Math.PI, 2 * Math.PI, 20),  // dome (top arc, closes flat)
+        _rect(-0.018, 0, 0.018, 0.36),              // stem
+        _ringSeg(0.07, 0.36, 0.07, 0.04, Math.PI / 2, 3 * Math.PI / 2, 10), // hook
+      ],
+    };
+  }
+  // eye — the surveillance, the paranoid stare.
+  function _buildEye() {
+    const top = _arc(0, 0, 0.5, Math.PI, 2 * Math.PI, 16).map((v, i) => i % 2 === 1 ? v * 0.45 : v);
+    const bot = _arc(0, 0, 0.5, 0, Math.PI, 16).map((v, i) => i % 2 === 1 ? v * 0.45 : v);
+    return {
+      aspect: 2.2,
+      subpaths: [
+        top.concat(bot),                   // almond eye outline
+        _circle(0, 0, 0.16, 18),           // iris (hole via evenodd)
+        _circle(0, 0, 0.06, 12),           // pupil dot (fills back in)
+      ],
+    };
+  }
+  // skyline — the city around you, neon density.
+  function _buildSkyline() {
+    // Walk a single closed polyline left to right, dipping for each building roof.
+    const heights = [0.08, 0.32, 0.18, 0.42, 0.14, 0.50, 0.22, 0.36, 0.10, 0.28, 0.16];
+    const baseY = 0.25;
+    const pts = [-0.5, baseY];
+    const n = heights.length;
+    for (let i = 0; i < n; i++) {
+      const x0 = -0.5 + i * (1 / n);
+      const x1 = -0.5 + (i + 1) * (1 / n);
+      const y = baseY - heights[i];
+      pts.push(x0, y, x1, y);
+    }
+    pts.push(0.5, baseY);
+    // little punched windows: a few small rectangle holes
+    const subs = [pts];
+    for (let i = 0; i < n; i++) {
+      if (heights[i] < 0.18) continue;
+      const x0 = -0.5 + i * (1 / n) + 0.015;
+      const x1 = -0.5 + (i + 1) * (1 / n) - 0.015;
+      const yTop = baseY - heights[i] + 0.05;
+      const yBot = baseY - 0.05;
+      // two-row windows, evenly spaced
+      for (let row = 0; row < 2; row++) {
+        const ry0 = yTop + (yBot - yTop) * (row / 3);
+        const ry1 = ry0 + (yBot - yTop) * 0.18;
+        subs.push(_rect(x0 + 0.005, ry0, x1 - 0.005, ry1));
+      }
+    }
+    return { aspect: 2.0, subpaths: subs };
+  }
+  // speaker — the bass thump bleeding from the next club.
+  function _buildSpeaker() {
+    return {
+      aspect: 1.0,
+      subpaths: [
+        _circle(0, 0, 0.50, 28),  // outer rim
+        _circle(0, 0, 0.42, 24),  // rim hole
+        _circle(0, 0, 0.34, 24),  // cone outer
+        _circle(0, 0, 0.13, 16),  // dust cap (fills)
+      ],
+    };
+  }
+  const SILHOUETTES = {
+    car:      { aspect: CAR_ASPECT, subpaths: CAR_SUBPATHS },
+    walker:   _buildWalker(),
+    umbrella: _buildUmbrella(),
+    eye:      _buildEye(),
+    skyline:  _buildSkyline(),
+    speaker:  _buildSpeaker(),
+  };
+  const SILHOUETTE_NAMES = Object.keys(SILHOUETTES);
+  let activeSilhouette = 'car';
+
   // --- particles / shapes ---
   // Two layers:
   //   "flyout": car silhouettes that fly toward the camera from a vanishing
@@ -790,7 +1043,7 @@
   let SLICE_TRIGGER = 0.065;           // bass-onset threshold; live-tunable via the dev panel slider
   const SLICE_BURST_MIN = 5;
   const SLICE_BURST_MAX = 12;
-  const MONO_BAR_CHANCE = 1 / 8;      // per-slice chance to desaturate (B&W) instead of invert
+  let MONO_BAR_CHANCE = 1 / 8;        // per-slice chance to desaturate (B&W) instead of invert
   const SLICE_ANGLE_JITTER = 8 * Math.PI / 180; // ±radians of per-slice angle offset around currentSliceAngle
   const ROW_CORRUPT_AMOUNT = 2.6;     // px of row shift per unit of bassPulse (* rectW)
   const ONSET_THRESHOLD = 0.07;       // level deviation above running avg to trigger
@@ -820,7 +1073,7 @@
     [ 60, 110, 255],  // electric blue
     [255, 255, 255],  // white = identity under multiply = no tint (pure B&W)
   ];
-  const KICKS_PER_COLOR_CYCLE = 64;
+  let KICKS_PER_COLOR_CYCLE = 64;
   const COLOR_LERP = 0.01;            // per-dt lerp toward target tint
 
   // pre-allocated noise canvas + image for grain overlay
@@ -1049,6 +1302,124 @@
   let tintR = COLOR_PALETTE[0][0];
   let tintG = COLOR_PALETTE[0][1];
   let tintB = COLOR_PALETTE[0][2];
+  // 0..1. Lerps the active tint toward white before the multiply pass:
+  // sat=1 → full color, sat=0 → identity (no tint, pure B&W).
+  let saturation = 1.0;
+
+  // --- automation runtime ---
+  // Each automatable parameter has an entry in PARAMS that describes its UI
+  // (slider range / dropdown options) and live setter. Per-param state lives
+  // in three parallel maps:
+  //   manual[name]  — current control (slider/dropdown) value, what the user
+  //                   sees in the dev panel
+  //   lanes[name]   — keypoint array sorted by time. Empty = no automation,
+  //                   live state falls back to manual.
+  //   armed[name]   — true while this lane is set to capture during REC.
+  // Each frame: live = lane.length ? eval(lane, t) : manual[name]. Wipe
+  // empties the lane, so on the next frame live snaps to manual (Option C).
+  const PARAMS = {
+    sliceTrigger: {
+      type: 'continuous', def: 0.065,
+      min: 0.005, max: 0.25, step: 0.005,
+      fmt: v => v.toFixed(3),
+      setLive: v => { SLICE_TRIGGER = v; },
+    },
+    saturation: {
+      type: 'continuous', def: 1.0,
+      min: 0, max: 1, step: 0.01,
+      fmt: v => v.toFixed(2),
+      setLive: v => { saturation = v; },
+    },
+    silhouette: {
+      type: 'discrete', def: 'car',
+      options: () => SILHOUETTE_NAMES,
+      fmt: v => v,
+      setLive: v => { if (SILHOUETTES[v]) activeSilhouette = v; },
+    },
+    kicksPerColorCycle: {
+      type: 'continuous', def: 64,
+      min: 4, max: 128, step: 1,
+      fmt: v => v.toFixed(0),
+      setLive: v => { KICKS_PER_COLOR_CYCLE = Math.round(v); },
+    },
+    monoBarChance: {
+      type: 'continuous', def: 1 / 8,
+      min: 0, max: 0.5, step: 0.005,
+      fmt: v => v.toFixed(3),
+      setLive: v => { MONO_BAR_CHANCE = v; },
+    },
+  };
+  const PARAM_NAMES = Object.keys(PARAMS);
+  const manual = {};
+  const lanes = {};
+  const armed = {};
+  for (const n of PARAM_NAMES) {
+    manual[n] = PARAMS[n].def;
+    lanes[n] = [];
+    armed[n] = false;
+  }
+
+  function evalLane(type, keys, t) {
+    if (!keys || !keys.length) return undefined;
+    if (t <= keys[0].t) return keys[0].v;
+    if (t >= keys[keys.length - 1].t) return keys[keys.length - 1].v;
+    let i = 0;
+    while (i < keys.length - 1 && keys[i + 1].t <= t) i++;
+    const k0 = keys[i], k1 = keys[i + 1];
+    if (type === 'discrete') return k0.v;
+    const span = k1.t - k0.t;
+    const f = span > 0 ? (t - k0.t) / span : 0;
+    return k0.v + (k1.v - k0.v) * f;
+  }
+
+  // Resolve every parameter's live value for the current playback time.
+  // Lane-driven if keys exist; falls back to manual otherwise. Always called
+  // when audio is loaded, so a value is written every frame — that's how
+  // post-wipe snap to manual happens. Also mirrors the value into the
+  // dev-panel control so the slider/dropdown visibly tracks automation.
+  function applyAutomation(t) {
+    for (const name of PARAM_NAMES) {
+      const lane = lanes[name];
+      const v = (lane.length > 0)
+        ? evalLane(PARAMS[name].type, lane, t)
+        : manual[name];
+      if (v === undefined) continue;
+      PARAMS[name].setLive(v);
+      if (paramCtrls[name]) paramCtrls[name].apply(v);
+    }
+  }
+
+  // Insert/replace a keypoint in the lane. If a key exists within MERGE_DT of
+  // t, replace it (so dragging a slider during REC produces one key per ~250ms
+  // window rather than a smear). Otherwise insert in sorted position.
+  const KEY_MERGE_DT = 0.25; // seconds
+  function recordKey(name, t, v) {
+    const lane = lanes[name];
+    let i = 0;
+    while (i < lane.length && lane[i].t < t - KEY_MERGE_DT) i++;
+    if (i < lane.length && Math.abs(lane[i].t - t) <= KEY_MERGE_DT) {
+      lane[i] = { t, v };
+    } else {
+      // find insert position (first index where lane[i].t > t)
+      let j = 0;
+      while (j < lane.length && lane[j].t <= t) j++;
+      lane.splice(j, 0, { t, v });
+    }
+    onLanesMutated();
+  }
+
+  function wipeLane(name) {
+    lanes[name].length = 0;
+    onLanesMutated();
+  }
+  function deleteKey(name, t) {
+    const lane = lanes[name];
+    const i = lane.findIndex(k => k.t === t);
+    if (i >= 0) {
+      lane.splice(i, 1);
+      onLanesMutated();
+    }
+  }
 
   // --- dev overlay (draggable debug panel) ---
   // 'd' toggles. Header is the drag handle; close button hides. The overlay
@@ -1057,14 +1428,245 @@
   const devOverlay = document.getElementById('dev-overlay');
   const devHeader = document.getElementById('dev-header');
   const devClose = document.getElementById('dev-close');
-  const devKThresh = document.getElementById('dev-kthresh');
-  const devKThreshVal = document.getElementById('dev-kthresh-val');
-  devKThresh.value = SLICE_TRIGGER;
-  devKThreshVal.textContent = SLICE_TRIGGER.toFixed(3);
-  devKThresh.addEventListener('input', () => {
-    SLICE_TRIGGER = parseFloat(devKThresh.value);
-    devKThreshVal.textContent = SLICE_TRIGGER.toFixed(3);
+  const devRecBtn = document.getElementById('dev-rec');
+  const devSaveBtn = document.getElementById('dev-save');
+  const devLoadInput = document.getElementById('dev-load');
+  const devParamsEl = document.getElementById('dev-params');
+  const devKeysEl = document.getElementById('dev-keys');
+  const devKeysCount = document.getElementById('dev-keys-count');
+  const devKeysToggle = document.getElementById('dev-keys-toggle');
+
+  // Per-param control elements, keyed by param name. Built once below; the
+  // `apply` function on each gets called whenever the underlying lane or
+  // manual value changes (e.g. timeline drives sliceTrigger → slider thumb
+  // moves). The `read` function pulls the current value out of the control.
+  const paramCtrls = {};
+  let recording = false;
+
+  function fmtKeyTime(t) {
+    const m = Math.floor(t / 60);
+    const s = t - m * 60;
+    return `${m}:${s.toFixed(1).padStart(4, '0')}`;
+  }
+
+  function buildParamRow(name) {
+    const p = PARAMS[name];
+    const row = document.createElement('div');
+    row.className = 'dev-param';
+    const top = document.createElement('div');
+    top.className = 'dev-param-top';
+    const arm = document.createElement('input');
+    arm.type = 'checkbox';
+    arm.title = 'arm for record';
+    arm.addEventListener('change', () => {
+      armed[name] = arm.checked;
+      saveSession();
+    });
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = name;
+    const val = document.createElement('span');
+    val.className = 'val';
+    const wipe = document.createElement('button');
+    wipe.className = 'dev-mini';
+    wipe.textContent = 'wipe';
+    wipe.title = 'clear all keypoints for this param';
+    wipe.addEventListener('click', () => {
+      if (lanes[name].length > 0) wipeLane(name);
+    });
+    top.append(arm, lbl, val, wipe);
+    row.append(top);
+
+    const ctrlRow = document.createElement('div');
+    ctrlRow.className = 'dev-param-ctrl';
+    let read, apply;
+    if (p.type === 'continuous') {
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.className = 'dev-slider';
+      slider.min = String(p.min);
+      slider.max = String(p.max);
+      slider.step = String(p.step);
+      slider.value = String(manual[name]);
+      val.textContent = p.fmt(manual[name]);
+      slider.addEventListener('input', () => {
+        const v = parseFloat(slider.value);
+        manual[name] = v;
+        val.textContent = p.fmt(v);
+        // Apply for live preview when no audio is playing or no automation
+        // exists. When automation is driving, applyAutomation each frame
+        // overrides this; the manual change still records if armed.
+        if (!currentEl || lanes[name].length === 0) p.setLive(v);
+        if (recording && armed[name] && currentEl && isFinite(currentEl.currentTime)) {
+          recordKey(name, currentEl.currentTime, v);
+        } else {
+          saveSession();
+        }
+      });
+      ctrlRow.append(slider);
+      read = () => parseFloat(slider.value);
+      apply = (v) => {
+        slider.value = String(v);
+        val.textContent = p.fmt(v);
+      };
+    } else {
+      const sel = document.createElement('select');
+      const opts = p.options();
+      for (const o of opts) {
+        const opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        sel.append(opt);
+      }
+      sel.value = manual[name];
+      val.textContent = manual[name];
+      sel.addEventListener('change', () => {
+        const v = sel.value;
+        manual[name] = v;
+        val.textContent = v;
+        if (!currentEl || lanes[name].length === 0) p.setLive(v);
+        if (recording && armed[name] && currentEl && isFinite(currentEl.currentTime)) {
+          recordKey(name, currentEl.currentTime, v);
+        } else {
+          saveSession();
+        }
+      });
+      ctrlRow.append(sel);
+      read = () => sel.value;
+      apply = (v) => { sel.value = v; val.textContent = v; };
+    }
+    row.append(ctrlRow);
+
+    paramCtrls[name] = { arm, val, apply, read };
+    return row;
+  }
+
+  for (const name of PARAM_NAMES) {
+    devParamsEl.append(buildParamRow(name));
+  }
+
+  function renderKeys() {
+    const all = [];
+    for (const name of PARAM_NAMES) {
+      for (const k of lanes[name]) all.push({ name, t: k.t, v: k.v });
+    }
+    all.sort((a, b) => a.t - b.t || a.name.localeCompare(b.name));
+    devKeysCount.textContent = String(all.length);
+    devKeysEl.innerHTML = '';
+    for (const k of all) {
+      const row = document.createElement('div');
+      row.className = 'dev-key';
+      const tEl = document.createElement('span'); tEl.className = 't'; tEl.textContent = fmtKeyTime(k.t);
+      const pEl = document.createElement('span'); pEl.className = 'p'; pEl.textContent = k.name;
+      const vEl = document.createElement('span'); vEl.className = 'v';
+      vEl.textContent = PARAMS[k.name].fmt(k.v);
+      const xEl = document.createElement('button'); xEl.className = 'x'; xEl.textContent = '×';
+      xEl.title = 'delete keypoint';
+      xEl.addEventListener('click', () => deleteKey(k.name, k.t));
+      row.append(tEl, pEl, vEl, xEl);
+      devKeysEl.append(row);
+    }
+  }
+  devKeysToggle.addEventListener('click', () => {
+    devKeysEl.classList.toggle('hidden');
+    devKeysToggle.textContent = devKeysEl.classList.contains('hidden') ? 'show' : 'hide';
   });
+
+  function onLanesMutated() {
+    renderKeys();
+    saveSession();
+  }
+
+  // REC toggle. When recording, the button gets a flashing red border to
+  // remind the user that any change to an armed control writes a keypoint.
+  devRecBtn.addEventListener('click', () => {
+    recording = !recording;
+    devRecBtn.classList.toggle('armed', recording);
+    devRecBtn.textContent = recording ? '■ rec' : '● rec';
+  });
+
+  // --- save / load ---
+  function serialize() {
+    const out = { version: 1, audioRef: (currentEl && currentEl.src) ? statusEl.textContent : '', lanes: {} };
+    for (const name of PARAM_NAMES) {
+      out.lanes[name] = lanes[name].map(k => ({ t: k.t, v: k.v }));
+    }
+    return out;
+  }
+  function loadFromObject(obj) {
+    if (!obj || !obj.lanes) return false;
+    for (const name of PARAM_NAMES) {
+      lanes[name] = Array.isArray(obj.lanes[name]) ? obj.lanes[name].slice() : [];
+    }
+    renderKeys();
+    return true;
+  }
+  devSaveBtn.addEventListener('click', () => {
+    const data = serialize();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    const baseName = (data.audioRef || 'arrangement').replace(/\.[^.]+$/, '');
+    a.href = URL.createObjectURL(blob);
+    a.download = baseName + '.timeline.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  devLoadInput.addEventListener('change', () => {
+    const f = devLoadInput.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const obj = JSON.parse(r.result);
+        loadFromObject(obj);
+        saveSession();
+      } catch (e) {
+        statusEl.textContent = 'load failed';
+      }
+    };
+    r.readAsText(f);
+    devLoadInput.value = '';
+  });
+
+  // --- localStorage autosave ---
+  const SESSION_KEY = 'ambient_viz_session_v1';
+  let saveTimer = null;
+  function saveSession() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        localStorage.setItem(SESSION_KEY, JSON.stringify({
+          lanes: serialize().lanes,
+          manual,
+          armed,
+        }));
+      } catch (_) {}
+    }, 200);
+  }
+  (function restoreSession() {
+    try {
+      const raw = localStorage.getItem(SESSION_KEY);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      if (obj.lanes) loadFromObject({ lanes: obj.lanes });
+      if (obj.manual) {
+        for (const name of PARAM_NAMES) {
+          if (obj.manual[name] !== undefined) {
+            manual[name] = obj.manual[name];
+            paramCtrls[name].apply(obj.manual[name]);
+            PARAMS[name].setLive(obj.manual[name]);
+          }
+        }
+      }
+      if (obj.armed) {
+        for (const name of PARAM_NAMES) {
+          armed[name] = !!obj.armed[name];
+          paramCtrls[name].arm.checked = armed[name];
+        }
+      }
+    } catch (_) {}
+  })();
+  renderKeys();
   const devEls = {
     tint: document.getElementById('dev-tint'),
     tintSw: document.getElementById('dev-tint-sw'),
@@ -1072,6 +1674,9 @@
     targetSw: document.getElementById('dev-target-sw'),
     kicks: document.getElementById('dev-kicks'),
     shape: document.getElementById('dev-shape'),
+    silh: document.getElementById('dev-silh'),
+    sat: document.getElementById('dev-sat'),
+    time: document.getElementById('dev-time'),
     bass: document.getElementById('dev-bass'),
     bf: document.getElementById('dev-bf'),
     mid: document.getElementById('dev-mid'),
@@ -1133,6 +1738,13 @@
     const inShape = Math.round(shapeProgress * KICKS_PER_SHAPE_CYCLE);
     devEls.shape.textContent =
       `${SHAPE_NAMES[shapeIndex]}→${SHAPE_NAMES[(shapeIndex + 1) % SHAPE_NAMES.length]} ${inShape}/${KICKS_PER_SHAPE_CYCLE}`;
+    devEls.silh.textContent = activeSilhouette;
+    devEls.sat.textContent = saturation.toFixed(2);
+    if (currentEl && isFinite(currentEl.duration)) {
+      devEls.time.textContent = `${fmtTime(currentEl.currentTime)} / ${fmtTime(currentEl.duration)}`;
+    } else {
+      devEls.time.textContent = '0:00 / 0:00';
+    }
     devEls.bass.textContent = b.bass.toFixed(2);
     devEls.bf.textContent = b.bassFast.toFixed(2);
     devEls.mid.textContent = b.mid.toFixed(2);
@@ -1154,6 +1766,9 @@
     last = now;
     inversionRegions.length = 0;
     monoRegions.length = 0;
+    if (currentEl && isFinite(currentEl.currentTime)) {
+      applyAutomation(currentEl.currentTime);
+    }
     fpsAccumCount++;
     if (now - fpsAccumStart >= 500) {
       fpsValue = fpsAccumCount * 1000 / (now - fpsAccumStart);
@@ -1352,8 +1967,9 @@
       // build the silhouette path at the current draw scale. Done inline
       // (rather than ctx.scale) so stroke widths stay in pixel units.
       ctx.beginPath();
-      for (let k = 0; k < CAR_SUBPATHS.length; k++) {
-        const sub = CAR_SUBPATHS[k];
+      const subs = (SILHOUETTES[activeSilhouette] || SILHOUETTES.car).subpaths;
+      for (let k = 0; k < subs.length; k++) {
+        const sub = subs[k];
         for (let j = 0; j < sub.length; j += 2) {
           const px = sub[j] * drawScale;
           const py = sub[j + 1] * drawScale;
@@ -1515,8 +2131,13 @@
     // Skipped on monochrome freeze frames so the freeze reads as a B&W beat.
     const tintActive = !(freezeFrames > 0 && freezeMono);
     if (tintActive) {
+      // saturation lerps the tint toward white (multiply identity)
+      const sat = Math.max(0, Math.min(1, saturation));
+      const effR = 255 - (255 - tintR) * sat;
+      const effG = 255 - (255 - tintG) * sat;
+      const effB = 255 - (255 - tintB) * sat;
       ctx.globalCompositeOperation = 'multiply';
-      ctx.fillStyle = `rgb(${tintR | 0},${tintG | 0},${tintB | 0})`;
+      ctx.fillStyle = `rgb(${effR | 0},${effG | 0},${effB | 0})`;
       ctx.fillRect(0, 0, W, H);
       ctx.globalCompositeOperation = 'source-over';
       // mono bars: repaint the pre-tint B&W (still in ditherCanvas) inside
