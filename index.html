@@ -962,6 +962,28 @@
   const SILHOUETTE_NAMES = Object.keys(SILHOUETTES);
   let activeSilhouette = 'car';
 
+  // Build one Path2D per silhouette in normalized unit coords ([-0.5, 0.5]).
+  // Geometry is fixed; flyouts only change scale + rotation per frame, so
+  // emitting moveTo/lineTo per point per frame is wasted work. Render code
+  // applies translate/rotate/scale via the context transform and calls
+  // ctx.fill(path)/ctx.stroke(path) — strokes compensate the scaled
+  // transform by dividing pixel-space line width by drawScale.
+  for (let _i = 0; _i < SILHOUETTE_NAMES.length; _i++) {
+    const _entry = SILHOUETTES[SILHOUETTE_NAMES[_i]];
+    const _path = new Path2D();
+    const _subs = _entry.subpaths;
+    for (let _k = 0; _k < _subs.length; _k++) {
+      const _sub = _subs[_k];
+      if (_sub.length < 2) continue;
+      _path.moveTo(_sub[0], _sub[1]);
+      for (let _j = 2; _j < _sub.length; _j += 2) {
+        _path.lineTo(_sub[_j], _sub[_j + 1]);
+      }
+      _path.closePath();
+    }
+    _entry.path = _path;
+  }
+
   // --- particles / shapes ---
   // Two layers:
   //   "flyout": car silhouettes that fly toward the camera from a vanishing
@@ -1160,6 +1182,9 @@
   let SLICE_TRIGGER = 0.065;           // bass-onset threshold; live-tunable via the dev panel slider
   const SLICE_BURST_MIN = 5;
   const SLICE_BURST_MAX = 12;
+  // Multiplier on the per-burst slice count. 1.0 = original 5–12 range,
+  // 0 = no slices ever spawn, 3.0 ≈ 15–36 per burst. Live tunable.
+  let SLICE_BURST_SCALE = 1.0;
   let MONO_BAR_CHANCE = 1 / 8;        // per-slice chance to desaturate (B&W) instead of invert
   const SLICE_ANGLE_JITTER = 8 * Math.PI / 180; // ±radians of per-slice angle offset around currentSliceAngle
   let ROW_CORRUPT_AMOUNT = 2.6;       // px of row shift per unit of bassPulse (* rectW) (live tunable)
@@ -1169,7 +1194,10 @@
   let MID_SLICE_TRIGGER = 0.09;       // mid-pulse threshold for additional tears (live tunable)
   let FLASH_TRIGGER = 0.18;           // bass rising-edge threshold for invert/strobe flash (live tunable)
   const FREEZE_FRAMES_MIN = 4;
-  const FREEZE_FRAMES_MAX = 12;
+  // Upper bound (in normalized 60fps frame units) for the freeze base
+  // duration. Final freeze length = base × (1 or 2) where base is a
+  // random integer in [FREEZE_FRAMES_MIN, FREEZE_FRAMES_MAX]. Live tunable.
+  let FREEZE_FRAMES_MAX = 12;
   const DITHER_TILES_X = 8;           // dither pattern tile (Bayer 8x8)
   const DITHER_TILES_Y = 8;
   // Color overlay applied AFTER dither. The dithered image is pure B&W, so
@@ -1200,6 +1228,19 @@
   const noiseCtx = noiseCanvas.getContext('2d');
   const noiseImg = noiseCtx.createImageData(GRAIN_RES, GRAIN_RES);
 
+  // Scanline pattern: a 1 × SCANLINE_PERIOD tile with row 0 fully opaque
+  // black and remaining rows transparent. Tiled via createPattern; one
+  // fillRect per frame replaces the previous loop of ~H/SCANLINE_PERIOD
+  // fillRect calls. SCANLINE_ALPHA is applied at draw time via globalAlpha
+  // so the live tunable doesn't require re-baking the tile.
+  const scanlineTile = document.createElement('canvas');
+  scanlineTile.width = 1;
+  scanlineTile.height = SCANLINE_PERIOD;
+  const scanlineTileCtx = scanlineTile.getContext('2d');
+  scanlineTileCtx.fillStyle = '#000';
+  scanlineTileCtx.fillRect(0, 0, 1, 1);
+  const scanlinePattern = ctx.createPattern(scanlineTile, 'repeat');
+
   function regenNoise(density) {
     // sparse bright pixels on black — phosphor-static look. density 0..1.
     const data = noiseImg.data;
@@ -1229,7 +1270,8 @@
   let nextRotateBeats = 3 + Math.floor(Math.random() * 6); // 3–8 beats
 
   function spawnSliceBurst(intensity) {
-    const count = SLICE_BURST_MIN + Math.floor(Math.random() * (SLICE_BURST_MAX - SLICE_BURST_MIN + 1));
+    const base = SLICE_BURST_MIN + Math.floor(Math.random() * (SLICE_BURST_MAX - SLICE_BURST_MIN + 1));
+    const count = Math.max(0, Math.round(base * SLICE_BURST_SCALE));
     for (let i = 0; i < count; i++) {
       slices.push({
         y: Math.random() * H,
@@ -1258,8 +1300,30 @@
   // Dither runs at CSS resolution (not device res) for speed and chunkier
   // pixel-art look. Result is then nearest-neighbor scaled back to the main
   // canvas so dither cells appear ~dpr device-pixels wide.
+  //
+  // The threshold step runs on the GPU via a WebGL fragment shader. Per
+  // frame: upload the 2D main canvas into a source texture, sample with
+  // bilinear filtering (matching the previous downsample), threshold the
+  // R channel against a Bayer 8x8 LUT (a small LUMINANCE texture), output
+  // pure black or white. The resulting WebGL canvas is then drawImage'd
+  // onto the main canvas at full device resolution with nearest-neighbor
+  // for chunky pixels — same downstream contract as the previous CPU
+  // implementation, including consumption by the mono-region pass below.
+  //
+  // Variable name `ditherCanvas` is preserved so the rest of the code
+  // (notably the mono-region repaint) needs no changes.
   const ditherCanvas = document.createElement('canvas');
-  const ditherCtx = ditherCanvas.getContext('2d');
+  const ditherGL = ditherCanvas.getContext('webgl', {
+    preserveDrawingBuffer: true,  // mono-region pass reads ditherCanvas later in the same frame
+    premultipliedAlpha: false,
+    antialias: false,
+    alpha: false,
+    depth: false,
+    stencil: false,
+  });
+  if (!ditherGL) {
+    throw new Error('WebGL not supported — required for dither pass');
+  }
   function resizeDither() {
     ditherCanvas.width = Math.max(1, Math.ceil(W));
     ditherCanvas.height = Math.max(1, Math.ceil(H));
@@ -1267,28 +1331,127 @@
   resizeDither();
   window.addEventListener('resize', resizeDither);
 
+  // shaders
+  const _DITHER_VS = `
+    attribute vec2 aPos;
+    varying vec2 vUv;
+    void main() {
+      // aPos is the fullscreen quad in clip space; vUv runs 0..1 across it.
+      // UNPACK_FLIP_Y_WEBGL=true is set at upload time so vUv (0,0) reads
+      // the canvas top-left and vUv (1,1) reads the bottom-right. Without
+      // that flip the dither canvas presents Y-inverted, which is invisible
+      // for the global upscale (lattice is roughly symmetric) but breaks
+      // the mono/inversion-region pass — clipped slice rects would repaint
+      // with content from the opposite Y of the canvas, reading as a
+      // high-contrast intrusion rather than a local re-tint.
+      vUv = aPos * 0.5 + 0.5;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+  const _DITHER_FS = `
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform sampler2D uBayer;
+    uniform vec2 uTexSize;
+    uniform vec2 uOffset;
+    void main() {
+      // R channel = luminance: by the time we run, the upstream pipeline
+      // has produced grayscale content in B&W aesthetic.
+      float lum = texture2D(uTex, vUv).r;
+      // Bayer threshold lookup: pre-baked into the LUT as the same value
+      // the CPU path used: (BAYER8 * 4 + 2) / 255, normalized to 0..1.
+      vec2 pix = vUv * uTexSize;
+      vec2 byx = mod(pix + uOffset, 8.0);
+      float thresh = texture2D(uBayer, (byx + 0.5) / 8.0).r;
+      gl_FragColor = lum > thresh ? vec4(1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+    }
+  `;
+  function _compileDitherShader(type, src) {
+    const sh = ditherGL.createShader(type);
+    ditherGL.shaderSource(sh, src);
+    ditherGL.compileShader(sh);
+    if (!ditherGL.getShaderParameter(sh, ditherGL.COMPILE_STATUS)) {
+      throw new Error('dither shader compile: ' + ditherGL.getShaderInfoLog(sh));
+    }
+    return sh;
+  }
+  const _ditherProg = ditherGL.createProgram();
+  ditherGL.attachShader(_ditherProg, _compileDitherShader(ditherGL.VERTEX_SHADER, _DITHER_VS));
+  ditherGL.attachShader(_ditherProg, _compileDitherShader(ditherGL.FRAGMENT_SHADER, _DITHER_FS));
+  ditherGL.linkProgram(_ditherProg);
+  if (!ditherGL.getProgramParameter(_ditherProg, ditherGL.LINK_STATUS)) {
+    throw new Error('dither program link: ' + ditherGL.getProgramInfoLog(_ditherProg));
+  }
+  const _ditherQuad = ditherGL.createBuffer();
+  ditherGL.bindBuffer(ditherGL.ARRAY_BUFFER, _ditherQuad);
+  ditherGL.bufferData(ditherGL.ARRAY_BUFFER, new Float32Array([
+    -1, -1,
+     1, -1,
+    -1,  1,
+     1,  1,
+  ]), ditherGL.STATIC_DRAW);
+  const _ditherUTex    = ditherGL.getUniformLocation(_ditherProg, 'uTex');
+  const _ditherUBayer  = ditherGL.getUniformLocation(_ditherProg, 'uBayer');
+  const _ditherUSize   = ditherGL.getUniformLocation(_ditherProg, 'uTexSize');
+  const _ditherUOffset = ditherGL.getUniformLocation(_ditherProg, 'uOffset');
+  const _ditherAPos    = ditherGL.getAttribLocation(_ditherProg, 'aPos');
+  // source texture: 2D canvas content, bilinear filter (matches previous
+  // imageSmoothingEnabled=true downsample).
+  const _ditherSrcTex = ditherGL.createTexture();
+  ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherSrcTex);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MIN_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.CLAMP_TO_EDGE);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.CLAMP_TO_EDGE);
+  // Bayer LUT: 8x8 LUMINANCE, pre-baked thresholds in 0..255.
+  const _bayerThresh = new Uint8Array(64);
+  for (let _i = 0; _i < 64; _i++) _bayerThresh[_i] = (BAYER8[_i] << 2) + 2;
+  const _ditherBayerTex = ditherGL.createTexture();
+  ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherBayerTex);
+  ditherGL.pixelStorei(ditherGL.UNPACK_ALIGNMENT, 1);
+  ditherGL.texImage2D(
+    ditherGL.TEXTURE_2D, 0,
+    ditherGL.LUMINANCE, 8, 8, 0,
+    ditherGL.LUMINANCE, ditherGL.UNSIGNED_BYTE,
+    _bayerThresh
+  );
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MIN_FILTER, ditherGL.NEAREST);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.NEAREST);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.REPEAT);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.REPEAT);
+
   function applyDither(offX, offY) {
     const dw = ditherCanvas.width;
     const dh = ditherCanvas.height;
     if (dw <= 0 || dh <= 0) return;
-    // downsample current frame onto the dither canvas
-    ditherCtx.imageSmoothingEnabled = true;
-    ditherCtx.drawImage(canvas, 0, 0, dw, dh);
-    const img = ditherCtx.getImageData(0, 0, dw, dh);
-    const data = img.data;
-    const data32 = new Uint32Array(data.buffer);
-    const ox = offX & 7, oy = offY & 7;
-    for (let y = 0; y < dh; y++) {
-      const by = ((y + oy) & 7) << 3;
-      for (let x = 0; x < dw; x++) {
-        const idx = y * dw + x;
-        const lum = data[idx << 2]; // R channel; content is grayscale
-        const t = (BAYER8[by + ((x + ox) & 7)] << 2) + 2; // 2..254
-        data32[idx] = lum > t ? 0xFFFFFFFF : 0xFF000000;
-      }
-    }
-    ditherCtx.putImageData(img, 0, 0);
-    // copy back nearest-neighbor at full canvas resolution
+    const gl = ditherGL;
+    // upload main canvas → source texture. Browsers have a fast path for
+    // canvas-as-texImage2D-source so this stays GPU-resident in practice.
+    // UNPACK_FLIP_Y_WEBGL=true so texture orientation matches the 2D
+    // canvas (origin top-left); needed for the mono-region pass to repaint
+    // local content under each slice rather than content from the
+    // opposite Y of the canvas.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+    // bind program + buffer + attribs
+    gl.viewport(0, 0, dw, dh);
+    gl.useProgram(_ditherProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, _ditherQuad);
+    gl.enableVertexAttribArray(_ditherAPos);
+    gl.vertexAttribPointer(_ditherAPos, 2, gl.FLOAT, false, 0, 0);
+    // uniforms: source on unit 0, Bayer LUT on unit 1
+    gl.uniform1i(_ditherUTex, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, _ditherBayerTex);
+    gl.uniform1i(_ditherUBayer, 1);
+    gl.uniform2f(_ditherUSize, dw, dh);
+    gl.uniform2f(_ditherUOffset, offX & 7, offY & 7);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // composite the dithered output onto the main canvas at full device
+    // resolution, nearest-neighbor for chunky pixels.
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.imageSmoothingEnabled = false;
@@ -1542,6 +1705,18 @@
       min: 0.01, max: 0.3, step: 0.005,
       fmt: v => v.toFixed(3), editor: false,
       setLive: v => { MID_SLICE_TRIGGER = v; },
+    },
+    sliceBurstScale: {
+      type: 'continuous', def: 1.0,
+      min: 0, max: 3, step: 0.05,
+      fmt: v => v.toFixed(2), editor: false,
+      setLive: v => { SLICE_BURST_SCALE = v; },
+    },
+    freezeFramesMax: {
+      type: 'continuous', def: 12,
+      min: 4, max: 60, step: 1,
+      fmt: v => v.toFixed(0), editor: false,
+      setLive: v => { FREEZE_FRAMES_MAX = Math.max(FREEZE_FRAMES_MIN, Math.round(v)); },
     },
     colorLerp: {
       type: 'continuous', def: 0.01,
@@ -2001,9 +2176,9 @@
     devEls.slices.textContent = slices.length;
     devEls.bars.textContent = `${inversionRegions.length}/${monoRegions.length}`;
     devEls.sliceAng.textContent = ((currentSliceAngle * 180 / Math.PI) | 0) + '°';
-    devEls.freeze.textContent = freezeFrames > 0
+    devEls.freeze.textContent = (freezeFrames > 0
       ? freezeFrames.toFixed(1) + (freezeMono ? ' mono' : '')
-      : '0';
+      : '0') + ` (max=${FREEZE_FRAMES_MAX})`;
     devEls.fps.textContent = fpsValue.toFixed(0);
   }
 
@@ -2704,34 +2879,30 @@
       // bass throb — brighten alpha on each kick so shapes pulse with bass
       a = Math.min(1, a * (1 + bassPulse * 0.7));
 
+      // Cached Path2D in normalized unit coords; we apply scale via the
+      // context transform and divide pixel-space line widths by drawScale
+      // to compensate. Avoids per-frame moveTo/lineTo emission across all
+      // subpaths × all flyouts.
+      const silh = SILHOUETTES[activeSilhouette] || SILHOUETTES.car;
+      const path = silh.path;
       ctx.save();
       ctx.translate(sx, sy);
       ctx.rotate(rot);
-      // build the silhouette path at the current draw scale. Done inline
-      // (rather than ctx.scale) so stroke widths stay in pixel units.
-      ctx.beginPath();
-      const subs = (SILHOUETTES[activeSilhouette] || SILHOUETTES.car).subpaths;
-      for (let k = 0; k < subs.length; k++) {
-        const sub = subs[k];
-        for (let j = 0; j < sub.length; j += 2) {
-          const px = sub[j] * drawScale;
-          const py = sub[j + 1] * drawScale;
-          if (j === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-      }
+      ctx.scale(drawScale, drawScale);
       // translucent fill — dither will stipple it into a density pattern.
       // even-odd makes inner subpaths render as holes (windshield, grille).
       ctx.fillStyle = `rgba(255,255,255,${a * s.fillAlpha})`;
-      ctx.fill('evenodd');
-      // outer glow stroke (wider, dimmer) + crisp inner stroke
+      ctx.fill(path, 'evenodd');
+      // outer glow stroke (wider, dimmer) + crisp inner stroke. lineWidth
+      // is divided by drawScale so the rendered width stays in CSS pixels
+      // despite the scaled transform.
+      const invScale = 1 / drawScale;
       ctx.strokeStyle = `rgba(255,255,255,${a * 0.35})`;
-      ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2);
-      ctx.stroke();
+      ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2) * invScale;
+      ctx.stroke(path);
       ctx.strokeStyle = `rgba(255,255,255,${a * 0.95})`;
-      ctx.lineWidth = Math.max(1, 1 + sc * 0.3);
-      ctx.stroke();
+      ctx.lineWidth = Math.max(1, 1 + sc * 0.3) * invScale;
+      ctx.stroke(path);
       ctx.restore();
     }
 
@@ -2848,12 +3019,16 @@
     }
     } // end normal render branch
 
-    // --- scanlines: dark rows every SCANLINE_PERIOD CSS px
+    // --- scanlines: dark rows every SCANLINE_PERIOD CSS px.
+    // Pre-baked 1×SCANLINE_PERIOD tile, repeat-tiled via createPattern;
+    // one fillRect replaces the previous per-row fillRect loop.
+    // SCANLINE_ALPHA modulates via globalAlpha so the live tunable
+    // doesn't need to re-bake the tile.
     ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = `rgba(0,0,0,${SCANLINE_ALPHA})`;
-    for (let y = 0; y < H; y += SCANLINE_PERIOD) {
-      ctx.fillRect(0, y, W, 1);
-    }
+    ctx.globalAlpha = SCANLINE_ALPHA;
+    ctx.fillStyle = scanlinePattern;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
 
     // --- film grain / TV snow: regenerated every frame, additive overlay.
     // density rises with treble for shimmery hi-hat fizz.
