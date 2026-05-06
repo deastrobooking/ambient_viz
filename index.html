@@ -191,6 +191,48 @@
     display: inline-block;
     flex: 0 0 auto;
   }
+  .dev-slider {
+    flex: 1;
+    margin: 0 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 3px;
+    background: #333;
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+  .dev-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 10px;
+    height: 10px;
+    background: #ddd;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .dev-slider::-moz-range-thumb {
+    width: 10px;
+    height: 10px;
+    background: #ddd;
+    border: none;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .dev-num {
+    flex: 0 0 auto;
+    min-width: 38px;
+    text-align: right;
+    color: #ddd;
+    font-variant-numeric: tabular-nums;
+  }
+  .dev-thresh-val {
+    text-align: center;
+    color: #ddd;
+    font-variant-numeric: tabular-nums;
+    padding: 2px 0 4px;
+    font-size: 11px;
+  }
 </style>
 </head>
 <body>
@@ -225,6 +267,7 @@
       <div class="dev-row"><span class="k">tint</span><span class="dev-swatch" id="dev-tint-sw"></span><span class="v" id="dev-tint">0,0,0</span></div>
       <div class="dev-row"><span class="k">target</span><span class="dev-swatch" id="dev-target-sw"></span><span class="v" id="dev-target">— [0]</span></div>
       <div class="dev-row"><span class="k">kicks</span><span class="v" id="dev-kicks">0/0</span></div>
+      <div class="dev-row"><span class="k">shape</span><span class="v" id="dev-shape">— 0/0</span></div>
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">bass</span><span class="v" id="dev-bass">0.00</span></div>
@@ -234,6 +277,11 @@
       <div class="dev-row"><span class="k">level</span><span class="v" id="dev-level">0.00</span></div>
       <div class="dev-row"><span class="k">bassPulse</span><span class="v" id="dev-bp">0.00</span></div>
       <div class="dev-row"><span class="k">bassDev</span><span class="v" id="dev-bd">0.00</span></div>
+      <div class="dev-row">
+        <span class="k">kick thresh</span>
+        <input type="range" id="dev-kthresh" class="dev-slider" min="0.005" max="0.25" step="0.005" value="0.07">
+      </div>
+      <div class="dev-thresh-val" id="dev-kthresh-val">0.070</div>
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">slices</span><span class="v" id="dev-slices">0</span></div>
@@ -641,13 +689,105 @@
   const PARTICLE_BASE_R = 1.0;        // baseline particle radius
   const PARTICLE_PULSE_AMOUNT = 12;   // px added to radius at peak transient
 
+  // Lattice particles morph between basic outlines as kicks land. Each shape
+  // is a fixed-N perimeter polygon (CCW); the active shape is a per-frame
+  // lerp between SHAPES[shapeIndex] and SHAPES[shapeIndex+1] at shapeProgress.
+  // Each kick nudges progress by 1/KICKS_PER_SHAPE_CYCLE; on rollover the
+  // shape pair advances. Choosing N=24 keeps points aligned to the symmetries
+  // of square (4), star (6), octagon (8), and crescent (12+12 split).
+  const SHAPE_N = 24;
+  const SHAPE_NAMES = ['dot', 'square', 'star', 'octagon', 'crescent'];
+  const KICKS_PER_SHAPE_CYCLE = 16;
+  function buildShape(name) {
+    const pts = new Float32Array(SHAPE_N * 2);
+    if (name === 'dot') {
+      for (let i = 0; i < SHAPE_N; i++) {
+        const a = (i / SHAPE_N) * Math.PI * 2;
+        pts[i * 2] = Math.cos(a);
+        pts[i * 2 + 1] = Math.sin(a);
+      }
+    } else if (name === 'square') {
+      // Walk perimeter starting at (1, 0), CCW, equal arc-length steps.
+      // Perimeter length = 8; each of 24 steps covers 1/3 of unit length.
+      for (let i = 0; i < SHAPE_N; i++) {
+        const arc = (i / SHAPE_N) * 8;
+        let x, y;
+        if (arc <= 1)      { x = 1;            y = arc; }
+        else if (arc <= 3) { x = 1 - (arc - 1); y = 1; }
+        else if (arc <= 5) { x = -1;           y = 1 - (arc - 3); }
+        else if (arc <= 7) { x = -1 + (arc - 5); y = -1; }
+        else               { x = 1;            y = -1 + (arc - 7); }
+        pts[i * 2] = x;
+        pts[i * 2 + 1] = y;
+      }
+    } else if (name === 'star') {
+      // 6-peak smooth star: r dips to 0 at troughs (cusp), max at peaks.
+      const PEAKS = 6;
+      for (let i = 0; i < SHAPE_N; i++) {
+        const a = (i / SHAPE_N) * Math.PI * 2;
+        const r = 0.5 + 0.5 * Math.cos(PEAKS * a);
+        pts[i * 2] = r * Math.cos(a);
+        pts[i * 2 + 1] = r * Math.sin(a);
+      }
+    } else if (name === 'octagon') {
+      // Walk 8 edges, 3 vertices each. Vertices at angles k*π/4.
+      for (let i = 0; i < SHAPE_N; i++) {
+        const arc = (i / SHAPE_N) * 8;
+        const edge = Math.floor(arc);
+        const local = arc - edge;
+        const a0 = edge * Math.PI / 4;
+        const a1 = (edge + 1) * Math.PI / 4;
+        pts[i * 2] = Math.cos(a0) + (Math.cos(a1) - Math.cos(a0)) * local;
+        pts[i * 2 + 1] = Math.sin(a0) + (Math.sin(a1) - Math.sin(a0)) * local;
+      }
+    } else if (name === 'crescent') {
+      // Outer arc: left half of unit circle (top intersection CCW to bottom).
+      // Inner arc: right-shifted unit circle, traced CW through its left side
+      // back to top — produces the concave inner edge of the crescent.
+      const half = SHAPE_N / 2;
+      const cx = 0.5;
+      const ix = cx / 2;
+      const iy = Math.sqrt(1 - ix * ix);
+      const aOuterTop = Math.atan2(iy, ix);
+      for (let i = 0; i < half; i++) {
+        const t = i / half;
+        const a = aOuterTop + t * (2 * Math.PI - 2 * aOuterTop);
+        pts[i * 2] = Math.cos(a);
+        pts[i * 2 + 1] = Math.sin(a);
+      }
+      const aInnerBot = Math.atan2(-iy, ix - cx);
+      const aInnerTop = Math.atan2(iy, ix - cx);
+      for (let i = 0; i < half; i++) {
+        const t = i / half;
+        const a = aInnerBot + t * ((aInnerTop - 2 * Math.PI) - aInnerBot);
+        pts[(half + i) * 2] = cx + Math.cos(a);
+        pts[(half + i) * 2 + 1] = Math.sin(a);
+      }
+    }
+    return pts;
+  }
+  const SHAPES = SHAPE_NAMES.map(buildShape);
+  const shapeBuffer = new Float32Array(SHAPE_N * 2);
+  let shapeIndex = 0;
+  let shapeProgress = 0;
+  // Offscreen canvas containing the morphed particle shape for the current
+  // frame. Drawn ONCE per frame, then drawImage'd at each lattice point —
+  // much cheaper than emitting SHAPE_N lineTos per particle into one path.
+  // Sized for max pulseR (~13) × max shape extent (~1.5 for square corners).
+  const PARTICLE_TILE = 48;
+  const PARTICLE_HALF = PARTICLE_TILE / 2;
+  const particleCanvas = document.createElement('canvas');
+  particleCanvas.width = PARTICLE_TILE;
+  particleCanvas.height = PARTICLE_TILE;
+  const particleCtx = particleCanvas.getContext('2d');
+
   // --- glitch / CRT constants ---
   const JITTER_PX = 26;               // max per-particle displacement at peak treble
   const SCANLINE_ALPHA = 0.42;        // strength of dark scanline rows
   const SCANLINE_PERIOD = 2;          // 1 of every N rows is darkened
   const GRAIN_ALPHA = 0.46;           // intensity of full-canvas grain overlay
   const GRAIN_RES = 320;              // noise canvas size (square); scaled to viewport
-  const SLICE_TRIGGER = 0.07;         // bass rising-edge above which a tear is spawned
+  let SLICE_TRIGGER = 0.065;           // bass-onset threshold; live-tunable via the dev panel slider
   const SLICE_BURST_MIN = 5;
   const SLICE_BURST_MAX = 12;
   const MONO_BAR_CHANCE = 1 / 8;      // per-slice chance to desaturate (B&W) instead of invert
@@ -678,6 +818,7 @@
     [255,  40,  60],  // crimson red
     [180,  30, 255],  // electric purple
     [ 60, 110, 255],  // electric blue
+    [255, 255, 255],  // white = identity under multiply = no tint (pure B&W)
   ];
   const KICKS_PER_COLOR_CYCLE = 64;
   const COLOR_LERP = 0.01;            // per-dt lerp toward target tint
@@ -916,12 +1057,21 @@
   const devOverlay = document.getElementById('dev-overlay');
   const devHeader = document.getElementById('dev-header');
   const devClose = document.getElementById('dev-close');
+  const devKThresh = document.getElementById('dev-kthresh');
+  const devKThreshVal = document.getElementById('dev-kthresh-val');
+  devKThresh.value = SLICE_TRIGGER;
+  devKThreshVal.textContent = SLICE_TRIGGER.toFixed(3);
+  devKThresh.addEventListener('input', () => {
+    SLICE_TRIGGER = parseFloat(devKThresh.value);
+    devKThreshVal.textContent = SLICE_TRIGGER.toFixed(3);
+  });
   const devEls = {
     tint: document.getElementById('dev-tint'),
     tintSw: document.getElementById('dev-tint-sw'),
     target: document.getElementById('dev-target'),
     targetSw: document.getElementById('dev-target-sw'),
     kicks: document.getElementById('dev-kicks'),
+    shape: document.getElementById('dev-shape'),
     bass: document.getElementById('dev-bass'),
     bf: document.getElementById('dev-bf'),
     mid: document.getElementById('dev-mid'),
@@ -935,7 +1085,7 @@
     freeze: document.getElementById('dev-freeze'),
     fps: document.getElementById('dev-fps'),
   };
-  const PALETTE_NAMES = ['green', 'red', 'purple', 'blue'];
+  const PALETTE_NAMES = ['green', 'red', 'purple', 'blue', 'b&w'];
 
   let devDrag = null;
   devHeader.addEventListener('pointerdown', e => {
@@ -980,6 +1130,9 @@
     devEls.targetSw.style.background = `rgb(${tgt[0]},${tgt[1]},${tgt[2]})`;
     devEls.target.textContent = `${PALETTE_NAMES[colorIndex] || '?'} [${colorIndex}]`;
     devEls.kicks.textContent = `${kickCount}/${KICKS_PER_COLOR_CYCLE}`;
+    const inShape = Math.round(shapeProgress * KICKS_PER_SHAPE_CYCLE);
+    devEls.shape.textContent =
+      `${SHAPE_NAMES[shapeIndex]}→${SHAPE_NAMES[(shapeIndex + 1) % SHAPE_NAMES.length]} ${inShape}/${KICKS_PER_SHAPE_CYCLE}`;
     devEls.bass.textContent = b.bass.toFixed(2);
     devEls.bf.textContent = b.bassFast.toFixed(2);
     devEls.mid.textContent = b.mid.toFixed(2);
@@ -1049,6 +1202,11 @@
       if (kickCount >= KICKS_PER_COLOR_CYCLE) {
         colorIndex = (colorIndex + 1) % COLOR_PALETTE.length;
         kickCount = 0;
+      }
+      shapeProgress += 1 / KICKS_PER_SHAPE_CYCLE;
+      if (shapeProgress >= 1) {
+        shapeIndex = (shapeIndex + 1) % SHAPES.length;
+        shapeProgress = 0;
       }
       beatsAtOrientation++;
       if (beatsAtOrientation >= nextRotateBeats) {
@@ -1253,15 +1411,30 @@
     const rowCorrupt = bassPulse * rectW * ROW_CORRUPT_AMOUNT;
     const pts = [];
     pushFilledRectPoints(pts, W * 0.5, H * 0.5, rectW, rectH, LATTICE_SPACING, rowCorrupt);
-    ctx.fillStyle = 'rgba(255,255,255,0.95)';
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i += 2) {
-      const x = pts[i] + (Math.random() - 0.5) * jitter;
-      const y = pts[i + 1] + (Math.random() - 0.5) * jitter;
-      ctx.moveTo(x + pulseR, y);
-      ctx.arc(x, y, pulseR, 0, Math.PI * 2);
+    // Lerp current shape pair into shapeBuffer once per frame, scaled by pulseR.
+    const sFrom = SHAPES[shapeIndex];
+    const sTo = SHAPES[(shapeIndex + 1) % SHAPES.length];
+    const morph = shapeProgress;
+    for (let k = 0; k < SHAPE_N * 2; k++) {
+      shapeBuffer[k] = (sFrom[k] + (sTo[k] - sFrom[k]) * morph) * pulseR;
     }
-    ctx.fill();
+    // Stamp the morphed shape once into the offscreen tile.
+    particleCtx.clearRect(0, 0, PARTICLE_TILE, PARTICLE_TILE);
+    particleCtx.fillStyle = 'rgba(255,255,255,0.95)';
+    particleCtx.beginPath();
+    particleCtx.moveTo(PARTICLE_HALF + shapeBuffer[0], PARTICLE_HALF + shapeBuffer[1]);
+    for (let k = 2; k < SHAPE_N * 2; k += 2) {
+      particleCtx.lineTo(PARTICLE_HALF + shapeBuffer[k], PARTICLE_HALF + shapeBuffer[k + 1]);
+    }
+    particleCtx.closePath();
+    particleCtx.fill();
+    // Stamp it at every lattice point. drawImage of a small bitmap is far
+    // cheaper than path-emitting per particle.
+    for (let i = 0; i < pts.length; i += 2) {
+      const x = pts[i] + (Math.random() - 0.5) * jitter - PARTICLE_HALF;
+      const y = pts[i + 1] + (Math.random() - 0.5) * jitter - PARTICLE_HALF;
+      ctx.drawImage(particleCanvas, x, y);
+    }
 
     // --- slice tears: copy horizontal bands of the canvas to shifted x,
     // additive composite for ghost-double-image. operate in device pixels.
