@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ambient_viz — evalLane tests</title>
+<style>
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #111; color: #ddd;
+    padding: 16px; margin: 0;
+    font-size: 13px;
+  }
+  h1 { font-size: 14px; color: #888; font-weight: normal; margin: 0 0 12px; text-transform: lowercase; letter-spacing: 0.05em; }
+  .summary { padding: 8px 12px; margin: 12px 0; border-radius: 3px; font-weight: bold; }
+  .summary.ok { background: rgba(120, 200, 120, 0.15); color: #8d8; border: 1px solid #484; }
+  .summary.fail { background: rgba(220, 80, 80, 0.15); color: #f88; border: 1px solid #844; }
+  .test { padding: 4px 0; border-bottom: 1px solid #1d1d1d; display: flex; gap: 12px; }
+  .test .mark { width: 14px; flex: 0 0 auto; }
+  .test.pass .mark { color: #6c6; }
+  .test.fail .mark { color: #c66; }
+  .test .name { flex: 1; color: #ccc; }
+  .test .detail { color: #888; }
+</style>
+</head>
+<body>
+<h1>ambient_viz — evalLane tests</h1>
+<div id="summary"></div>
+<div id="results"></div>
+<script>
+// ============================================================================
+// Mirror of the evalLane runtime from index.html. Keep in sync — when the
+// real implementation changes, copy the changes here too. The shape is a
+// pure function of (type, keys, t), making it cheap to test in isolation.
+// ============================================================================
+const EASE = {
+  linear: f => f,
+  easeIn: f => f * f,
+  easeOut: f => 1 - (1 - f) * (1 - f),
+  easeInOut: f => f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2,
+  step: () => 0,
+};
+
+function evalLane(type, keys, t) {
+  if (!keys || !keys.length) return undefined;
+  if (t <= keys[0].t) return keys[0].v;
+  if (t >= keys[keys.length - 1].t) return keys[keys.length - 1].v;
+  let i = 0;
+  while (i < keys.length - 1 && keys[i + 1].t <= t) i++;
+  const k0 = keys[i], k1 = keys[i + 1];
+  if (type === 'discrete') return k0.v;
+  const span = k1.t - k0.t;
+  let f = span > 0 ? (t - k0.t) / span : 0;
+  const ease = EASE[k0.curve] || EASE.linear;
+  f = ease(f);
+  return k0.v + (k1.v - k0.v) * f;
+}
+
+// ----- tiny test runner -----
+const tests = [];
+function test(name, fn) { tests.push({ name, fn }); }
+function approx(a, b, eps = 1e-9) {
+  return typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) < eps;
+}
+function eq(a, b) {
+  if (a === b) return true;
+  if (typeof a === 'number' && typeof b === 'number') return approx(a, b, 1e-9);
+  return false;
+}
+function expect(actual, expected) {
+  if (!eq(actual, expected)) {
+    throw new Error(`expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+// ============================================================================
+// tests
+// ============================================================================
+
+test('empty lane → undefined', () => {
+  expect(evalLane('continuous', [], 5), undefined);
+  expect(evalLane('continuous', null, 5), undefined);
+});
+
+test('single key — t before, at, after returns the key value', () => {
+  const k = [{ t: 10, v: 0.5, curve: 'linear' }];
+  expect(evalLane('continuous', k, 0), 0.5);
+  expect(evalLane('continuous', k, 10), 0.5);
+  expect(evalLane('continuous', k, 20), 0.5);
+});
+
+test('two-key linear — exact midpoint', () => {
+  const k = [{ t: 0, v: 0, curve: 'linear' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 5), 0.5);
+});
+
+test('two-key linear — quarter and three-quarters', () => {
+  const k = [{ t: 0, v: 0, curve: 'linear' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 2.5), 0.25);
+  expect(evalLane('continuous', k, 7.5), 0.75);
+});
+
+test('easeIn — midpoint of f² is 0.25', () => {
+  const k = [{ t: 0, v: 0, curve: 'easeIn' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 5), 0.25);
+});
+
+test('easeOut — midpoint of 1−(1−f)² is 0.75', () => {
+  const k = [{ t: 0, v: 0, curve: 'easeOut' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 5), 0.75);
+});
+
+test('easeInOut — midpoint is 0.5 (S-curve symmetric)', () => {
+  const k = [{ t: 0, v: 0, curve: 'easeInOut' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 5), 0.5);
+});
+
+test('easeInOut — quarter is 0.125', () => {
+  // f=0.25 → 2·0.0625 = 0.125
+  const k = [{ t: 0, v: 0, curve: 'easeInOut' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 2.5), 0.125);
+});
+
+test('step — holds k0.v across the segment', () => {
+  const k = [{ t: 0, v: 0, curve: 'step' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 0), 0);
+  expect(evalLane('continuous', k, 5), 0);
+  expect(evalLane('continuous', k, 9.999), 0);
+  // exactly at next key: clamped to next.v
+  expect(evalLane('continuous', k, 10), 1);
+});
+
+test('discrete — always returns floor key value, ignoring curve', () => {
+  const k = [{ t: 0, v: 'car' }, { t: 10, v: 'walker' }];
+  expect(evalLane('discrete', k, 0), 'car');
+  expect(evalLane('discrete', k, 5), 'car');
+  expect(evalLane('discrete', k, 9.999), 'car');
+  expect(evalLane('discrete', k, 10), 'walker');
+});
+
+test('three keys — segment selection', () => {
+  const k = [
+    { t: 0, v: 0, curve: 'linear' },
+    { t: 10, v: 1, curve: 'linear' },
+    { t: 20, v: 0, curve: 'linear' },
+  ];
+  expect(evalLane('continuous', k, 5), 0.5);   // first segment
+  expect(evalLane('continuous', k, 15), 0.5);  // second segment
+});
+
+test('t before first key — clamps to first', () => {
+  const k = [{ t: 5, v: 0.7, curve: 'linear' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 0), 0.7);
+  expect(evalLane('continuous', k, -100), 0.7);
+});
+
+test('t after last key — clamps to last', () => {
+  const k = [{ t: 0, v: 0, curve: 'linear' }, { t: 10, v: 0.7 }];
+  expect(evalLane('continuous', k, 10), 0.7);
+  expect(evalLane('continuous', k, 100), 0.7);
+});
+
+test('exact key boundary — picks correct segment', () => {
+  // at t === k1.t, walker forward picks segment [k1,k2]
+  const k = [
+    { t: 0, v: 0, curve: 'linear' },
+    { t: 10, v: 0.5, curve: 'linear' },
+    { t: 20, v: 1, curve: 'linear' },
+  ];
+  expect(evalLane('continuous', k, 10), 0.5);
+});
+
+test('zero-span segment (duplicate t) — defaults to k0.v', () => {
+  const k = [
+    { t: 0, v: 0, curve: 'linear' },
+    { t: 10, v: 0.3 },
+    { t: 10, v: 0.8, curve: 'linear' },
+    { t: 20, v: 1 },
+  ];
+  // exact 10 returns last-of-block (clamped via tail check)
+  expect(evalLane('continuous', k, 10), 0.8);
+});
+
+test('missing curve field → defaults to linear', () => {
+  const k = [{ t: 0, v: 0 }, { t: 10, v: 1 }]; // no curve
+  expect(evalLane('continuous', k, 5), 0.5);
+});
+
+test('unknown curve → defaults to linear (forward-compat)', () => {
+  const k = [{ t: 0, v: 0, curve: 'magic' }, { t: 10, v: 1 }];
+  expect(evalLane('continuous', k, 5), 0.5);
+});
+
+// ============================================================================
+// run
+// ============================================================================
+const results = document.getElementById('results');
+const summary = document.getElementById('summary');
+let pass = 0, fail = 0;
+for (const t of tests) {
+  const div = document.createElement('div');
+  div.className = 'test';
+  try {
+    t.fn();
+    div.classList.add('pass');
+    div.innerHTML = `<span class="mark">✓</span><span class="name">${t.name}</span>`;
+    pass++;
+  } catch (e) {
+    div.classList.add('fail');
+    div.innerHTML = `<span class="mark">✗</span><span class="name">${t.name}</span><span class="detail">${e.message}</span>`;
+    fail++;
+  }
+  results.append(div);
+}
+summary.className = 'summary ' + (fail === 0 ? 'ok' : 'fail');
+summary.textContent = fail === 0
+  ? `${pass} passing`
+  : `${pass} passing, ${fail} failing`;
+</script>
+</body>
+</html>

@@ -481,6 +481,34 @@
 </div>
 
 <script>
+// ============================================================================
+// ambient_viz — single-file inline visualizer
+//
+// IIFE sections (in declaration order):
+//   - DOM refs + canvas resize
+//   - audio graph: main analyser + parallel low-smoothing transient analyser
+//   - file/mic source loading + scrubber UI
+//   - drag & drop
+//   - audio band extraction (bands())
+//   - silhouette registry (car SVG-derived + 5 hand-built placeholders)
+//   - particles: flyout cars + sparks
+//   - lattice: hex-grid particles, particle shape morph (dot→square→…)
+//   - glitch/CRT live tunables (JITTER_PX, FLASH_TRIGGER, etc. — registered
+//     in PARAMS so they're slider/automation-tunable)
+//   - 1-bit Bayer dither pipeline
+//   - frame freeze + block shuffle
+//   - render-loop state (smoothed envelopes, kick counter, color/shape progress)
+//   - automation runtime: PARAMS registry, manual/lanes/armed maps, evalLane
+//   - dev overlay: debug readouts + per-param sliders + REC + save/load + autosave
+//   - visual automation editor (bottom strip): canvas-rendered timeline
+//   - editor input: drag/click/wheel/right-click-menu
+//   - frame() — the per-frame render loop
+//
+// To add a new tunable: see the "HOW TO ADD A NEW TUNABLE PARAMETER" comment
+// in the automation runtime section (search for that header).
+// To add a new silhouette: see HOW TO ADD A NEW SILHOUETTE.
+// To add a new particle morph shape: see HOW TO ADD A NEW LATTICE PARTICLE SHAPE.
+// ============================================================================
 (() => {
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
@@ -914,6 +942,15 @@
       ],
     };
   }
+  // HOW TO ADD A NEW SILHOUETTE:
+  //   1. Either build it procedurally with the _circle/_arc/_rect/_ringSeg
+  //      helpers above, OR run `node preprocess.js your.svg` and paste its
+  //      `CAR_ASPECT` / `CAR_SUBPATHS` output into a builder here.
+  //   2. Add a key to SILHOUETTES below mapping a name → { aspect, subpaths }.
+  //   3. The PARAMS.silhouette dropdown auto-populates from SILHOUETTE_NAMES,
+  //      so no UI changes are needed.
+  // INVARIANT: activeSilhouette is always a key of SILHOUETTES. Lane
+  // playback validates discrete values via PARAMS.silhouette.options().
   const SILHOUETTES = {
     car:      { aspect: CAR_ASPECT, subpaths: CAR_SUBPATHS },
     walker:   _buildWalker(),
@@ -1002,7 +1039,11 @@
   // A single centered rectangle filled with a hex lattice of uniform-size
   // particles. Particle radius pulses with bass *transients* (deviation from
   // a slow running baseline), so steady bass doesn't pin the size at peak.
-  const LATTICE_SPACING = 24;          // px between adjacent particles
+  let LATTICE_SPACING = 24;            // px between adjacent particles. (live tunable; PARAMS may mutate)
+  // Reused per-frame lattice point buffer (x0,y0,x1,y1,…). Module-scope so
+  // the array object isn't re-allocated each frame; only its underlying
+  // capacity grows. Reset via lattPts.length = 0 in the render path.
+  const lattPts = [];
   const PARTICLE_BASE_R = 1.0;        // baseline particle radius
   const PARTICLE_PULSE_AMOUNT = 12;   // px added to radius at peak transient
 
@@ -1012,9 +1053,16 @@
   // Each kick nudges progress by 1/KICKS_PER_SHAPE_CYCLE; on rollover the
   // shape pair advances. Choosing N=24 keeps points aligned to the symmetries
   // of square (4), star (6), octagon (8), and crescent (12+12 split).
+  // HOW TO ADD A NEW LATTICE PARTICLE SHAPE:
+  //   1. Add the name to SHAPE_NAMES (becomes one stop in the morph cycle).
+  //   2. Add a `else if (name === 'yourShape')` branch in buildShape() that
+  //      fills `pts` with SHAPE_N * 2 floats normalized to ~unit radius.
+  //      Vertex layout should align angularly across shapes (i=0 → right,
+  //      i=N/4 → top in math convention) so morphs interpolate cleanly.
+  //   3. Cycle is kick-driven; cycle length = SHAPE_NAMES.length * kicksPerShapeCycle.
   const SHAPE_N = 24;
   const SHAPE_NAMES = ['dot', 'square', 'star', 'octagon', 'crescent'];
-  const KICKS_PER_SHAPE_CYCLE = 16;
+  let KICKS_PER_SHAPE_CYCLE = 16;       // (live tunable; PARAMS may mutate)
   function buildShape(name) {
     const pts = new Float32Array(SHAPE_N * 2);
     if (name === 'dot') {
@@ -1099,22 +1147,27 @@
   const particleCtx = particleCanvas.getContext('2d');
 
   // --- glitch / CRT constants ---
-  const JITTER_PX = 26;               // max per-particle displacement at peak treble
-  const SCANLINE_ALPHA = 0.42;        // strength of dark scanline rows
+  // Most of the values in this block were originally `const`. They were
+  // promoted to `let` so PARAMS / the dev panel / the visual editor can
+  // mutate them at runtime. The SCREAMING_SNAKE naming is preserved
+  // deliberately — they're still grep-anchors used by render code; the
+  // PARAMS entries below are what makes them tunable.
+  let JITTER_PX = 26;                 // max per-particle displacement at peak treble (live tunable)
+  let SCANLINE_ALPHA = 0.42;          // strength of dark scanline rows (live tunable)
   const SCANLINE_PERIOD = 2;          // 1 of every N rows is darkened
-  const GRAIN_ALPHA = 0.46;           // intensity of full-canvas grain overlay
+  let GRAIN_ALPHA = 0.46;             // intensity of full-canvas grain overlay (live tunable)
   const GRAIN_RES = 320;              // noise canvas size (square); scaled to viewport
   let SLICE_TRIGGER = 0.065;           // bass-onset threshold; live-tunable via the dev panel slider
   const SLICE_BURST_MIN = 5;
   const SLICE_BURST_MAX = 12;
   let MONO_BAR_CHANCE = 1 / 8;        // per-slice chance to desaturate (B&W) instead of invert
   const SLICE_ANGLE_JITTER = 8 * Math.PI / 180; // ±radians of per-slice angle offset around currentSliceAngle
-  const ROW_CORRUPT_AMOUNT = 2.6;     // px of row shift per unit of bassPulse (* rectW)
-  const ONSET_THRESHOLD = 0.07;       // level deviation above running avg to trigger
+  let ROW_CORRUPT_AMOUNT = 2.6;       // px of row shift per unit of bassPulse (* rectW) (live tunable)
+  let ONSET_THRESHOLD = 0.07;         // level deviation above running avg to trigger (live tunable)
   const ONSET_COOLDOWN_MIN = 12;      // frames between onset events
   const ONSET_COOLDOWN_MAX = 35;
-  const MID_SLICE_TRIGGER = 0.09;     // mid-pulse threshold for additional tears
-  const FLASH_TRIGGER = 0.18;         // bass rising-edge threshold for invert/strobe flash
+  let MID_SLICE_TRIGGER = 0.09;       // mid-pulse threshold for additional tears (live tunable)
+  let FLASH_TRIGGER = 0.18;           // bass rising-edge threshold for invert/strobe flash (live tunable)
   const FREEZE_FRAMES_MIN = 4;
   const FREEZE_FRAMES_MAX = 12;
   const DITHER_TILES_X = 8;           // dither pattern tile (Bayer 8x8)
@@ -1138,7 +1191,7 @@
     [255, 255, 255],  // white = identity under multiply = no tint (pure B&W)
   ];
   let KICKS_PER_COLOR_CYCLE = 64;
-  const COLOR_LERP = 0.01;            // per-dt lerp toward target tint
+  let COLOR_LERP = 0.01;              // per-dt lerp toward target tint (live tunable)
 
   // pre-allocated noise canvas + image for grain overlay
   const noiseCanvas = document.createElement('canvas');
@@ -1262,7 +1315,7 @@
   // briefly returns to pure B&W, which lands as a quiet exhale against the
   // tinted majority of the visual.
   let freezeMono = false;
-  const FREEZE_MONO_CHANCE = 1 / 8;
+  let FREEZE_MONO_CHANCE = 1 / 8;     // (live tunable; PARAMS may mutate)
   function captureFreeze() {
     freezeCtx.clearRect(0, 0, freezeCanvas.width, freezeCanvas.height);
     freezeCtx.drawImage(canvas, 0, 0);
@@ -1370,50 +1423,158 @@
   // sat=1 → full color, sat=0 → identity (no tint, pure B&W).
   let saturation = 1.0;
 
-  // --- automation runtime ---
-  // Each automatable parameter has an entry in PARAMS that describes its UI
-  // (slider range / dropdown options) and live setter. Per-param state lives
-  // in three parallel maps:
-  //   manual[name]  — current control (slider/dropdown) value, what the user
-  //                   sees in the dev panel
-  //   lanes[name]   — keypoint array sorted by time. Empty = no automation,
-  //                   live state falls back to manual.
-  //   armed[name]   — true while this lane is set to capture during REC.
-  // Each frame: live = lane.length ? eval(lane, t) : manual[name]. Wipe
-  // empties the lane, so on the next frame live snaps to manual (Option C).
+  // ============================================================
+  // automation runtime + PARAMS registry (single source of truth)
+  // ============================================================
+  //
+  // HOW TO ADD A NEW TUNABLE PARAMETER:
+  //   1. Declare a `let` for its live runtime value somewhere appropriate
+  //      (typically near related visual state). SCREAMING_SNAKE for
+  //      legacy-style globals is fine — see the lattice/glitch sections.
+  //   2. Add an entry to PARAMS below with:
+  //        - type: 'continuous' (numeric slider) or 'discrete' (dropdown)
+  //        - def: starting value
+  //        - For continuous: min, max, step, fmt(v) → string
+  //        - For discrete:   options() → array of valid values, fmt(v)
+  //        - setLive: function that writes the value into your `let`
+  //        - editor: true to expose as a lane in the bottom-strip visual
+  //                  editor. Default false (dev-panel slider only). The
+  //                  strip has limited vertical space; only set true for
+  //                  params you'll actually automate over a track.
+  //   3. That's it. Sliders, automation lanes, save/load round-trip,
+  //      localStorage autosave, and the manual↔lane fallback are wired
+  //      automatically.
+  //
+  // RUNTIME MODEL:
+  //   manual[name] — slider/dropdown value (what the user sees in the panel)
+  //   lanes[name]  — sorted-by-time keypoint array. Empty = no automation,
+  //                  live state falls back to manual.
+  //   armed[name]  — true while this lane captures during REC mode.
+  //
+  // Each frame: live = lane.length ? evalLane(lane, t) : manual[name].
+  // Wipe empties the lane, so the next frame live snaps to manual (Option C).
+  //
+  // INVARIANTS (assumed true everywhere; mutation paths must preserve):
+  //   - lanes[name] is always sorted ascending by t
+  //   - keypoints have shape { t, v, curve } where curve ∈ EASE
+  //   - PARAM_NAMES, manual, lanes, armed share the same key set
+  //   - For discrete lanes, k.v ∈ PARAMS[name].options()
+  //
   const PARAMS = {
+    // --- editor-visible (default automation surface, ≤6 lanes fit) ---
     sliceTrigger: {
       type: 'continuous', def: 0.065,
       min: 0.005, max: 0.25, step: 0.005,
-      fmt: v => v.toFixed(3),
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => { SLICE_TRIGGER = v; },
     },
     saturation: {
       type: 'continuous', def: 1.0,
       min: 0, max: 1, step: 0.01,
-      fmt: v => v.toFixed(2),
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => { saturation = v; },
     },
     silhouette: {
       type: 'discrete', def: 'car',
       options: () => SILHOUETTE_NAMES,
-      fmt: v => v,
+      fmt: v => v, editor: true,
       setLive: v => { if (SILHOUETTES[v]) activeSilhouette = v; },
     },
     kicksPerColorCycle: {
       type: 'continuous', def: 64,
       min: 4, max: 128, step: 1,
-      fmt: v => v.toFixed(0),
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => { KICKS_PER_COLOR_CYCLE = Math.round(v); },
     },
     monoBarChance: {
       type: 'continuous', def: 1 / 8,
       min: 0, max: 0.5, step: 0.005,
-      fmt: v => v.toFixed(3),
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => { MONO_BAR_CHANCE = v; },
+    },
+    // --- dev-panel-only (slider available, not in editor by default) ---
+    // Flip `editor: true` to surface in the bottom strip when you want to
+    // automate one of these over an arrangement.
+    jitterPx: {
+      type: 'continuous', def: 26,
+      min: 0, max: 60, step: 1,
+      fmt: v => v.toFixed(0), editor: false,
+      setLive: v => { JITTER_PX = v; },
+    },
+    latticeSpacing: {
+      type: 'continuous', def: 24,
+      min: 8, max: 64, step: 1,
+      fmt: v => v.toFixed(0), editor: false,
+      setLive: v => { LATTICE_SPACING = Math.round(v); },
+    },
+    rowCorruptAmount: {
+      type: 'continuous', def: 2.6,
+      min: 0, max: 8, step: 0.1,
+      fmt: v => v.toFixed(1), editor: false,
+      setLive: v => { ROW_CORRUPT_AMOUNT = v; },
+    },
+    grainAlpha: {
+      type: 'continuous', def: 0.46,
+      min: 0, max: 1, step: 0.02,
+      fmt: v => v.toFixed(2), editor: false,
+      setLive: v => { GRAIN_ALPHA = v; },
+    },
+    scanlineAlpha: {
+      type: 'continuous', def: 0.42,
+      min: 0, max: 1, step: 0.02,
+      fmt: v => v.toFixed(2), editor: false,
+      setLive: v => { SCANLINE_ALPHA = v; },
+    },
+    flashTrigger: {
+      type: 'continuous', def: 0.18,
+      min: 0.02, max: 0.5, step: 0.01,
+      fmt: v => v.toFixed(2), editor: false,
+      setLive: v => { FLASH_TRIGGER = v; },
+    },
+    onsetThreshold: {
+      type: 'continuous', def: 0.07,
+      min: 0.01, max: 0.3, step: 0.005,
+      fmt: v => v.toFixed(3), editor: false,
+      setLive: v => { ONSET_THRESHOLD = v; },
+    },
+    midSliceTrigger: {
+      type: 'continuous', def: 0.09,
+      min: 0.01, max: 0.3, step: 0.005,
+      fmt: v => v.toFixed(3), editor: false,
+      setLive: v => { MID_SLICE_TRIGGER = v; },
+    },
+    colorLerp: {
+      type: 'continuous', def: 0.01,
+      min: 0.001, max: 0.1, step: 0.001,
+      fmt: v => v.toFixed(3), editor: false,
+      setLive: v => { COLOR_LERP = v; },
+    },
+    freezeMonoChance: {
+      type: 'continuous', def: 1 / 8,
+      min: 0, max: 1, step: 0.01,
+      fmt: v => v.toFixed(2), editor: false,
+      setLive: v => { FREEZE_MONO_CHANCE = v; },
+    },
+    kicksPerShapeCycle: {
+      type: 'continuous', def: 16,
+      min: 2, max: 64, step: 1,
+      fmt: v => v.toFixed(0), editor: false,
+      setLive: v => { KICKS_PER_SHAPE_CYCLE = Math.round(v); },
     },
   };
   const PARAM_NAMES = Object.keys(PARAMS);
+  // PANEL_ORDER drives the dev-panel slider list (every PARAMS entry, in
+  // registry order, continuous first then discrete for visual consistency).
+  // EDITOR_ORDER is the subset surfaced as lanes in the bottom-strip
+  // visual editor — only entries with `editor: true`.
+  const PANEL_ORDER = (() => {
+    const cont = [], disc = [];
+    for (const n of PARAM_NAMES) {
+      if (PARAMS[n].type === 'continuous') cont.push(n); else disc.push(n);
+    }
+    return [...cont, ...disc];
+  })();
+  const EDITOR_ORDER = PANEL_ORDER.filter(n => PARAMS[n].editor);
   const manual = {};
   const lanes = {};
   const armed = {};
@@ -1469,6 +1630,8 @@
   // Insert/replace a keypoint in the lane. If a key exists within MERGE_DT of
   // t, replace it (so dragging a slider during REC produces one key per ~250ms
   // window rather than a smear). Otherwise insert in sorted position.
+  // POSTCONDITION: lanes[name] remains sorted ascending by t (invariant
+  // assumed by evalLane and the editor's hit testing).
   const KEY_MERGE_DT = 0.25; // seconds
   function recordKey(name, t, v) {
     const lane = lanes[name];
@@ -1525,6 +1688,7 @@
     return `${m}:${s.toFixed(1).padStart(4, '0')}`;
   }
 
+  // ----- per-param row builder + control wiring -----
   function buildParamRow(name) {
     const p = PARAMS[name];
     const row = document.createElement('div');
@@ -1616,10 +1780,13 @@
     return row;
   }
 
-  for (const name of PARAM_NAMES) {
+  // Dev panel sliders display in PANEL_ORDER (continuous first, then
+  // discrete) so the visual ordering matches the editor strip.
+  for (const name of PANEL_ORDER) {
     devParamsEl.append(buildParamRow(name));
   }
 
+  // ----- keypoint list (dev-panel) -----
   function renderKeys() {
     const all = [];
     for (const name of PARAM_NAMES) {
@@ -1654,6 +1821,7 @@
 
   // REC toggle. When recording, the button gets a flashing red border to
   // remind the user that any change to an armed control writes a keypoint.
+  // ----- REC toggle -----
   devRecBtn.addEventListener('click', () => {
     recording = !recording;
     devRecBtn.classList.toggle('armed', recording);
@@ -1850,7 +2018,18 @@
   const editorEl = document.getElementById('editor');
   const editorCanvas = document.getElementById('editor-canvas');
   const ectx = editorCanvas.getContext('2d');
+  // Static editor chrome offscreen canvas — declared up here (rather than
+  // adjacent to renderEditorStatic) so resizeEditor's first invocation can
+  // safely reference it. The render function itself is hoisted; this const
+  // is not, and TDZ would fire if we depended on its later declaration.
+  const editorStaticCanvas = document.createElement('canvas');
+  const esCtx = editorStaticCanvas.getContext('2d');
   let edpr = 1;
+  // Set true whenever the canvas resizes; renderEditor reads the flag and
+  // refreshes editorStaticCanvas on the next frame. Avoids TDZ during init
+  // (the ED_* layout constants and LANE_RECTS are declared after this
+  // function but before the frame loop starts).
+  let editorStaticDirty = true;
   function resizeEditor() {
     edpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssW = editorEl.clientWidth;
@@ -1858,6 +2037,7 @@
     editorCanvas.width = Math.floor(cssW * edpr);
     editorCanvas.height = Math.floor(cssH * edpr);
     ectx.setTransform(edpr, 0, 0, edpr, 0, 0);
+    editorStaticDirty = true;
   }
   window.addEventListener('resize', resizeEditor);
   resizeEditor();
@@ -1905,23 +2085,19 @@
   const ED_KEY_R = 4;
   const ED_HIT_PX = 6;          // hit-test slop around keys
 
-  function getLaneOrder() {
-    const cont = [], disc = [];
-    for (const name of PARAM_NAMES) {
-      if (PARAMS[name].type === 'continuous') cont.push(name);
-      else disc.push(name);
-    }
-    return [...cont, ...disc];
-  }
-  function laneRect(name) {
+  // Editor-visible lane order is fixed once PARAMS is defined — cache it
+  // and the per-lane y bounds so per-frame render and per-event hit testing
+  // don't allocate. (Was getLaneOrder()/laneRect() — both are now constants.)
+  const LANE_RECTS = (() => {
+    const out = {};
     let y = ED_TOOLBAR_H + ED_RULER_H;
-    for (const n of getLaneOrder()) {
+    for (const n of EDITOR_ORDER) {
       const h = PARAMS[n].type === 'continuous' ? ED_LANE_H_CONT : ED_LANE_H_DISC;
-      if (n === name) return { y0: y, y1: y + h, h };
+      out[n] = { y0: y, y1: y + h, h };
       y += h;
     }
-    return null;
-  }
+    return out;
+  })();
   function editorCssSize() {
     return { w: editorCanvas.width / edpr, h: editorCanvas.height / edpr };
   }
@@ -1935,13 +2111,13 @@
   }
   function valueToY(v, name) {
     const p = PARAMS[name];
-    const r = laneRect(name);
+    const r = LANE_RECTS[name];
     const pad = 5;
     return r.y0 + pad + (1 - (v - p.min) / (p.max - p.min)) * (r.h - 2 * pad);
   }
   function yToValue(y, name) {
     const p = PARAMS[name];
-    const r = laneRect(name);
+    const r = LANE_RECTS[name];
     const pad = 5;
     let f = 1 - (y - r.y0 - pad) / (r.h - 2 * pad);
     f = Math.max(0, Math.min(1, f));
@@ -1950,15 +2126,34 @@
     return Math.max(p.min, Math.min(p.max, v));
   }
 
-  function renderEditor() {
-    if (!editorVisible) return;
+  // Static editor chrome (background, lane bands, separators, label
+  // strip) is rendered once into an offscreen canvas (declared above next
+  // to editorCanvas) and blitted each frame, since none of these change
+  // with time scrolling. Refreshed on resize. Lane labels still draw
+  // dynamically over the top because their color tracks `armed[name]`.
+  function renderEditorStatic() {
+    editorStaticCanvas.width = editorCanvas.width;
+    editorStaticCanvas.height = editorCanvas.height;
+    esCtx.setTransform(edpr, 0, 0, edpr, 0, 0);
     const { w, h } = editorCssSize();
-    ectx.fillStyle = 'rgba(0,0,0,0.92)';
-    ectx.fillRect(0, 0, w, h);
+    esCtx.fillStyle = 'rgba(0,0,0,0.92)';
+    esCtx.fillRect(0, 0, w, h);
+    esCtx.fillStyle = 'rgba(255,255,255,0.04)';
+    esCtx.fillRect(0, ED_TOOLBAR_H, w, ED_RULER_H);
+    for (const name of EDITOR_ORDER) {
+      const r = LANE_RECTS[name];
+      esCtx.fillStyle = 'rgba(255,255,255,0.015)';
+      esCtx.fillRect(0, r.y0, w, r.h);
+      esCtx.fillStyle = '#1a1a1a';
+      esCtx.fillRect(0, r.y0, w, 1);
+      esCtx.fillStyle = '#222';
+      esCtx.fillRect(ED_LABEL_W - 1, r.y0, 1, r.h);
+    }
+    esCtx.fillStyle = 'rgba(0,0,0,0.92)';
+    esCtx.fillRect(0, ED_TOOLBAR_H + ED_RULER_H, ED_LABEL_W - 1, h - ED_TOOLBAR_H - ED_RULER_H);
+  }
 
-    // ruler
-    ectx.fillStyle = 'rgba(255,255,255,0.04)';
-    ectx.fillRect(0, ED_TOOLBAR_H, w, ED_RULER_H);
+  function drawRuler(w) {
     ectx.font = '10px ui-monospace, Menlo, monospace';
     const span = editorTEnd - editorTStart;
     let tickInt;
@@ -1967,7 +2162,6 @@
     else if (span <= 300) tickInt = 30;
     else if (span <= 1200) tickInt = 60;
     else tickInt = 300;
-    ectx.fillStyle = '#777';
     for (let t = Math.ceil(editorTStart / tickInt) * tickInt; t <= editorTEnd; t += tickInt) {
       const x = timeToX(t);
       if (x < ED_LABEL_W - 1) continue;
@@ -1978,144 +2172,155 @@
       ectx.fillStyle = '#888';
       ectx.fillText(m + ':' + (s < 10 ? '0' : '') + s, x + 3, ED_TOOLBAR_H + 11);
     }
+  }
 
-    // lanes
-    for (const name of getLaneOrder()) {
-      const r = laneRect(name);
-      const p = PARAMS[name];
-      // band background
-      ectx.fillStyle = 'rgba(255,255,255,0.015)';
-      ectx.fillRect(0, r.y0, w, r.h);
-      // separator at the top of each lane
-      ectx.fillStyle = '#1a1a1a';
-      ectx.fillRect(0, r.y0, w, 1);
-      // label
-      ectx.fillStyle = armed[name] ? '#f88' : '#aaa';
-      ectx.fillText(name, 6, r.y0 + r.h / 2 + 4);
-      // label/lane separator
-      ectx.fillStyle = '#222';
-      ectx.fillRect(ED_LABEL_W - 1, r.y0, 1, r.h);
-
-      const lane = lanes[name];
-      if (!lane.length) continue;
-
-      if (p.type === 'continuous') {
-        // segment polyline — sample easing per segment so the actual curve
-        // shape is visible. linear is one lineTo; step draws the corner;
-        // eased curves sample 24 substeps.
-        ectx.strokeStyle = '#555';
-        ectx.lineWidth = 1;
-        ectx.beginPath();
-        ectx.moveTo(timeToX(lane[0].t), valueToY(lane[0].v, name));
-        for (let i = 0; i < lane.length - 1; i++) {
-          const k0 = lane[i], k1 = lane[i + 1];
-          const x0 = timeToX(k0.t), x1 = timeToX(k1.t);
-          const y0 = valueToY(k0.v, name), y1 = valueToY(k1.v, name);
-          const curve = k0.curve || 'linear';
-          if (curve === 'linear') {
-            ectx.lineTo(x1, y1);
-          } else if (curve === 'step') {
-            ectx.lineTo(x1, y0);
-            ectx.lineTo(x1, y1);
-          } else {
-            const ease = EASE[curve];
-            const SUB = 24;
-            for (let j = 1; j <= SUB; j++) {
-              const f = j / SUB;
-              const ef = ease(f);
-              ectx.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * ef);
-            }
-          }
-        }
-        ectx.stroke();
-        // dots — highlight on hover or while being dragged
-        for (let i = 0; i < lane.length; i++) {
-          const k = lane[i];
-          const x = timeToX(k.t);
-          const y = valueToY(k.v, name);
-          if (x < ED_LABEL_W - ED_KEY_R) continue;
-          const hot = (editorHover && editorHover.name === name && editorHover.keyIdx === i) ||
-                      (editorDrag && editorDrag.kind === 'key' && editorDrag.name === name && editorDrag.keyIdx === i);
-          ectx.fillStyle = hot ? '#fff' : '#ddd';
-          ectx.beginPath();
-          ectx.arc(x, y, hot ? ED_KEY_R + 1.5 : ED_KEY_R, 0, Math.PI * 2);
-          ectx.fill();
-        }
+  function drawContinuousLane(name, lane, r) {
+    // segment polyline — sample easing per segment so the actual curve
+    // shape is visible. linear is one lineTo; step draws the corner;
+    // eased curves sample 24 substeps.
+    ectx.strokeStyle = '#555';
+    ectx.lineWidth = 1;
+    ectx.beginPath();
+    ectx.moveTo(timeToX(lane[0].t), valueToY(lane[0].v, name));
+    for (let i = 0; i < lane.length - 1; i++) {
+      const k0 = lane[i], k1 = lane[i + 1];
+      const x0 = timeToX(k0.t), x1 = timeToX(k1.t);
+      const y0 = valueToY(k0.v, name), y1 = valueToY(k1.v, name);
+      const curve = k0.curve || 'linear';
+      if (curve === 'linear') {
+        ectx.lineTo(x1, y1);
+      } else if (curve === 'step') {
+        ectx.lineTo(x1, y0);
+        ectx.lineTo(x1, y1);
       } else {
-        // triangle markers + text
-        for (let i = 0; i < lane.length; i++) {
-          const k = lane[i];
-          const x = timeToX(k.t);
-          if (x < ED_LABEL_W - 6) continue;
-          const y = r.y0 + 4;
-          const hot = (editorHover && editorHover.name === name && editorHover.keyIdx === i) ||
-                      (editorDrag && editorDrag.kind === 'key' && editorDrag.name === name && editorDrag.keyIdx === i);
-          const sz = hot ? 6 : 5;
-          ectx.fillStyle = hot ? '#fff' : '#ddd';
-          ectx.beginPath();
-          ectx.moveTo(x, y);
-          ectx.lineTo(x - sz, y + sz + 3);
-          ectx.lineTo(x + sz, y + sz + 3);
-          ectx.closePath();
-          ectx.fill();
-          ectx.fillStyle = hot ? '#ddd' : '#aaa';
-          ectx.fillText(String(k.v), x + 6, y + 13);
+        const ease = EASE[curve];
+        const SUB = 24;
+        for (let j = 1; j <= SUB; j++) {
+          const f = j / SUB;
+          const ef = ease(f);
+          ectx.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * ef);
         }
       }
     }
+    ectx.stroke();
+    // dots — highlight on hover or while being dragged
+    for (let i = 0; i < lane.length; i++) {
+      const k = lane[i];
+      const x = timeToX(k.t);
+      const y = valueToY(k.v, name);
+      if (x < ED_LABEL_W - ED_KEY_R) continue;
+      const hot = isKeyHot(name, i);
+      ectx.fillStyle = hot ? '#fff' : '#ddd';
+      ectx.beginPath();
+      ectx.arc(x, y, hot ? ED_KEY_R + 1.5 : ED_KEY_R, 0, Math.PI * 2);
+      ectx.fill();
+    }
+  }
 
-    // playhead
-    if (currentEl && isFinite(currentEl.currentTime)) {
-      const px = timeToX(currentEl.currentTime);
-      if (px >= ED_LABEL_W - 1 && px <= w) {
-        ectx.fillStyle = '#f55';
-        ectx.fillRect(px - 0.5, ED_TOOLBAR_H, 1, h - ED_TOOLBAR_H);
+  function drawDiscreteLane(name, lane, r) {
+    for (let i = 0; i < lane.length; i++) {
+      const k = lane[i];
+      const x = timeToX(k.t);
+      if (x < ED_LABEL_W - 6) continue;
+      const y = r.y0 + 4;
+      const hot = isKeyHot(name, i);
+      const sz = hot ? 6 : 5;
+      ectx.fillStyle = hot ? '#fff' : '#ddd';
+      ectx.beginPath();
+      ectx.moveTo(x, y);
+      ectx.lineTo(x - sz, y + sz + 3);
+      ectx.lineTo(x + sz, y + sz + 3);
+      ectx.closePath();
+      ectx.fill();
+      ectx.fillStyle = hot ? '#ddd' : '#aaa';
+      ectx.fillText(String(k.v), x + 6, y + 13);
+    }
+  }
+
+  function isKeyHot(name, i) {
+    return (editorHover && editorHover.name === name && editorHover.keyIdx === i) ||
+           (editorDrag && editorDrag.kind === 'key' && editorDrag.name === name && editorDrag.keyIdx === i);
+  }
+
+  function drawLanes() {
+    ectx.font = '10px ui-monospace, Menlo, monospace';
+    for (const name of EDITOR_ORDER) {
+      const r = LANE_RECTS[name];
+      const lane = lanes[name];
+      if (lane.length) {
+        if (PARAMS[name].type === 'continuous') drawContinuousLane(name, lane, r);
+        else drawDiscreteLane(name, lane, r);
       }
     }
+  }
 
-    // left-margin overlay so labels never clip under keys when editor is narrow
-    ectx.fillStyle = 'rgba(0,0,0,0.92)';
-    ectx.fillRect(0, ED_TOOLBAR_H + ED_RULER_H, ED_LABEL_W - 1, h - ED_TOOLBAR_H - ED_RULER_H);
-    for (const name of getLaneOrder()) {
-      const r = laneRect(name);
+  function drawLaneLabels() {
+    ectx.font = '10px ui-monospace, Menlo, monospace';
+    for (const name of EDITOR_ORDER) {
+      const r = LANE_RECTS[name];
       ectx.fillStyle = armed[name] ? '#f88' : '#aaa';
       ectx.fillText(name, 6, r.y0 + r.h / 2 + 4);
     }
+  }
 
-    // tooltip for hovered or dragged key — drawn last so it sits on top
+  function drawPlayhead(w, h) {
+    if (!currentEl || !isFinite(currentEl.currentTime)) return;
+    const px = timeToX(currentEl.currentTime);
+    if (px < ED_LABEL_W - 1 || px > w) return;
+    ectx.fillStyle = '#f55';
+    ectx.fillRect(px - 0.5, ED_TOOLBAR_H, 1, h - ED_TOOLBAR_H);
+  }
+
+  function drawTooltip(w) {
     let ttKey = null;
     if (editorDrag && editorDrag.kind === 'key') {
       ttKey = { name: editorDrag.name, idx: editorDrag.keyIdx };
     } else if (editorHover) {
       ttKey = { name: editorHover.name, idx: editorHover.keyIdx };
     }
-    if (ttKey) {
-      const lane = lanes[ttKey.name];
-      const k = lane[ttKey.idx];
-      if (k) {
-        const p = PARAMS[ttKey.name];
-        const r = laneRect(ttKey.name);
-        const kx = timeToX(k.t);
-        const ky = p.type === 'continuous' ? valueToY(k.v, ttKey.name) : r.y0 + 4;
-        const m = Math.floor(k.t / 60);
-        const s = k.t - m * 60;
-        const tStr = `${m}:${s.toFixed(1).padStart(4, '0')}`;
-        const label = `${tStr}  ${ttKey.name}=${p.fmt(k.v)}`;
-        ectx.font = '10px ui-monospace, Menlo, monospace';
-        const tw = ectx.measureText(label).width;
-        const padX = 5, padY = 2, th = 14;
-        let tx = kx + 9, ty = ky - th - 6;
-        if (tx + tw + padX * 2 > w - 4) tx = kx - tw - padX * 2 - 9;
-        if (ty < ED_TOOLBAR_H + ED_RULER_H + 2) ty = ky + 8;
-        ectx.fillStyle = 'rgba(0, 0, 0, 0.9)';
-        ectx.fillRect(tx, ty, tw + padX * 2, th);
-        ectx.strokeStyle = '#444';
-        ectx.lineWidth = 1;
-        ectx.strokeRect(tx + 0.5, ty + 0.5, tw + padX * 2 - 1, th - 1);
-        ectx.fillStyle = '#fff';
-        ectx.fillText(label, tx + padX, ty + th - padY - 2);
-      }
+    if (!ttKey) return;
+    const lane = lanes[ttKey.name];
+    const k = lane[ttKey.idx];
+    if (!k) return;
+    const p = PARAMS[ttKey.name];
+    const r = LANE_RECTS[ttKey.name];
+    const kx = timeToX(k.t);
+    const ky = p.type === 'continuous' ? valueToY(k.v, ttKey.name) : r.y0 + 4;
+    const m = Math.floor(k.t / 60);
+    const s = k.t - m * 60;
+    const tStr = `${m}:${s.toFixed(1).padStart(4, '0')}`;
+    const label = `${tStr}  ${ttKey.name}=${p.fmt(k.v)}`;
+    ectx.font = '10px ui-monospace, Menlo, monospace';
+    const tw = ectx.measureText(label).width;
+    const padX = 5, padY = 2, th = 14;
+    let tx = kx + 9, ty = ky - th - 6;
+    if (tx + tw + padX * 2 > w - 4) tx = kx - tw - padX * 2 - 9;
+    if (ty < ED_TOOLBAR_H + ED_RULER_H + 2) ty = ky + 8;
+    ectx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    ectx.fillRect(tx, ty, tw + padX * 2, th);
+    ectx.strokeStyle = '#444';
+    ectx.lineWidth = 1;
+    ectx.strokeRect(tx + 0.5, ty + 0.5, tw + padX * 2 - 1, th - 1);
+    ectx.fillStyle = '#fff';
+    ectx.fillText(label, tx + padX, ty + th - padY - 2);
+  }
+
+  function renderEditor() {
+    if (!editorVisible) return;
+    if (editorStaticDirty) {
+      renderEditorStatic();
+      editorStaticDirty = false;
     }
+    const { w, h } = editorCssSize();
+    // Static chrome — bg, lane bands, separators, label strip — drawn from
+    // the prerender. Everything else (ruler ticks, lanes, playhead, labels,
+    // tooltip) is dynamic and stacked on top each frame.
+    ectx.drawImage(editorStaticCanvas, 0, 0, w, h);
+    drawRuler(w);
+    drawLanes();
+    drawPlayhead(w, h);
+    drawLaneLabels();
+    drawTooltip(w);
   }
 
   // --- editor input ---
@@ -2129,8 +2334,8 @@
   function hitTest(mx, my) {
     if (mx < ED_LABEL_W) return { kind: 'label' };
     if (my < ED_TOOLBAR_H + ED_RULER_H) return { kind: 'ruler' };
-    for (const name of getLaneOrder()) {
-      const r = laneRect(name);
+    for (const name of EDITOR_ORDER) {
+      const r = LANE_RECTS[name];
       if (my < r.y0 || my >= r.y1) continue;
       const lane = lanes[name];
       const p = PARAMS[name];
@@ -2563,8 +2768,10 @@
     const pulseR = PARTICLE_BASE_R + bassPulse * PARTICLE_PULSE_AMOUNT;
     const jitter = JITTER_PX * smoothTreble;
     const rowCorrupt = bassPulse * rectW * ROW_CORRUPT_AMOUNT;
-    const pts = [];
-    pushFilledRectPoints(pts, W * 0.5, H * 0.5, rectW, rectH, LATTICE_SPACING, rowCorrupt);
+    // Reuse a single point buffer across frames; .length=0 keeps capacity.
+    lattPts.length = 0;
+    pushFilledRectPoints(lattPts, W * 0.5, H * 0.5, rectW, rectH, LATTICE_SPACING, rowCorrupt);
+    const pts = lattPts;
     // Lerp current shape pair into shapeBuffer once per frame, scaled by pulseR.
     const sFrom = SHAPES[shapeIndex];
     const sTo = SHAPES[(shapeIndex + 1) % SHAPES.length];
