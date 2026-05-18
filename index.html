@@ -135,7 +135,7 @@
     bottom: 0;
     left: 0;
     right: 0;
-    height: 190px;
+    height: var(--editor-h, 190px);
     background: rgba(0,0,0,0.92);
     border-top: 1px solid #2a2a2a;
     z-index: 6;
@@ -148,7 +148,29 @@
     height: 100%;
     cursor: crosshair;
   }
-  body.editor-visible #ui { bottom: 206px; }
+  #editor-resize {
+    position: absolute;
+    top: -3px;
+    left: 0;
+    right: 0;
+    height: 7px;
+    cursor: ns-resize;
+    z-index: 2;
+  }
+  #editor-resize::before {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 36px;
+    height: 2px;
+    background: #2a2a2a;
+    border-radius: 1px;
+    transition: background 0.15s;
+  }
+  #editor-resize:hover::before, #editor-resize.dragging::before { background: #666; }
+  body.editor-visible #ui { bottom: calc(var(--editor-h, 190px) + 16px); }
   #editor-menu {
     position: fixed;
     background: #161616;
@@ -419,6 +441,7 @@
   </div>
 </div>
 <div id="editor">
+  <div id="editor-resize" title="drag to resize"></div>
   <canvas id="editor-canvas"></canvas>
 </div>
 <div id="editor-menu" class="hidden">
@@ -603,6 +626,9 @@ let FLASH_TRIGGER = 0.18;
 let COLOR_LERP = 0.01;
 let KICKS_PER_COLOR_CYCLE = 64;
 let KICKS_PER_SHAPE_CYCLE = 16;
+let KICKS_PER_TWIST = 8;
+let MAX_TWIST_DEG = 720;
+let TWIST_PINCH = 0.3;
 let LATTICE_SPACING = 24;
 let FREEZE_MONO_CHANCE = 1 / 8;
 let SLICE_BURST_SCALE = 1.0;
@@ -1148,10 +1174,139 @@ function _buildJoeLouisFist() {
   return { vertices: allVerts, edges: allEdges };
 }
 
+// Transcending (David Barr & Sergio De Giusti, 2003), Hart Plaza, Detroit.
+// A wide low cylindrical plinth carries two stone half-rings that rise
+// from opposite sides and arch toward each other, their apex ends
+// stopping just short of meeting at top center (the gap is the
+// "transcending" gesture). Surrounding the sculpture are 14 Vermont
+// granite boulders. Each half-ring is rendered as a box-cross-section
+// beam (four parallel arcs at the corners of a square section)
+// following a 180° circular arc whose chord runs foot-to-apex, with
+// the arc bulging outward — so the two rings together approximate a
+// full circle in the vertical plane with a small apex gap.
+function _buildTranscending() {
+  const allVerts = [];
+  const allEdges = [];
+
+  // --- plinth: 12-sided low cylinder ---
+  const plinthR = 0.42;
+  const plinthBot = -0.5;
+  const plinthTop = -0.46;
+  const PN = 12;
+  const plinthBotRing = allVerts.length;
+  for (let i = 0; i < PN; i++) {
+    const a = (i / PN) * Math.PI * 2;
+    allVerts.push([plinthR * Math.cos(a), plinthBot, plinthR * Math.sin(a)]);
+  }
+  const plinthTopRing = allVerts.length;
+  for (let i = 0; i < PN; i++) {
+    const a = (i / PN) * Math.PI * 2;
+    allVerts.push([plinthR * Math.cos(a), plinthTop, plinthR * Math.sin(a)]);
+  }
+  for (let i = 0; i < PN; i++) {
+    const next = (i + 1) % PN;
+    allEdges.push([plinthBotRing + i, plinthBotRing + next]);
+    allEdges.push([plinthTopRing + i, plinthTopRing + next]);
+    allEdges.push([plinthBotRing + i, plinthTopRing + i]);
+  }
+
+  // --- two stone half-rings ---
+  // The two half-rings are the left and right halves of a single
+  // circle in a vertical plane: imagine a complete ring standing on
+  // the plinth, then cut along the vertical diameter — the two halves
+  // are the result. A small angular gap is removed at both the apex
+  // (top) and base (bottom), so the halves "nearly but not quite"
+  // meet along the central vertical axis. Each half is given physical
+  // depth by a box cross-section: four parallel arc curves at the
+  // corners of a square section (radial inner/outer × out-of-plane
+  // front/back), connected by cross-section rectangles at every
+  // angular step so the stone reads as solid from any rotation.
+  const ringR = 0.40;                        // ring radius in world units
+  const ringCY = plinthTop + ringR;          // circle center y — bottom of ring just touches plinth top
+  const archM = 14;                          // angular steps per half-ring
+  const archThick = 0.022;                   // half-thickness radially (stone width)
+  const archDepth = 0.022;                   // half-thickness in z (stone depth)
+  const archGapRad = 0.07;                   // angular half-gap at each meeting point (radians)
+
+  function _arcBeam(thetaStart, thetaEnd) {
+    const N = archM + 1;
+    const lineStart = allVerts.length;
+    const zPairs = [+archDepth, -archDepth];      // front then back
+    const radii = [ringR - archThick, ringR + archThick]; // inner then outer
+    for (let zi = 0; zi < 2; zi++) {
+      for (let si = 0; si < 2; si++) {
+        const r = radii[si];
+        const z = zPairs[zi];
+        for (let i = 0; i < N; i++) {
+          const t = thetaStart + (thetaEnd - thetaStart) * (i / archM);
+          allVerts.push([r * Math.cos(t), ringCY + r * Math.sin(t), z]);
+        }
+      }
+    }
+    const idx = (zi, si, i) => lineStart + (zi * 2 + si) * N + i;
+
+    // Longitudinal edges along each of the 4 parallel arcs.
+    for (let zi = 0; zi < 2; zi++) {
+      for (let si = 0; si < 2; si++) {
+        for (let i = 0; i < archM; i++) {
+          allEdges.push([idx(zi, si, i), idx(zi, si, i + 1)]);
+        }
+      }
+    }
+    // Cross-section rectangle at every angular step keeps the section
+    // reading as solid stone, not 4 floating ribbons.
+    for (let i = 0; i < N; i++) {
+      allEdges.push([idx(0, 0, i), idx(0, 1, i)]);   // front: inner→outer
+      allEdges.push([idx(1, 0, i), idx(1, 1, i)]);   // back:  inner→outer
+      allEdges.push([idx(0, 0, i), idx(1, 0, i)]);   // inner: front→back
+      allEdges.push([idx(0, 1, i), idx(1, 1, i)]);   // outer: front→back
+    }
+  }
+
+  // Right half: sweep CCW from just past the bottom (θ = -π/2 + gap)
+  // through θ = 0 (right side) up to just before the top (θ = π/2 - gap).
+  _arcBeam(-Math.PI / 2 + archGapRad,  Math.PI / 2 - archGapRad);
+  // Left half: sweep CCW from just past the top (θ = π/2 + gap) through
+  // θ = π (left side) down to just before the bottom (θ = 3π/2 - gap).
+  _arcBeam( Math.PI / 2 + archGapRad,  3 * Math.PI / 2 - archGapRad);
+
+  // --- 14 Vermont granite boulders ringed around the plinth ---
+  // Tetrahedral primitives with per-boulder jitter (deterministic via
+  // index trigonometry so the mesh is stable across rebuilds). Heights
+  // are ~2× the plinth's, matching the 6-ft boulders vs ~3-ft plinth
+  // ratio in the actual installation.
+  const bCount = 14;
+  const boulderRing = plinthR + 0.14;
+  const boulderH = 0.10;
+  for (let i = 0; i < bCount; i++) {
+    const a = (i / bCount) * Math.PI * 2 + 0.11;
+    const cx = boulderRing * Math.cos(a);
+    const cz = boulderRing * Math.sin(a);
+    const j = (k) => 0.012 * Math.sin(i * 13.37 + k * 7.21);
+    const r0 = 0.045 + j(0);
+    const r1 = 0.045 + j(1);
+    const r2 = 0.045 + j(2);
+    const v0 = allVerts.length;
+    allVerts.push([cx + r0 * Math.cos(a + 0.6),  plinthBot,             cz + r0 * Math.sin(a + 0.6)]);
+    allVerts.push([cx + r1 * Math.cos(a + 2.6),  plinthBot,             cz + r1 * Math.sin(a + 2.6)]);
+    allVerts.push([cx + r2 * Math.cos(a - 1.8),  plinthBot,             cz + r2 * Math.sin(a - 1.8)]);
+    allVerts.push([cx + j(3),                    plinthBot + boulderH,  cz + j(4)]);
+    allEdges.push([v0,     v0 + 1]);
+    allEdges.push([v0 + 1, v0 + 2]);
+    allEdges.push([v0 + 2, v0]);
+    allEdges.push([v0,     v0 + 3]);
+    allEdges.push([v0 + 1, v0 + 3]);
+    allEdges.push([v0 + 2, v0 + 3]);
+  }
+
+  return { vertices: allVerts, edges: allEdges };
+}
+
 const MESHES = {
-  rencen: _buildRencen(),
-  bridge: _buildAmbassador(),
-  fist:   _buildJoeLouisFist(),
+  rencen:       _buildRencen(),
+  bridge:       _buildAmbassador(),
+  fist:         _buildJoeLouisFist(),
+  transcending: _buildTranscending(),
 };
 const MESH_NAMES = Object.keys(MESHES);
 
@@ -1191,6 +1346,14 @@ let flashCool = 0, pendingFlash = null;
 let pendingFreeze = false, pendingShuffle = false;
 let ditherPhaseX = 0, ditherPhaseY = 0;
 let colorIndex = 0, kickCount = 0;
+// twistKickCount accumulates 0..KICKS_PER_TWIST-1; targetTwist is derived
+// from twistKickCount/KICKS_PER_TWIST and currentTwist eases toward it.
+// On each KICKS_PER_TWIST'th kick the counter snaps back to 0, so the
+// twist winds up to MAX_TWIST_DEG and rhythmically releases — producing
+// a nested-spiral / seashell deformation that builds and collapses.
+let twistKickCount = 0;
+let currentTwist = 0;
+let currentPinch = 0;
 let tintR = COLOR_PALETTE[0][0];
 let tintG = COLOR_PALETTE[0][1];
 let tintB = COLOR_PALETTE[0][2];
@@ -1215,6 +1378,9 @@ let scanlineTile, scanlinePattern;
 let ditherCanvas, ditherGL;
 let _ditherProg, _ditherQuad, _ditherSrcTex, _ditherBayerTex;
 let _ditherUTex, _ditherUBayer, _ditherUSize, _ditherUOffset, _ditherAPos;
+let twistCanvas, twistGL;
+let _twistProg, _twistQuad, _twistSrcTex;
+let _twistUTex, _twistURes, _twistUTwist, _twistUPinch, _twistAPos;
 let freezeCanvas, freezeCtx;
 
 function spawnFlyout(s) {
@@ -1549,6 +1715,132 @@ function resizeDither() {
   ditherCanvas.width = Math.max(1, Math.ceil(W));
   ditherCanvas.height = Math.max(1, Math.ceil(H));
 }
+
+// === pinch + twist pipeline ===
+// Reads the main canvas as a texture, applies a circular pinch+twist
+// deformation (radial falloff so corners stay still), and draws the
+// result back over the main canvas. Sits before the bar/grain overlays
+// so those passes layer on top of the deformed content. The twist angle
+// can exceed 2π — at maxTwistDeg = 720°, points near the center spiral
+// nearly twice around relative to the unmoving rim, producing a nested
+// seashell effect.
+function setupTwist() {
+  twistCanvas = new OffscreenCanvas(Math.max(1, canvas.width), Math.max(1, canvas.height));
+  twistGL = twistCanvas.getContext('webgl', {
+    preserveDrawingBuffer: true,
+    premultipliedAlpha: false,
+    antialias: true,
+    alpha: false,
+    depth: false,
+    stencil: false,
+  });
+  if (!twistGL) throw new Error('twist WebGL not supported in worker');
+
+  const VS_SRC =
+    'attribute vec2 aPos;' +
+    'varying vec2 vUv;' +
+    'void main() {' +
+    '  vUv = aPos * 0.5 + 0.5;' +
+    '  gl_Position = vec4(aPos, 0.0, 1.0);' +
+    '}';
+  // Falloff is computed in pixel space against the canvas diagonal so
+  // the active region reaches into the corners. The pow(0.6) curve
+  // keeps the deformation broad — at the mid-radius the twist is still
+  // ~66% strength, instead of the 50% you'd get from a linear falloff
+  // or the ~16% from a smoothstep — so more of the screen participates.
+  // Pinch scales radius inward, coupled to the same falloff so pinch
+  // and twist build together.
+  const FS_SRC =
+    'precision highp float;' +
+    'varying vec2 vUv;' +
+    'uniform sampler2D uTex;' +
+    'uniform vec2 uResolution;' +
+    'uniform float uTwist;' +
+    'uniform float uPinch;' +
+    'void main() {' +
+    '  vec2 px = vUv * uResolution;' +
+    '  vec2 c = uResolution * 0.5;' +
+    '  vec2 d = px - c;' +
+    '  float r = length(d);' +
+    '  float maxR = length(c);' +
+    '  float t = clamp(r / maxR, 0.0, 1.0);' +
+    '  float falloff = pow(1.0 - t, 0.6);' +
+    '  float twist = uTwist * falloff;' +
+    '  float pinch = uPinch * falloff;' +
+    '  float cs = cos(twist);' +
+    '  float sn = sin(twist);' +
+    '  vec2 td = vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);' +
+    '  td *= (1.0 - pinch * 0.55);' +
+    '  vec2 srcUv = (c + td) / uResolution;' +
+    '  gl_FragColor = texture2D(uTex, srcUv);' +
+    '}';
+  function compile(type, src) {
+    const sh = twistGL.createShader(type);
+    twistGL.shaderSource(sh, src);
+    twistGL.compileShader(sh);
+    if (!twistGL.getShaderParameter(sh, twistGL.COMPILE_STATUS)) {
+      throw new Error('twist shader compile: ' + twistGL.getShaderInfoLog(sh));
+    }
+    return sh;
+  }
+  _twistProg = twistGL.createProgram();
+  twistGL.attachShader(_twistProg, compile(twistGL.VERTEX_SHADER, VS_SRC));
+  twistGL.attachShader(_twistProg, compile(twistGL.FRAGMENT_SHADER, FS_SRC));
+  twistGL.linkProgram(_twistProg);
+  if (!twistGL.getProgramParameter(_twistProg, twistGL.LINK_STATUS)) {
+    throw new Error('twist program link: ' + twistGL.getProgramInfoLog(_twistProg));
+  }
+  _twistQuad = twistGL.createBuffer();
+  twistGL.bindBuffer(twistGL.ARRAY_BUFFER, _twistQuad);
+  twistGL.bufferData(twistGL.ARRAY_BUFFER, new Float32Array([
+    -1, -1,  1, -1, -1,  1,  1,  1,
+  ]), twistGL.STATIC_DRAW);
+  _twistUTex   = twistGL.getUniformLocation(_twistProg, 'uTex');
+  _twistURes   = twistGL.getUniformLocation(_twistProg, 'uResolution');
+  _twistUTwist = twistGL.getUniformLocation(_twistProg, 'uTwist');
+  _twistUPinch = twistGL.getUniformLocation(_twistProg, 'uPinch');
+  _twistAPos   = twistGL.getAttribLocation(_twistProg, 'aPos');
+  _twistSrcTex = twistGL.createTexture();
+  twistGL.bindTexture(twistGL.TEXTURE_2D, _twistSrcTex);
+  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_MIN_FILTER, twistGL.LINEAR);
+  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_MAG_FILTER, twistGL.LINEAR);
+  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_WRAP_S, twistGL.CLAMP_TO_EDGE);
+  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_WRAP_T, twistGL.CLAMP_TO_EDGE);
+}
+
+function resizeTwist() {
+  twistCanvas.width = Math.max(1, canvas.width);
+  twistCanvas.height = Math.max(1, canvas.height);
+}
+
+// Skips when both twist and pinch are negligible — avoids the texture
+// upload + redraw on frames where the effect would be invisible.
+function applyTwist(twist, pinch) {
+  if (Math.abs(twist) < 1e-4 && pinch < 1e-4) return;
+  const dw = twistCanvas.width;
+  const dh = twistCanvas.height;
+  if (dw <= 0 || dh <= 0) return;
+  const gl = twistGL;
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _twistSrcTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  gl.viewport(0, 0, dw, dh);
+  gl.useProgram(_twistProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _twistQuad);
+  gl.enableVertexAttribArray(_twistAPos);
+  gl.vertexAttribPointer(_twistAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform1i(_twistUTex, 0);
+  gl.uniform2f(_twistURes, dw, dh);
+  gl.uniform1f(_twistUTwist, twist);
+  gl.uniform1f(_twistUPinch, pinch);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'copy';
+  ctx.drawImage(twistCanvas, 0, 0, dw, dh, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
 function resizeFreeze() {
   freezeCanvas.width = canvas.width;
   freezeCanvas.height = canvas.height;
@@ -1610,6 +1902,8 @@ function frame(now) {
       shapeIndex = (shapeIndex + 1) % SHAPES.length;
       shapeProgress = 0;
     }
+    twistKickCount++;
+    if (twistKickCount >= KICKS_PER_TWIST) twistKickCount = 0;
     beatsAtOrientation++;
     if (beatsAtOrientation >= nextRotateBeats) {
       const rotRad = (20 + Math.random() * 25) * Math.PI / 180;
@@ -1620,6 +1914,19 @@ function frame(now) {
     spawnSliceBurst(Math.min(1, bassOnset * 4));
     sliceCool = 3 + Math.random() * 6;
   }
+
+  // Ease the rendered twist toward the kick-driven target. Targets are
+  // (twistKickCount / KICKS_PER_TWIST) scaled by max twist / max pinch.
+  // Because twistKickCount snaps from KICKS_PER_TWIST-1 back to 0 on the
+  // "release" kick, the eased current values fall back through zero,
+  // unwinding the spiral before the next wind-up begins.
+  const _twistDenom = Math.max(1, KICKS_PER_TWIST);
+  const _twistProgress = twistKickCount / _twistDenom;
+  const _twistTargetRad = _twistProgress * MAX_TWIST_DEG * Math.PI / 180;
+  const _twistPinchTarget = _twistProgress * TWIST_PINCH;
+  const _twistLerp = Math.min(1, 0.16 * dt);
+  currentTwist += (_twistTargetRad - currentTwist) * _twistLerp;
+  currentPinch += (_twistPinchTarget - currentPinch) * _twistLerp;
 
   midBaseline = midBaseline * 0.97 + b.mid * 0.03;
   const midDev = Math.max(0, b.mid - midBaseline);
@@ -1676,6 +1983,7 @@ function frame(now) {
   if (freezeFrames > 0) {
     restoreFreeze();
     freezeFrames -= dt;
+    applyTwist(currentTwist, currentPinch);
   } else {
     const fade = 0.06 + 0.05 * (1 - smoothLevel);
     ctx.fillStyle = 'rgba(0,0,0,' + fade + ')';
@@ -1886,6 +2194,10 @@ function frame(now) {
       ctx.drawImage(particleCanvas, x, y);
     }
 
+    // Pinch + twist sits between the scene content and the bar overlay
+    // so slices/scanline/grain layer on top of the deformed image.
+    applyTwist(currentTwist, currentPinch);
+
     if (slices.length) {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2067,6 +2379,12 @@ function applyParam(name, v) {
       ensureMesh3dCount();
       break;
     case 'mesh3dRotSpeed': MESH3D_ROT_SPEED = v; break;
+    case 'kicksPerTwist':
+      KICKS_PER_TWIST = Math.max(1, Math.round(v));
+      if (twistKickCount >= KICKS_PER_TWIST) twistKickCount = 0;
+      break;
+    case 'maxTwistDeg': MAX_TWIST_DEG = v; break;
+    case 'twistPinch': TWIST_PINCH = v; break;
   }
 }
 function applyParams(p) {
@@ -2088,6 +2406,7 @@ host.onmessage = function (e) {
     if (msg.params) applyParams(msg.params);
     setupOffscreens();
     setupDither();
+    setupTwist();
     initFlyout();
     initMeshes3d();
     last = performance.now();
@@ -2114,6 +2433,7 @@ host.onmessage = function (e) {
     rebuildScanlineTile();
     rebuildParticleTile();
     if (ditherCanvas) resizeDither();
+    if (twistCanvas) resizeTwist();
     if (freezeCanvas) resizeFreeze();
     // Drop any in-flight slices: their s.y/s.dx are baked in the old
     // viewport's coordinate system, and they'd render bars at stale
@@ -2200,6 +2520,13 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     (typeof DedicatedWorkerGlobalScope === 'undefined' &&
       typeof OffscreenCanvas === 'undefined');
 
+  // ?lite mode: caps the render bitmap to 1280×720 (browser upscales
+  // CSS-wise) and sets a sparser lattice. Intended for low-power devices
+  // (Raspberry Pi 4, low-end ARM Chromebooks). See PI_PERFORMANCE.md.
+  const liteMode = /[?&]lite(=|&|$)/.test(location.search);
+  const LITE_MAX_W = 1280;
+  const LITE_MAX_H = 720;
+
   const canvas = document.getElementById('c');
   // Render is owned by a Worker that controls the canvas via OffscreenCanvas
   // (see <script type="text/worker" id="worker-src"> above). Main thread
@@ -2258,10 +2585,21 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
 
   let dpr = Math.min(window.devicePixelRatio || 1, 2);
   let W = 0, H = 0;
+  function computeDpr() {
+    let d = Math.min(window.devicePixelRatio || 1, 2);
+    if (liteMode) {
+      // Clamp bitmap to LITE_MAX_W × LITE_MAX_H. Browser upscales the
+      // smaller bitmap to fill the 100vw × 100vh canvas.
+      const w = window.innerWidth, h = window.innerHeight;
+      if (w > 0) d = Math.min(d, LITE_MAX_W / w);
+      if (h > 0) d = Math.min(d, LITE_MAX_H / h);
+    }
+    return d;
+  }
   function resize() {
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth;
     H = window.innerHeight;
+    dpr = computeDpr();
     // CSS sizing is handled by the canvas { width: 100vw; height: 100vh }
     // rule in <style>, which auto-tracks viewport changes. The bitmap
     // dimensions are owned by the worker (see worker.onmessage 'resize').
@@ -2444,9 +2782,15 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         return Math.min(audio.duration || 0, _startOffset + (audioCtx.currentTime - _startCtxTime));
       },
       set(t) {
+        // Reject non-finite seek targets outright. Previously the
+        // `+t || 0` fallback silently coerced NaN to 0, which could
+        // pin playback to the start of the buffer whenever a caller
+        // accidentally passed a malformed value.
+        const v = +t;
+        if (!Number.isFinite(v)) return;
         const wasPlaying = !_paused;
         if (wasPlaying) _stop();
-        _startOffset = Math.max(0, Math.min(audio.duration || 0, +t || 0));
+        _startOffset = Math.max(0, Math.min(audio.duration || 0, v));
         if (wasPlaying) _start();
         _fire('timeupdate');
       },
@@ -2477,8 +2821,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // On iOS we route through createBufferAudioPlayer (decodeAudioData +
   // AudioBufferSourceNode) because MediaElementSource on iOS WebKit doesn't
   // pipe data through the Web Audio graph — analyser reads zeros even when
-  // audio is audible. On other browsers, MediaElementSource is preferred:
-  // streaming, no full-decode memory cost.
+  // audio is audible. On other browsers we feed the audio element a
+  // blob: URL backed by the fully-fetched file rather than letting it
+  // progressively-stream from the original URL. Streaming relies on the
+  // host server's Range-request support for seeking past the currently-
+  // buffered region; some dev servers (and file://) advertise no Range,
+  // causing Chrome to silently restart playback from 0 on any seek
+  // past the buffered window. A blob: URL is in-memory and
+  // unconditionally seekable, so scrubbing works regardless of host.
   function loadFromUrl(url, displayName) {
     ensureCtx();
     teardownSource();
@@ -2488,7 +2838,6 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       audio = createBufferAudioPlayer(url);
     } else {
       audio = new Audio();
-      audio.src = url;
       audio.loop = false;
       audio.preload = 'auto';
       audio.playsInline = true;
@@ -2496,11 +2845,51 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       audio.setAttribute('webkit-playsinline', '');
       audio.style.display = 'none';
       document.body.appendChild(audio);
-      const src = audioCtx.createMediaElementSource(audio);
-      src.connect(analyser);
-      src.connect(transientAnalyser);
+      const mediaSrc = audioCtx.createMediaElementSource(audio);
+      mediaSrc.connect(analyser);
+      mediaSrc.connect(transientAnalyser);
       analyser.connect(audioCtx.destination);
-      currentSource = src;
+      currentSource = mediaSrc;
+
+      // play() may fire synchronously from the user-gesture handler
+      // before the blob fetch resolves. Wrap it so calls in that window
+      // queue until src is assigned, then resume — mirrors the iOS
+      // bufferAudio _bufferReady deferral.
+      let srcReady = false;
+      const pendingPlays = [];
+      const nativePlay = audio.play.bind(audio);
+      audio.play = function () {
+        if (srcReady) return nativePlay();
+        return new Promise((resolve, reject) => {
+          pendingPlays.push({ resolve, reject });
+        });
+      };
+      function adoptSrc(newSrc) {
+        audio.src = newSrc;
+        srcReady = true;
+        while (pendingPlays.length) {
+          const { resolve, reject } = pendingPlays.shift();
+          nativePlay().then(resolve, reject);
+        }
+      }
+
+      if (url.startsWith('blob:')) {
+        // Drag-and-drop path: URL is already a blob from
+        // URL.createObjectURL(file). In-memory and seekable as-is.
+        adoptSrc(url);
+      } else {
+        fetch(url)
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+          .then(blob => adoptSrc(URL.createObjectURL(blob)))
+          .catch(err => {
+            console.error('[ambient_viz] audio fetch err:', err);
+            statusEl.textContent = 'load err: ' + (err && (err.message || err.name) || 'unknown');
+            while (pendingPlays.length) {
+              const { reject } = pendingPlays.shift();
+              reject(err);
+            }
+          });
+      }
     }
     currentEl = audio;
     statusEl.textContent = displayName;
@@ -2527,15 +2916,19 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
 
   function fracFromEvent(e) {
     const rect = timeline.getBoundingClientRect();
+    if (!(rect.width > 0)) return 0;
     const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-    return Math.max(0, Math.min(1, x / rect.width));
+    const f = x / rect.width;
+    if (!isFinite(f)) return 0;
+    return Math.max(0, Math.min(1, f));
   }
   function applyScrub(frac, commit) {
     if (!currentEl || !isFinite(currentEl.duration) || currentEl.duration <= 0) return;
+    if (!isFinite(frac)) return;
     setTimelineProgress(frac);
     const t = frac * currentEl.duration;
     timeCur.textContent = fmtTime(t);
-    if (commit) currentEl.currentTime = t;
+    if (commit && isFinite(t) && t >= 0) currentEl.currentTime = t;
   }
   timeline.addEventListener('pointerdown', e => {
     if (!currentEl) return;
@@ -2679,9 +3072,8 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   //        - For discrete:   options() → array of valid values, fmt(v)
   //        - setLive: function that writes the value into your `let`
   //        - editor: true to expose as a lane in the bottom-strip visual
-  //                  editor. Default false (dev-panel slider only). The
-  //                  strip has limited vertical space; only set true for
-  //                  params you'll actually automate over a track.
+  //                  editor. Set false to hide a param from the strip
+  //                  (dev-panel slider only).
   //   3. That's it. Sliders, automation lanes, save/load round-trip,
   //      localStorage autosave, and the manual↔lane fallback are wired
   //      automatically.
@@ -2702,7 +3094,6 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   //   - For discrete lanes, k.v ∈ PARAMS[name].options()
   //
   const PARAMS = {
-    // --- editor-visible (default automation surface, ≤6 lanes fit) ---
     sliceTrigger: {
       type: 'continuous', def: 0.065,
       min: 0.005, max: 0.25, step: 0.005,
@@ -2733,98 +3124,113 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       fmt: v => v.toFixed(3), editor: true,
       setLive: v => setParam('monoBarChance', v),
     },
-    // --- dev-panel-only (slider available, not in editor by default) ---
-    // Flip `editor: true` to surface in the bottom strip when you want to
-    // automate one of these over an arrangement.
     jitterPx: {
       type: 'continuous', def: 26,
       min: 0, max: 60, step: 1,
-      fmt: v => v.toFixed(0), editor: false,
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => setParam('jitterPx', v),
     },
     latticeSpacing: {
       type: 'continuous', def: 24,
       min: 8, max: 64, step: 1,
-      fmt: v => v.toFixed(0), editor: false,
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => setParam('latticeSpacing', v),
     },
     rowCorruptAmount: {
       type: 'continuous', def: 2.6,
       min: 0, max: 8, step: 0.1,
-      fmt: v => v.toFixed(1), editor: false,
+      fmt: v => v.toFixed(1), editor: true,
       setLive: v => setParam('rowCorruptAmount', v),
     },
     grainAlpha: {
       type: 'continuous', def: 0.46,
       min: 0, max: 1, step: 0.02,
-      fmt: v => v.toFixed(2), editor: false,
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('grainAlpha', v),
     },
     scanlineAlpha: {
       type: 'continuous', def: 0.42,
       min: 0, max: 1, step: 0.02,
-      fmt: v => v.toFixed(2), editor: false,
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('scanlineAlpha', v),
     },
     flashTrigger: {
       type: 'continuous', def: 0.18,
       min: 0.02, max: 0.5, step: 0.01,
-      fmt: v => v.toFixed(2), editor: false,
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('flashTrigger', v),
     },
     onsetThreshold: {
       type: 'continuous', def: 0.07,
       min: 0.01, max: 0.3, step: 0.005,
-      fmt: v => v.toFixed(3), editor: false,
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => setParam('onsetThreshold', v),
     },
     midSliceTrigger: {
       type: 'continuous', def: 0.09,
       min: 0.01, max: 0.3, step: 0.005,
-      fmt: v => v.toFixed(3), editor: false,
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => setParam('midSliceTrigger', v),
     },
     sliceBurstScale: {
       type: 'continuous', def: 1.0,
       min: 0, max: 3, step: 0.05,
-      fmt: v => v.toFixed(2), editor: false,
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('sliceBurstScale', v),
     },
     freezeFramesMax: {
       type: 'continuous', def: 12,
       min: 4, max: 60, step: 1,
-      fmt: v => v.toFixed(0), editor: false,
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => setParam('freezeFramesMax', v),
     },
     colorLerp: {
       type: 'continuous', def: 0.01,
       min: 0.001, max: 0.1, step: 0.001,
-      fmt: v => v.toFixed(3), editor: false,
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => setParam('colorLerp', v),
     },
     freezeMonoChance: {
       type: 'continuous', def: 1 / 8,
       min: 0, max: 1, step: 0.01,
-      fmt: v => v.toFixed(2), editor: false,
+      fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('freezeMonoChance', v),
     },
     kicksPerShapeCycle: {
       type: 'continuous', def: 16,
       min: 2, max: 64, step: 1,
-      fmt: v => v.toFixed(0), editor: false,
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => setParam('kicksPerShapeCycle', v),
     },
     mesh3dCount: {
       type: 'continuous', def: 2,
       min: 0, max: 4, step: 1,
-      fmt: v => v.toFixed(0), editor: false,
+      fmt: v => v.toFixed(0), editor: true,
       setLive: v => setParam('mesh3dCount', v),
     },
     mesh3dRotSpeed: {
       type: 'continuous', def: 0.0075,
       min: -0.15, max: 0.15, step: 0.001,
-      fmt: v => v.toFixed(3), editor: false,
+      fmt: v => v.toFixed(3), editor: true,
       setLive: v => setParam('mesh3dRotSpeed', v),
+    },
+    kicksPerTwist: {
+      type: 'continuous', def: 8,
+      min: 1, max: 64, step: 1,
+      fmt: v => v.toFixed(0), editor: true,
+      setLive: v => setParam('kicksPerTwist', v),
+    },
+    maxTwistDeg: {
+      type: 'continuous', def: 720,
+      min: 0, max: 1440, step: 10,
+      fmt: v => v.toFixed(0), editor: true,
+      setLive: v => setParam('maxTwistDeg', v),
+    },
+    twistPinch: {
+      type: 'continuous', def: 0.3,
+      min: 0, max: 1, step: 0.01,
+      fmt: v => v.toFixed(2), editor: true,
+      setLive: v => setParam('twistPinch', v),
     },
   };
   const PARAM_NAMES = Object.keys(PARAMS);
@@ -3296,9 +3702,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // (slider-style with y-axis encoding value), then discrete (markers with
   // text labels). Mouse: click a key to drag it in time (and value, if
   // continuous); click empty lane area to add a key; right-click a key to
-  // delete; drag the ruler to scrub audio; wheel to zoom. The strip shares
-  // the same `lanes` state as the dev panel — mutations route through the
-  // same recordKey/deleteKey paths so autosave stays consistent.
+  // delete; drag the ruler to scrub audio; wheel scrolls lanes vertically
+  // (when overflowing) or zooms time (no overflow / shift+wheel). Top edge
+  // is a drag handle that resizes the strip (height persisted across
+  // sessions). The strip shares the same `lanes` state as the dev panel —
+  // mutations route through the same recordKey/deleteKey paths so autosave
+  // stays consistent.
   const editorEl = document.getElementById('editor');
   const editorCanvas = document.getElementById('editor-canvas');
   const ectx = editorCanvas.getContext('2d');
@@ -3314,6 +3723,18 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // (the ED_* layout constants and LANE_RECTS are declared after this
   // function but before the frame loop starts).
   let editorStaticDirty = true;
+  // Editor height is user-resizable via the top-edge grip. Persisted across
+  // sessions; clamped to the window so it can never eat the whole viewport.
+  const ED_HEIGHT_KEY = 'ambient_viz.editor.h';
+  const ED_HEIGHT_MIN = 80;
+  function clampEditorHeight(h) {
+    return Math.max(ED_HEIGHT_MIN, Math.min(window.innerHeight - 80, h));
+  }
+  let editorHeight = clampEditorHeight(parseInt(localStorage.getItem(ED_HEIGHT_KEY), 10) || 190);
+  document.documentElement.style.setProperty('--editor-h', editorHeight + 'px');
+  // Vertical scroll offset for the lane area (CSS px, layout-space). The
+  // ruler and label-strip background stay fixed; only lanes translate.
+  let editorScrollY = 0;
   function resizeEditor() {
     edpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssW = editorEl.clientWidth;
@@ -3323,7 +3744,13 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     ectx.setTransform(edpr, 0, 0, edpr, 0, 0);
     editorStaticDirty = true;
   }
-  window.addEventListener('resize', resizeEditor);
+  function setEditorHeight(h) {
+    editorHeight = clampEditorHeight(h);
+    document.documentElement.style.setProperty('--editor-h', editorHeight + 'px');
+    resizeEditor();
+    clampEditorScrollY();
+  }
+  window.addEventListener('resize', () => setEditorHeight(editorHeight));
   resizeEditor();
 
   let editorVisible = true;
@@ -3382,8 +3809,26 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     }
     return out;
   })();
+  // Bottom edge of all lanes in layout-space (y where the last lane ends).
+  // Used to compute scroll bounds.
+  const EDITOR_CONTENT_BOTTOM = (() => {
+    let last = ED_TOOLBAR_H + ED_RULER_H;
+    for (const n of EDITOR_ORDER) last = Math.max(last, LANE_RECTS[n].y1);
+    return last;
+  })();
+  const ED_SB_W = 6;            // vertical scrollbar width (CSS px)
   function editorCssSize() {
     return { w: editorCanvas.width / edpr, h: editorCanvas.height / edpr };
+  }
+  function getEditorViewportH() {
+    return editorCssSize().h - (ED_TOOLBAR_H + ED_RULER_H);
+  }
+  function getMaxScrollY() {
+    const lanesH = EDITOR_CONTENT_BOTTOM - (ED_TOOLBAR_H + ED_RULER_H);
+    return Math.max(0, lanesH - getEditorViewportH());
+  }
+  function clampEditorScrollY() {
+    editorScrollY = Math.max(0, Math.min(getMaxScrollY(), editorScrollY));
   }
   function timeToX(t) {
     const { w } = editorCssSize();
@@ -3391,7 +3836,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   }
   function xToTime(x) {
     const { w } = editorCssSize();
-    return editorTStart + (x - ED_LABEL_W) / (w - ED_LABEL_W) * (editorTEnd - editorTStart);
+    const denom = w - ED_LABEL_W;
+    const span = editorTEnd - editorTStart;
+    // If the visible range collapsed to zero (can happen briefly while
+    // duration is still 0 — autoCenterEditor's duration-clamp pins both
+    // ends to 0) or the canvas width is degenerate, abstain instead of
+    // returning a meaningless editorTStart for every click.
+    if (denom <= 0 || span <= 0) return NaN;
+    return editorTStart + (x - ED_LABEL_W) / denom * span;
   }
   function valueToY(v, name) {
     const p = PARAMS[name];
@@ -3410,11 +3862,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     return Math.max(p.min, Math.min(p.max, v));
   }
 
-  // Static editor chrome (background, lane bands, separators, label
-  // strip) is rendered once into an offscreen canvas (declared above next
-  // to editorCanvas) and blitted each frame, since none of these change
-  // with time scrolling. Refreshed on resize. Lane labels still draw
-  // dynamically over the top because their color tracks `armed[name]`.
+  // Static editor chrome (background, ruler bg, label-strip bg + separator)
+  // is rendered once into an offscreen canvas (declared above next to
+  // editorCanvas) and blitted each frame, since none of these change with
+  // time scrolling. Per-lane chrome (band fills, top separators) is now
+  // drawn dynamically inside the scroll-clipped lane area — see
+  // drawLaneChrome — because lanes translate vertically when scrolled.
   function renderEditorStatic() {
     editorStaticCanvas.width = editorCanvas.width;
     editorStaticCanvas.height = editorCanvas.height;
@@ -3424,17 +3877,38 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     esCtx.fillRect(0, 0, w, h);
     esCtx.fillStyle = 'rgba(255,255,255,0.04)';
     esCtx.fillRect(0, ED_TOOLBAR_H, w, ED_RULER_H);
-    for (const name of EDITOR_ORDER) {
-      const r = LANE_RECTS[name];
-      esCtx.fillStyle = 'rgba(255,255,255,0.015)';
-      esCtx.fillRect(0, r.y0, w, r.h);
-      esCtx.fillStyle = '#1a1a1a';
-      esCtx.fillRect(0, r.y0, w, 1);
-      esCtx.fillStyle = '#222';
-      esCtx.fillRect(ED_LABEL_W - 1, r.y0, 1, r.h);
-    }
+    // Label strip background (opaque, fixed — does not scroll).
     esCtx.fillStyle = 'rgba(0,0,0,0.92)';
     esCtx.fillRect(0, ED_TOOLBAR_H + ED_RULER_H, ED_LABEL_W - 1, h - ED_TOOLBAR_H - ED_RULER_H);
+    // Vertical separator between label strip and lane area.
+    esCtx.fillStyle = '#222';
+    esCtx.fillRect(ED_LABEL_W - 1, ED_TOOLBAR_H + ED_RULER_H, 1, h - ED_TOOLBAR_H - ED_RULER_H);
+  }
+  // Per-lane band fill + 1px top-of-lane separator. Drawn each frame inside
+  // the scroll-translated/clipped context so it scrolls with the curves.
+  function drawLaneChrome(w) {
+    const xL = ED_LABEL_W;
+    const laneW = w - ED_LABEL_W;
+    for (const name of EDITOR_ORDER) {
+      const r = LANE_RECTS[name];
+      ectx.fillStyle = 'rgba(255,255,255,0.015)';
+      ectx.fillRect(xL, r.y0, laneW, r.h);
+      ectx.fillStyle = '#1a1a1a';
+      ectx.fillRect(xL, r.y0, laneW, 1);
+    }
+  }
+  function drawScrollbar(w) {
+    const max = getMaxScrollY();
+    if (max <= 0) return;
+    const top = ED_TOOLBAR_H + ED_RULER_H;
+    const viewH = getEditorViewportH();
+    const lanesH = EDITOR_CONTENT_BOTTOM - top;
+    const thumbH = Math.max(20, viewH * (viewH / lanesH));
+    const thumbY = top + (editorScrollY / max) * (viewH - thumbH);
+    ectx.fillStyle = 'rgba(255,255,255,0.04)';
+    ectx.fillRect(w - ED_SB_W, top, ED_SB_W, viewH);
+    ectx.fillStyle = 'rgba(255,255,255,0.22)';
+    ectx.fillRect(w - ED_SB_W + 1, thumbY, ED_SB_W - 2, thumbH);
   }
 
   function drawRuler(w) {
@@ -3569,7 +4043,9 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     const p = PARAMS[ttKey.name];
     const r = LANE_RECTS[ttKey.name];
     const kx = timeToX(k.t);
-    const ky = p.type === 'continuous' ? valueToY(k.v, ttKey.name) : r.y0 + 4;
+    // valueToY/r.y0 are layout-space; tooltip overlays canvas space, so
+    // subtract scroll to get on-screen y for placement.
+    const ky = (p.type === 'continuous' ? valueToY(k.v, ttKey.name) : r.y0 + 4) - editorScrollY;
     const m = Math.floor(k.t / 60);
     const s = k.t - m * 60;
     const tStr = `${m}:${s.toFixed(1).padStart(4, '0')}`;
@@ -3596,31 +4072,50 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       editorStaticDirty = false;
     }
     const { w, h } = editorCssSize();
-    // Static chrome — bg, lane bands, separators, label strip — drawn from
-    // the prerender. Everything else (ruler ticks, lanes, playhead, labels,
-    // tooltip) is dynamic and stacked on top each frame.
+    // Static chrome — bg, ruler bg, label-strip bg + separator — drawn from
+    // the prerender. Lane bands/curves/labels render in a scroll-clipped
+    // translated context so they slide vertically; ruler/playhead/scrollbar
+    // overlay on top, fixed.
     ectx.drawImage(editorStaticCanvas, 0, 0, w, h);
     drawRuler(w);
+    ectx.save();
+    ectx.beginPath();
+    ectx.rect(0, ED_TOOLBAR_H + ED_RULER_H, w, h - ED_TOOLBAR_H - ED_RULER_H);
+    ectx.clip();
+    ectx.translate(0, -editorScrollY);
+    drawLaneChrome(w);
     drawLanes();
-    drawPlayhead(w, h);
     drawLaneLabels();
+    ectx.restore();
+    drawPlayhead(w, h);
+    drawScrollbar(w);
     drawTooltip(w);
   }
 
   // --- editor input ---
+  // editorMouse returns canvas-space (mx, my) plus ly = my + scrollY, the
+  // layout-space y to use for lane hit-test / valueToY / yToValue (which
+  // operate in layout space and are agnostic of scroll).
   function editorMouse(e) {
     const rect = editorCanvas.getBoundingClientRect();
+    const my = e.clientY - rect.top;
     return {
       mx: e.clientX - rect.left,
-      my: e.clientY - rect.top,
+      my,
+      ly: my + editorScrollY,
     };
   }
-  function hitTest(mx, my) {
+  function hitTest(mx, my, ly) {
+    const { w } = editorCssSize();
+    // scrollbar takes priority — only when overflow exists and below ruler
+    if (getMaxScrollY() > 0 && mx >= w - ED_SB_W && my >= ED_TOOLBAR_H + ED_RULER_H) {
+      return { kind: 'scrollbar' };
+    }
     if (mx < ED_LABEL_W) return { kind: 'label' };
     if (my < ED_TOOLBAR_H + ED_RULER_H) return { kind: 'ruler' };
     for (const name of EDITOR_ORDER) {
       const r = LANE_RECTS[name];
-      if (my < r.y0 || my >= r.y1) continue;
+      if (ly < r.y0 || ly >= r.y1) continue;
       const lane = lanes[name];
       const p = PARAMS[name];
       // closest key by x
@@ -3629,7 +4124,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         const dx = Math.abs(timeToX(lane[i].t) - mx);
         if (dx < bestDx) {
           if (p.type === 'continuous') {
-            const dy = Math.abs(valueToY(lane[i].v, name) - my);
+            const dy = Math.abs(valueToY(lane[i].v, name) - ly);
             if (dy <= ED_HIT_PX) { bestI = i; bestDx = dx; }
           } else {
             bestI = i; bestDx = dx;
@@ -3638,20 +4133,39 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       }
       if (bestI >= 0) return { kind: 'key', name, keyIdx: bestI };
       const t = Math.max(0, xToTime(mx));
-      const v = p.type === 'continuous' ? yToValue(my, name) : manual[name];
+      const v = p.type === 'continuous' ? yToValue(ly, name) : manual[name];
       return { kind: 'lane', name, t, v };
     }
     return { kind: 'none' };
   }
 
   let editorDrag = null;
+  function scrollFromBarY(my) {
+    // Map a canvas-space my (within the scrollbar track) to scrollY such
+    // that the thumb's center sits under the cursor when possible.
+    const top = ED_TOOLBAR_H + ED_RULER_H;
+    const viewH = getEditorViewportH();
+    const lanesH = EDITOR_CONTENT_BOTTOM - top;
+    const max = getMaxScrollY();
+    if (max <= 0) return 0;
+    const thumbH = Math.max(20, viewH * (viewH / lanesH));
+    const trackTravel = viewH - thumbH;
+    const desiredThumbTop = Math.max(0, Math.min(trackTravel, my - top - thumbH / 2));
+    return (desiredThumbTop / trackTravel) * max;
+  }
   editorCanvas.addEventListener('pointerdown', (e) => {
     if (e.button === 2) return; // right-click handled by contextmenu
-    const { mx, my } = editorMouse(e);
-    const hit = hitTest(mx, my);
-    if (hit.kind === 'ruler') {
-      if (currentEl && isFinite(currentEl.duration)) {
-        currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, xToTime(mx)));
+    const { mx, my, ly } = editorMouse(e);
+    const hit = hitTest(mx, my, ly);
+    if (hit.kind === 'scrollbar') {
+      editorScrollY = scrollFromBarY(my);
+      editorDrag = { kind: 'scrollbar' };
+    } else if (hit.kind === 'ruler') {
+      if (currentEl && isFinite(currentEl.duration) && currentEl.duration > 0) {
+        const t = xToTime(mx);
+        if (isFinite(t)) {
+          currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, t));
+        }
       }
       editorDrag = { kind: 'scrub' };
     } else if (hit.kind === 'key') {
@@ -3668,11 +4182,18 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     e.preventDefault();
   });
   editorCanvas.addEventListener('pointermove', (e) => {
-    const { mx, my } = editorMouse(e);
+    const { mx, my, ly } = editorMouse(e);
     if (editorDrag) {
+      if (editorDrag.kind === 'scrollbar') {
+        editorScrollY = scrollFromBarY(my);
+        return;
+      }
       if (editorDrag.kind === 'scrub') {
-        if (currentEl && isFinite(currentEl.duration)) {
-          currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, xToTime(mx)));
+        if (currentEl && isFinite(currentEl.duration) && currentEl.duration > 0) {
+          const t = xToTime(mx);
+          if (isFinite(t)) {
+            currentEl.currentTime = Math.max(0, Math.min(currentEl.duration, t));
+          }
         }
         return;
       }
@@ -3683,7 +4204,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         const p = PARAMS[editorDrag.name];
         const dur = (currentEl && isFinite(currentEl.duration)) ? currentEl.duration : Infinity;
         k.t = Math.max(0, Math.min(dur, xToTime(mx)));
-        if (p.type === 'continuous') k.v = yToValue(my, editorDrag.name);
+        if (p.type === 'continuous') k.v = yToValue(ly, editorDrag.name);
         lane.sort((a, b) => a.t - b.t);
         editorDrag.keyIdx = lane.indexOf(k);
         onLanesMutated();
@@ -3691,13 +4212,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       return;
     }
     // not dragging — update hover + cursor
-    const hit = hitTest(mx, my);
+    const hit = hitTest(mx, my, ly);
     if (hit.kind === 'key') {
       editorHover = { name: hit.name, keyIdx: hit.keyIdx };
       editorCanvas.style.cursor = 'pointer';
     } else {
       editorHover = null;
-      if (hit.kind === 'ruler') editorCanvas.style.cursor = 'ew-resize';
+      if (hit.kind === 'scrollbar') editorCanvas.style.cursor = 'default';
+      else if (hit.kind === 'ruler') editorCanvas.style.cursor = 'ew-resize';
       else if (hit.kind === 'lane') editorCanvas.style.cursor = 'crosshair';
       else editorCanvas.style.cursor = 'default';
     }
@@ -3764,16 +4286,25 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   });
   editorCanvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
-    const { mx, my } = editorMouse(e);
-    const hit = hitTest(mx, my);
+    const { mx, my, ly } = editorMouse(e);
+    const hit = hitTest(mx, my, ly);
     if (hit.kind === 'key') {
       showEditorMenu(e.clientX, e.clientY, hit.name, hit.keyIdx);
     } else {
       hideEditorMenu();
     }
   });
+  // Wheel mapping: when lanes overflow and shift isn't held, scroll the
+  // lane list vertically (matches DAW conventions). Otherwise (no overflow,
+  // or shift held) zoom the time axis around its current center, which is
+  // the legacy behavior.
   editorCanvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    const max = getMaxScrollY();
+    if (max > 0 && !e.shiftKey) {
+      editorScrollY = Math.max(0, Math.min(max, editorScrollY + e.deltaY));
+      return;
+    }
     const factor = e.deltaY > 0 ? 1.25 : 0.8;
     const newSpan = Math.max(2, Math.min(7200, (editorTEnd - editorTStart) * factor));
     // preserve current center; auto-center will re-snap to playhead next frame
@@ -3781,6 +4312,32 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     editorTStart = center - newSpan / 2;
     editorTEnd = center + newSpan / 2;
   }, { passive: false });
+
+  // Resize handle at the top edge of the editor — drag vertically to grow
+  // or shrink the strip. Persisted to localStorage; clamped to window.
+  const editorResize = document.getElementById('editor-resize');
+  let editorResizeDrag = null;
+  editorResize.addEventListener('pointerdown', (e) => {
+    editorResizeDrag = { startY: e.clientY, startH: editorHeight };
+    editorResize.classList.add('dragging');
+    try { editorResize.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  editorResize.addEventListener('pointermove', (e) => {
+    if (!editorResizeDrag) return;
+    // Drag up (clientY decreasing) grows the strip.
+    const dy = editorResizeDrag.startY - e.clientY;
+    setEditorHeight(editorResizeDrag.startH + dy);
+  });
+  function endEditorResize(e) {
+    if (!editorResizeDrag) return;
+    editorResizeDrag = null;
+    editorResize.classList.remove('dragging');
+    try { editorResize.releasePointerCapture(e.pointerId); } catch (_) {}
+    try { localStorage.setItem(ED_HEIGHT_KEY, String(editorHeight)); } catch (_) {}
+  }
+  editorResize.addEventListener('pointerup', endEditorResize);
+  editorResize.addEventListener('pointercancel', endEditorResize);
 
   // 't' toggles the editor strip
   window.addEventListener('keydown', (e) => {
@@ -3811,6 +4368,11 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // through main-thread render, which works fine — the only cost is losing
   // worker offload. (`isiOS` is declared near the top of the IIFE so audio
   // code can also branch on it.)
+  // ?lite: bump LATTICE_SPACING from 24 → 36 (≈2.25× fewer lattice stamps).
+  // Applied to `manual` so the dev panel slider reflects the lite value too.
+  if (liteMode) {
+    manual.latticeSpacing = 36;
+  }
   const _initParams = {};
   for (const name of PARAM_NAMES) _initParams[name] = manual[name];
 
