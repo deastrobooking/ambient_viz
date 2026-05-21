@@ -24,6 +24,9 @@ Venetian Snares.
   a Pi, POSTs events to the Node bridge. See `python/README.md`.
 - `hardware-handoff.md` — canonical hardware spec for the kiosk build
   (sensors, pin map, wiring, tuning).
+- `PI_KIOSK_BRINGUP.md` — phased runbook for taking a bare Pi 4 to all
+  four sensors streaming into the visualizer, with a verification step
+  between each phase.
 
 ## Two ways to run
 
