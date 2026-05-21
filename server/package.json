@@ -1,0 +1,13 @@
+{
+  "name": "ambient_viz-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serves the static visualizer and streams Pi GPIO inputs to the browser over SSE.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

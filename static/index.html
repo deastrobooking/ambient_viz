@@ -2497,6 +2497,50 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
 
 <script>
 // ============================================================================
+// GPIO input client (SSE)
+//
+// Receives `{name, value, ts}` change events from the Node server (see
+// /server) and stows the latest value of each input on
+// `window.AMBIENT_INPUTS`. Inert by default: visualizer code can read
+// values opportunistically (e.g. `AMBIENT_INPUTS.humidity ?? 0.5`), but
+// nothing is bound to viz parameters yet.
+//
+// No-ops gracefully when:
+//   - opened via file:// (no origin to connect to)
+//   - server is not running (EventSource will retry; UI stays usable)
+//   - EventSource is unavailable
+// ============================================================================
+(function () {
+  const state = Object.create(null);
+  const meta = { connected: false, lastEventAt: 0, error: null };
+  window.AMBIENT_INPUTS = state;
+  Object.defineProperty(state, '__meta', { value: meta, enumerable: false });
+
+  if (typeof EventSource === 'undefined') return;
+  if (location.protocol === 'file:') return;
+
+  let es;
+  try { es = new EventSource('/events'); }
+  catch (e) { meta.error = String(e); return; }
+
+  es.addEventListener('change', (ev) => {
+    try {
+      const { name, value, ts } = JSON.parse(ev.data);
+      state[name] = value;
+      meta.lastEventAt = ts || Date.now();
+    } catch { /* ignore bad frame */ }
+  });
+  es.addEventListener('ready', () => { meta.connected = true; meta.error = null; });
+  es.addEventListener('error', () => {
+    meta.connected = false;
+    meta.error = 'disconnected';
+    // EventSource auto-reconnects; nothing to do here.
+  });
+})();
+</script>
+
+<script>
+// ============================================================================
 // ambient_viz — single-file inline visualizer
 //
 // IIFE sections (in declaration order):
