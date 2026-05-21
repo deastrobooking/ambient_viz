@@ -1,36 +1,74 @@
-// Fake input source for development on machines without GPIO.
-// Emits values shaped like what the real drivers will publish, so the
-// browser-side client and any future visualizer mappings can be wired
-// before any hardware exists.
+// Fake input source: emits the same wire format the Python sensor sidecar
+// produces in production, so the browser-side SSE plumbing can be
+// validated on a machine without GPIO.
+//
+// Real production path: Python drivers POST to /ingest. This in-process
+// mock skips the HTTP hop and publishes directly to the bus.
+//
+// Event names match hardware-handoff.md's vocabulary:
+//   motion           — bool, AM312 PIR state (latched while motion is held)
+//   distance_cm      — number 25..120, VL53L1X distance with smoothing
+//   breath_detected  — timestamp of the most recent breath puff (bumps
+//                      monotonically; visualizer compares to its clock)
+//   touch_mask       — 12-bit int, MPR121 channel touch state
+//
+// Patterns mimic realistic-ish kiosk behavior: occasional person walking
+// up (motion + distance ramping down), occasional breath event, drifting
+// touches.
 
 const timers = [];
 
 module.exports = ({ publish }) => {
-  let p1 = false, p2 = false;
-  timers.push(setInterval(() => { p1 = !p1; publish('tog.power', p1); }, 3700));
-  timers.push(setInterval(() => { p2 = !p2; publish('tog.invert', p2); }, 7100));
-
+  // Person-walks-up cycle: every ~25 s, simulate someone approaching,
+  // standing, then leaving.
+  let cycleT = 0;
+  const CYCLE_MS = 25000;
   timers.push(setInterval(() => {
-    publish('pir.motion', 1);
-    setTimeout(() => publish('pir.motion', 0), 600);
-  }, 5000));
+    cycleT = (cycleT + 100) % CYCLE_MS;
+    const t = cycleT / CYCLE_MS; // 0..1 across the cycle
+    if (t < 0.05) {
+      publish('motion', false);
+      publish('distance_cm', 200);
+    } else if (t < 0.35) {
+      // Approaching: distance ramps 200 → 30
+      publish('motion', true);
+      const d = 200 - (t - 0.05) / 0.30 * 170;
+      publish('distance_cm', +d.toFixed(1));
+    } else if (t < 0.65) {
+      // Standing close, slight breathing wobble
+      publish('motion', true);
+      publish('distance_cm', +(30 + 3 * Math.sin(cycleT / 600)).toFixed(1));
+    } else if (t < 0.85) {
+      // Leaving: 30 → 200
+      publish('motion', true);
+      const d = 30 + (t - 0.65) / 0.20 * 170;
+      publish('distance_cm', +d.toFixed(1));
+    } else {
+      publish('motion', false);
+      publish('distance_cm', 200);
+    }
+  }, 100));
 
-  const KEYS = ['1','2','3','A','4','5','6','B','7','8','9','C','*','0','#','D'];
+  // Breath events: fire near the middle of the standing-close phase
+  // (~12.5 s into each cycle). Slight jitter so not perfectly periodic.
   timers.push(setInterval(() => {
-    publish('key.last', KEYS[Math.floor(Math.random() * KEYS.length)]);
-  }, 4000));
+    if (Math.random() < 0.6) publish('breath_detected', Date.now());
+  }, 11000 + Math.random() * 4000));
 
-  const t0 = Date.now();
-  timers.push(setInterval(() => {
-    const t = (Date.now() - t0) / 1000;
-    publish('humidity', +(0.5 + 0.4 * Math.sin(t * 0.12)).toFixed(3));
-  }, 500));
-
+  // Cap touch: drifting bitmask, occasional multi-pad press
   let mask = 0;
   timers.push(setInterval(() => {
-    mask ^= 1 << Math.floor(Math.random() * 12);
-    publish('touch.mask', mask);
-  }, 1200));
+    if (Math.random() < 0.3) {
+      // press: set a random pad
+      mask |= 1 << Math.floor(Math.random() * 12);
+    } else {
+      // release: clear a random set bit
+      const setBits = [];
+      for (let i = 0; i < 12; i++) if (mask & (1 << i)) setBits.push(i);
+      if (setBits.length) mask &= ~(1 << setBits[Math.floor(Math.random() * setBits.length)]);
+    }
+    publish('touch_mask', mask);
+  }, 1500));
 };
 
 module.exports.stop = () => {

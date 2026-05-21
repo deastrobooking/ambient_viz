@@ -6,13 +6,15 @@ const { EventEmitter } = require('events');
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'static');
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const SOURCES = (process.env.AMBIENT_INPUTS || 'mock')
-  .split(',').map(s => s.trim()).filter(s => s && s !== 'none');
+const MOCK = process.env.MOCK === '1' || process.env.MOCK === 'true';
+const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
+const INGEST_MAX_BYTES = 65536;
 
 const inputBus = new EventEmitter();
 const inputState = Object.create(null);
 
 function publish(name, value) {
+  if (typeof name !== 'string' || !name) return;
   const prev = inputState[name];
   if (prev && prev.value === value) return;
   const entry = { name, value, ts: Date.now() };
@@ -20,13 +22,9 @@ function publish(name, value) {
   inputBus.emit('change', entry);
 }
 
-for (const src of SOURCES) {
-  try {
-    require(`./inputs/${src}`)({ publish });
-    console.log(`input source: ${src}`);
-  } catch (e) {
-    console.error(`failed to load input source '${src}': ${e.message}`);
-  }
+if (MOCK) {
+  require('./inputs/mock')({ publish });
+  console.log('mock source: enabled');
 }
 
 const sseClients = new Set();
@@ -55,6 +53,53 @@ function handleSSE(req, res) {
   req.on('close', () => {
     clearInterval(heartbeat);
     sseClients.delete(res);
+  });
+}
+
+// POST /ingest — accepts publications from the Python sensor sidecar.
+// Restricted to loopback connections; optionally requires INGEST_TOKEN.
+// Body: either a single {name, value} or an array of those.
+function isLoopback(req) {
+  const a = req.socket.remoteAddress || '';
+  return a === '127.0.0.1'
+      || a === '::1'
+      || a === '::ffff:127.0.0.1'
+      || a.startsWith('127.');
+}
+
+function handleIngest(req, res) {
+  if (!isLoopback(req)) {
+    res.writeHead(403); res.end('localhost only'); return;
+  }
+  if (INGEST_TOKEN && req.headers['x-ingest-token'] !== INGEST_TOKEN) {
+    res.writeHead(401); res.end('bad token'); return;
+  }
+  let total = 0;
+  const chunks = [];
+  req.on('data', (chunk) => {
+    total += chunk.length;
+    if (total > INGEST_MAX_BYTES) {
+      res.writeHead(413); res.end('payload too large');
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => {
+    if (res.writableEnded) return;
+    let parsed;
+    try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    catch { res.writeHead(400); res.end('bad json'); return; }
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    let accepted = 0;
+    for (const item of items) {
+      if (item && typeof item === 'object' && typeof item.name === 'string') {
+        publish(item.name, item.value);
+        accepted++;
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ accepted }));
   });
 }
 
@@ -124,7 +169,8 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/events') return handleSSE(req, res);
+  if (req.url === '/events' && req.method === 'GET') return handleSSE(req, res);
+  if (req.url === '/ingest' && req.method === 'POST') return handleIngest(req, res);
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405); res.end('method not allowed'); return;
   }
@@ -135,5 +181,5 @@ server.listen(PORT, HOST, () => {
   const hostShown = HOST === '0.0.0.0' ? 'localhost' : HOST;
   console.log(`ambient_viz server listening on http://${hostShown}:${PORT}`);
   console.log(`static root: ${STATIC_ROOT}`);
-  console.log(`inputs: ${SOURCES.length ? SOURCES.join(', ') : 'none'}`);
+  console.log(`ingest token: ${INGEST_TOKEN ? 'required' : 'disabled (localhost-only)'}`);
 });
