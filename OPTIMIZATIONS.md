@@ -1,6 +1,6 @@
 # Performance Optimizations
 
-Audit of `index.html` render loop, ordered by expected impact. Line numbers
+Audit of `static/index.html` render loop, ordered by expected impact. Line numbers
 reference the state at the time of writing; treat as approximate.
 
 Existing performance notes live in `README.md` ("Performance notes"). This
@@ -286,7 +286,7 @@ sliders, and visual editor could induce frame drops under load.
   same effective rate; if the main thread stalls, audio updates pause
   but the worker keeps drawing the last snapshot.
 - `Worker` source size: ~1100 lines of inlined render code embedded as
-  `textContent`. The HTML grew, but `index.html` is still self-contained.
+  `textContent`. The HTML grew, but `static/index.html` is still self-contained.
 
 ## Suggested order of attack
 

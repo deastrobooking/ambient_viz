@@ -10,7 +10,7 @@ WebGL work; everything else is software-rasterized 2D. The 8GB of RAM on
 the Pi 4 is irrelevant — this workload is not memory-bound.
 
 Items are grouped by approximate impact. Numbers in parens are the
-default values in `index.html`. Many of these are already exposed as
+default values in `static/index.html`. Many of these are already exposed as
 live sliders in the dev panel (press `~` to open) and can be tuned at
 runtime without code changes.
 
@@ -42,7 +42,7 @@ If the Pi is driving a 4K or retina-class screen, the default `dpr` cap
 is 2, which means a 3840×2160 bitmap = ~8M pixels. Pinning `dpr = 1`
 cuts that to 2M.
 
-`index.html:2282` and `index.html:2285`:
+`static/index.html:2282` and `static/index.html:2285`:
 ```js
 let dpr = Math.min(window.devicePixelRatio || 1, 2);
 ```
@@ -57,7 +57,7 @@ in CSS pixels. Stamp count scales **quadratically** — going from 24 to
 36 cuts ~4000 stamps/frame to ~1800 (2.25× fewer); going to 48 cuts to
 ~1000 (4× fewer).
 
-`index.html:629`:
+`static/index.html:629`:
 ```js
 let LATTICE_SPACING = 24;
 ```
@@ -76,7 +76,7 @@ are rendered each frame. Each mesh runs a JS software rasterizer
 (vertex transform + back-face cull + line/vertex draw) per frame. Two
 meshes is moderate; zero removes the layer entirely.
 
-`index.html:1289`:
+`static/index.html:1289`:
 ```js
 let MESH3D_COUNT = 2;
 ```
@@ -95,7 +95,7 @@ Visual cost: the rotating wireframe shapes go away. Lattice + flyouts
 each frame. Each one is a `Path2D` fill + halo stroke + crisp stroke.
 Halving to `5` halves the silhouette drawing cost.
 
-`index.html:528`:
+`static/index.html:528`:
 ```js
 const FLYOUT_COUNT = 10;
 ```
@@ -118,7 +118,7 @@ frame (~200K `Math.random()` calls). Smaller = cheaper.
   `regenNoise` (~line 1203) to early-return when alpha is below some
   threshold.
 
-`index.html:540` (`const`) and `index.html:619` (`let`, live param).
+`static/index.html:540` (`const`) and `static/index.html:619` (`let`, live param).
 
 ### Increase scanline period
 
@@ -127,7 +127,7 @@ implementation now uses a single tiled fillRect (optimization #5 in
 `OPTIMIZATIONS.md`) so this is cheap, but going to `3` or `4`
 incrementally reduces overdraw on the tile.
 
-`index.html:541` — currently `const`. Change requires rebuilding
+`static/index.html:541` — currently `const`. Change requires rebuilding
 `scanlineTile`/`scanlinePattern` (see `rebuildScanlineTile`).
 
 Visual cost: slightly less CRT-line density. Subtle.

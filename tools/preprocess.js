@@ -6,8 +6,9 @@
 // deltas as-is.
 
 const fs = require('fs');
-const SRC = 'irocz.svg';
-const OUT = 'silhouette.js';
+const path = require('path');
+const SRC = path.join(__dirname, '..', 'static', 'irocz.svg');
+const OUT = path.join(__dirname, 'silhouette.js');
 const FLATTEN_TOL = 1.0; // user-units (mm) — coarser = fewer points
 
 const svg = fs.readFileSync(SRC, 'utf8');

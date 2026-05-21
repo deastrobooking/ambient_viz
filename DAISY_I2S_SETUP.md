@@ -243,7 +243,7 @@ card. PipeWire persists this.
 ### 2. Launch the visualizer
 
 ```bash
-chromium-browser --kiosk file:///path/to/ambient_viz/index.html?lite
+chromium-browser --kiosk file:///path/to/ambient_viz/static/index.html?lite
 ```
 
 The `?lite` flag is the 720p + sparse-lattice mode (see

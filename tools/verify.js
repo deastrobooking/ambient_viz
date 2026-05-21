@@ -1,11 +1,10 @@
 // Quick verification: render the silhouette subpaths to a PPM so we can
 // confirm the SVG flattening produced the right shape.
 const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
 
-require('./silhouette.js'); // declares CAR_ASPECT, CAR_SUBPATHS — but they're consts inside, won't be globally visible
-// instead, eval the file:
-const src = fs.readFileSync('silhouette.js', 'utf8');
+const src = fs.readFileSync(path.join(__dirname, 'silhouette.js'), 'utf8');
 const ctx = {};
 new Function('exports', src.replace(/const (\w+)/g, 'exports.$1'))(ctx);
 const { CAR_ASPECT, CAR_SUBPATHS } = ctx;

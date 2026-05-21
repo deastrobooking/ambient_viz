@@ -4,20 +4,27 @@ Browser-based audio visualizer for ambient / industrial / IDM material.
 Black-and-white CRT/glitch aesthetic — reference points: NIN, Aphex Twin,
 Venetian Snares.
 
-## Files
+## Layout
 
-- `index.html` — single self-contained app (HTML + CSS + JS, no deps, no build).
-- `irocz.svg` — source artwork for the flying-shape silhouette (Inkscape output).
-- `preprocess.js` — Node script that flattens `irocz.svg` into a polyline
-  array and writes `silhouette.js`.
-- `silhouette.js` — generated; the embedded `CAR_SUBPATHS` block in
-  `index.html` is a copy of this file's data. Regenerate via `node preprocess.js`
-  then paste into `index.html`.
-- `verify.js` — renders `silhouette.js` to `/tmp/verify.png` for sanity checks.
+- `static/` — everything served to the browser.
+  - `index.html` — the app (HTML + CSS + JS, no build step).
+  - `tests.html` — runtime test harness.
+  - `irocz.svg` — source artwork for the flying-shape silhouette (Inkscape output).
+  - `irocz.png`, `transcending.png` — auxiliary artwork.
+  - `20251006_arrangement_1.mp3` + `.timeline.json` — bundled demo track.
+- `tools/` — Node build helpers, not served.
+  - `preprocess.js` — flattens `static/irocz.svg` into `tools/silhouette.js`.
+  - `silhouette.js` — generated; the embedded `CAR_SUBPATHS` block in
+    `static/index.html` is a copy of this file's data. Regenerate via
+    `node tools/preprocess.js`, then paste into `static/index.html`.
+  - `verify.js` — renders `silhouette.js` to `/tmp/verify.png` for sanity checks.
+- `server/` — Node SSE server (Pi GPIO → browser); see `server/README.md`.
 
-To run: open `index.html` directly in a browser. No server needed. File
-loading is via the file input or drag-drop. Mic input is supported but
-doesn't play audio out (avoids feedback).
+To run: open `static/index.html` directly in a browser (no server needed for
+the visualizer itself), or run the Node server and visit `http://localhost:8080/`
+to also get GPIO input over SSE. File loading is via the file input or
+drag-drop. Mic input is supported but doesn't play audio out (avoids
+feedback).
 
 ## High-level architecture
 
@@ -202,7 +209,7 @@ This pass is the heaviest in the frame (~10–20ms on a 1600×900 viewport).
 First optimization to try if frame rate sags: dither at half CSS resolution
 (`Math.ceil(W/2)`, `Math.ceil(H/2)` in `resizeDither`).
 
-## Silhouette pipeline (`preprocess.js`)
+## Silhouette pipeline (`tools/preprocess.js`)
 
 1. Read `irocz.svg`, extract first `<path d>` and any parent
    `<g transform="translate(...)">`.
@@ -222,11 +229,11 @@ First optimization to try if frame rate sags: dither at half CSS resolution
 The data is **inlined** into `index.html` (not loaded at runtime) so the
 HTML is fully self-contained.
 
-To regenerate after changing the SVG: `node preprocess.js`, then copy
-`silhouette.js`'s `CAR_ASPECT` and `CAR_SUBPATHS` into the corresponding
-block in `index.html`.
+To regenerate after changing the SVG: `node tools/preprocess.js`, then copy
+`tools/silhouette.js`'s `CAR_ASPECT` and `CAR_SUBPATHS` into the
+corresponding block in `static/index.html`.
 
-To verify the parsed silhouette visually: `node verify.js`, then open
+To verify the parsed silhouette visually: `node tools/verify.js`, then open
 `/tmp/verify.png`.
 
 ## UI
