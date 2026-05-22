@@ -2739,7 +2739,18 @@ function flyoutAppend(name, x, y, drawScale, rot, fillAlpha, edgeAlpha) {
 function applyFlyouts() {
   if (!_lattUseGL) return false;
   const gl = lattGL;
-  let drew = false;
+
+  // Pre-flight: ensure at least one drawable group. Without this guard,
+  // enabling _flyAInst0/_flyAInst1 unconditionally and then skipping the
+  // vertexAttribPointer (because every entry has count=0) leaves the
+  // attributes enabled with no recorded buffer — INVALID_OPERATION on
+  // any later draw across all programs.
+  let totalCount = 0;
+  _flyInstPerSilh.forEach((g, name) => {
+    if (g.count > 0 && _silhTex[name]) totalCount += g.count;
+    else if (g.count > 0) g.count = 0;  // unknown silhouette: drop
+  });
+  if (totalCount === 0) return false;
 
   gl.useProgram(_flyProg);
   gl.uniform2f(_flyURes, W, H);
@@ -2783,14 +2794,13 @@ function applyFlyouts() {
     gl.uniform1f(_flyUAlphaIdx, 1.0);
     _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, g.count);
 
-    drew = true;
     g.count = 0;
   });
 
   // Reset divisors so subsequent programs (lattice) don't inherit.
   _lattInstExt.vertexAttribDivisorANGLE(_flyAInst0, 0);
   _lattInstExt.vertexAttribDivisorANGLE(_flyAInst1, 0);
-  return drew;
+  return true;
 }
 
 // Per-frame fade darken. Equivalent to the legacy
@@ -2970,7 +2980,7 @@ function snapshotContentToScratch() {
 // strip from scratch to the destination strip with additive blend. Each
 // slice's `mono`/regular flag pushes a region for the post-dither mono/
 // inversion overlay (unchanged from the Canvas2D path).
-function applySlicesGL(W_, H_, dpr_) {
+function applySlicesGL(W_, H_, dt_) {
   if (!_lattUseGL || slices.length <= 0) return;
   const gl = lattGL;
   // Capture current FBO content as scratch source.
@@ -2990,7 +3000,7 @@ function applySlicesGL(W_, H_, dpr_) {
   // Walk slices in reverse: aging + splice on death (mirrors original).
   for (let i = slices.length - 1; i >= 0; i--) {
     const s = slices[i];
-    s.life -= dt;
+    s.life -= dt_;
     if (s.life <= 0) { slices.splice(i, 1); continue; }
     const sy = Math.max(0, Math.min(H_ - 1, s.y));
     const sh = Math.max(1, Math.min(H_ - sy, s.h * viewportScale));
@@ -3547,7 +3557,7 @@ function frame(now) {
     // twisted scene. Acceptable.
     _pmark('slc');
     if (_lattUseGL) {
-      applySlicesGL(W, H, dpr);
+      applySlicesGL(W, H, dt);
     } else if (slices.length) {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
