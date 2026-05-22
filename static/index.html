@@ -1466,26 +1466,35 @@ let noiseRing = [];      // OffscreenCanvas[NOISE_RING]
 let noiseRingIdx = 0;
 let scanlineTile, scanlinePattern;
 let ditherCanvas, ditherGL;
-// Two-pass GL pipeline inside one context: pass 1 warps the source canvas
-// (twist+pinch) into an intermediate FBO-attached texture; pass 2 samples
-// that texture at display-space UV and applies the bayer threshold. This
-// keeps the single-texImage2D bandwidth win (we only upload the main
-// canvas once per frame) while preserving the original aesthetic where
-// scanlines/grain stay in display space (i.e. don't warp with twist).
+// Unified GL pipeline (Phase 3 of the WebGL refactor — see PI_PERFORMANCE.md).
+// Content (fade, flyouts, meshes, sparks, lattice, slices, freeze) renders
+// into `_contentFbo` (FBO color-attached to `_contentTex`). The twist pass
+// samples _contentTex directly into _ditherIntermediateTex; the dither pass
+// samples that into the default framebuffer (= ditherCanvas). Final
+// `ctx.drawImage(ditherCanvas, ...)` composites onto the main Canvas2D for
+// post-dither tint/invert/strobe. No `texImage2D(canvas)` upload per frame.
+//
+// On GL init failure (no WebGL, missing ANGLE_instanced_arrays, etc.) we
+// fall back to the legacy Canvas2D path and `_lattUseGL = false`; in that
+// mode applyDither still uploads the main canvas via texImage2D.
 let _ditherProg, _ditherQuad, _ditherSrcTex, _ditherBayerTex;
 let _ditherUTex, _ditherUBayer, _ditherUSize, _ditherUOffset, _ditherAPos;
 let _ditherUGrain, _ditherUGrainAlpha, _ditherUScanlineAlpha, _ditherUScanlinePeriod;
 let _ditherTwistProg, _ditherTwistUTex, _ditherTwistURes;
 let _ditherTwistUTwist, _ditherTwistUPinch, _ditherTwistAPos;
 let _ditherFbo, _ditherIntermediateTex, _ditherGrainTex;
-// Lattice GL pipeline (Phase 1 of the WebGL refactor — see PI_PERFORMANCE.md).
-// Replaces the ~700 per-frame `ctx.drawImage(particleCanvas, x, y)` stamps
-// with a single instanced draw call into an OffscreenCanvas-backed GL canvas,
-// then a single `ctx.drawImage(lattCanvas, ...)` composites the result onto
-// the main Canvas2D. _lattUseGL gates the GL path; on init failure (no
-// WebGL, missing ANGLE_instanced_arrays, etc.) we fall back to the
-// original 700-stamp Canvas2D loop and set _lattUseGL = false.
-let lattCanvas, lattGL, _lattInstExt;
+// Content FBO + its color attachment. Same dimensions as ditherCanvas.
+let _contentFbo, _contentTex;
+// Scratch texture used by slices / block shuffle (snapshot of _contentTex
+// before per-strip blits, so we can sample from a stable source while
+// writing to _contentFbo). Allocated lazily on first use.
+let _contentScratchTex;
+// Freeze texture: a snapshot of _contentTex captured on pendingFreeze and
+// replayed by restoreFreeze. Same dims as _contentTex; allocated lazily.
+let _freezeTex;
+// `lattGL` is kept as an alias for `ditherGL` (Phase 3 unified contexts).
+// The historical name is retained because hundreds of references use it.
+let lattGL, _lattInstExt;
 let _lattProg, _lattQuad, _lattInstBuf, _lattSpriteTex;
 let _lattACorner, _lattAInstPos, _lattURes, _lattUTileSize, _lattUSprite;
 let _lattInstData = null;
@@ -1520,6 +1529,34 @@ let _flyInstBuf;
 // Stride: 6 floats per instance (x, y, drawScale, rot, fillAlpha, edgeAlpha).
 const FLY_STRIDE = 6;
 const _flyInstPerSilh = new Map();
+// Fade pass: fullscreen black quad with source-over blend modulated by an
+// alpha uniform. Replaces the legacy `ctx.fillRect` darken.
+let _fadeProg, _fadeAPos, _fadeUAlpha;
+// Mesh wireframe (3D mesh layer). Edges render as instanced quads expanded
+// from line segments (width baked into per-instance halfWidth). Vertex
+// circles render as instanced quads with a smoothstep hard-circle shader.
+// Both layers append to per-frame Float32Arrays during the mesh loop and
+// dispatch one instanced draw each at the end.
+let _meshEdgeProg, _meshEdgeACorner, _meshEdgeAInst0, _meshEdgeAInst1, _meshEdgeURes;
+let _meshEdgeCornerBuf, _meshEdgeInstBuf;
+let _meshEdgeData = null;
+let _meshEdgeCap = 0;  // capacity in *edges* (stride = 8 floats)
+let _meshEdgeCount = 0;  // edges accumulated this frame; reset in applyMeshEdges
+const MESH_EDGE_STRIDE = 8;
+let _meshVertProg, _meshVertACorner, _meshVertAInst, _meshVertURes;
+let _meshVertInstBuf;
+let _meshVertData = null;
+let _meshVertCap = 0;  // capacity in *vertices* (stride = 4 floats)
+let _meshVertCount = 0;
+const MESH_VERT_STRIDE = 4;
+// Blit program: rectangular sample-and-blit from a source texture to the
+// content FBO. Used for slice tears (additive blend, optional rotation)
+// and block shuffle (source-over blend, no rotation). Source UV is
+// computed in CSS pixel space and inverted on Y to match _contentTex's
+// GL-native orientation (row 0 = screen bottom).
+let _blitProg, _blitAPos, _blitUDest, _blitUSrc, _blitURes;
+let _blitUCenter, _blitUAngle, _blitUTex;
+let _blitQuadBuf;
 let freezeCanvas, freezeCtx;
 
 // Probability that a freshly-spawned flyout uses some silhouette other
@@ -1951,12 +1988,20 @@ function applyDither(offX, offY, twist, pinch, grainTile, grainAlpha, scanlineAl
   const gl = ditherGL;
   gl.disable(gl.BLEND);
 
-  // ----- Pass 0a: upload the main canvas (scene + lattice + slices,
-  //               WITHOUT scanlines/grain — those moved into the shader).
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  // ----- Pass 0a: source texture for the twist pass.
+  // GL content path (Phase 3): _contentTex is already populated by the
+  // content FBO draws — sample it directly. Zero per-frame upload cost.
+  // Canvas2D fallback: upload the main canvas via texImage2D as before.
+  let srcTex;
+  if (_lattUseGL) {
+    srcTex = _contentTex;
+  } else {
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+    srcTex = _ditherSrcTex;
+  }
 
   // ----- Pass 0b: upload the current noise-ring tile (~12 KB; small).
   if (grainTile) {
@@ -1973,7 +2018,7 @@ function applyDither(offX, offY, twist, pinch, grainTile, grainAlpha, scanlineAl
   gl.enableVertexAttribArray(_ditherTwistAPos);
   gl.vertexAttribPointer(_ditherTwistAPos, 2, gl.FLOAT, false, 0, 0);
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
   gl.uniform1i(_ditherTwistUTex, 0);
   gl.uniform2f(_ditherTwistURes, dw, dh);
   gl.uniform1f(_ditherTwistUTwist, twist || 0);
@@ -2066,37 +2111,30 @@ function resizeDither() {
   }
 }
 
-// === lattice GL pipeline ===
-// Instanced sprite renderer for the hex-lattice stamp loop. The particle
-// shape itself is still drawn each frame on the existing `particleCanvas`
-// (it morphs between SHAPES[shapeIndex] and the next shape, pulses with
-// bassPulse, etc.), and is uploaded to the GL sprite texture per frame.
-// Instance positions come from `pushFilledRectPoints` like before — we
-// just push them into a Float32Array and run one instanced draw call
-// instead of ~700 individual ctx.drawImage stamps.
+// === content GL pipeline (lattice + sparks + flyouts + fade + meshes +
+// slices + freeze) ===
+// All content layers render into _contentFbo's color attachment
+// (_contentTex). The dither pass then samples _contentTex directly,
+// eliminating the per-frame texImage2D(canvas) upload. Setup here defines
+// the instanced sprite renderer (lattice), spark/flyout programs, and the
+// content FBO itself. Other passes (fade quad, mesh lines, slice strips,
+// freeze copy) are set up alongside in dedicated helpers.
 //
-// Blend mode: additive (gl.ONE, gl.ONE). The Canvas2D lattice block runs
-// with globalCompositeOperation = 'lighter' (set up at the start of the
-// non-freeze branch and never reset before the lattice block), so the
-// final ctx.drawImage(lattCanvas, ...) under 'lighter' composites the
-// additively-accumulated GL output additively over the existing canvas
-// content — visually equivalent to the original additive stamps.
+// Blend mode: additive (ONE, ONE) by default — matches the original
+// 'lighter' GCO that the legacy Canvas2D path used through the flyout /
+// mesh / spark / lattice sections. The fade pass briefly switches to
+// (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) for its source-over darken, then
+// restores additive.
 function setupLattice() {
   if (noGL) {
     _lattUseGL = false;
     return;
   }
   try {
-    lattCanvas = new OffscreenCanvas(Math.max(1, canvas.width), Math.max(1, canvas.height));
-    lattGL = lattCanvas.getContext('webgl', {
-      premultipliedAlpha: true,
-      preserveDrawingBuffer: false,
-      antialias: false,
-      alpha: true,
-      depth: false,
-      stencil: false,
-    });
-    if (!lattGL) throw new Error('lattice WebGL context unavailable');
+    if (!ditherGL) throw new Error('ditherGL not initialized; setupDither must run before setupLattice');
+    // Unified context: lattice / sparks / flyouts now share ditherGL. The
+    // legacy `lattGL` name aliases the same context for diff brevity.
+    lattGL = ditherGL;
     _lattInstExt = lattGL.getExtension('ANGLE_instanced_arrays');
     if (!_lattInstExt) throw new Error('ANGLE_instanced_arrays not supported');
 
@@ -2255,6 +2293,174 @@ function setupLattice() {
     _flyUAlphaIdx = lattGL.getUniformLocation(_flyProg, 'uAlphaIdx');
     _flyInstBuf   = lattGL.createBuffer();
 
+    // ----- Fade program. Fullscreen black quad whose alpha is set per-
+    // frame to match the original `rgba(0,0,0,fade)` fillRect. The blend
+    // func is switched to source-over (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+    // for this pass and restored to additive after.
+    const FADE_VS_SRC =
+      'attribute vec2 aPos;' +
+      'void main() { gl_Position = vec4(aPos, 0.0, 1.0); }';
+    const FADE_FS_SRC =
+      'precision mediump float;' +
+      'uniform float uAlpha;' +
+      // Premultiplied black: RGB=0, A=uAlpha. With (SRC_ALPHA,
+      // ONE_MINUS_SRC_ALPHA), dst = 0*alpha + dst*(1-alpha).
+      'void main() { gl_FragColor = vec4(0.0, 0.0, 0.0, uAlpha); }';
+    _fadeProg = lattGL.createProgram();
+    lattGL.attachShader(_fadeProg, compile(lattGL.VERTEX_SHADER, FADE_VS_SRC));
+    lattGL.attachShader(_fadeProg, compile(lattGL.FRAGMENT_SHADER, FADE_FS_SRC));
+    lattGL.linkProgram(_fadeProg);
+    if (!lattGL.getProgramParameter(_fadeProg, lattGL.LINK_STATUS)) {
+      throw new Error('fade program link: ' + lattGL.getProgramInfoLog(_fadeProg));
+    }
+    _fadeAPos   = lattGL.getAttribLocation(_fadeProg, 'aPos');
+    _fadeUAlpha = lattGL.getUniformLocation(_fadeProg, 'uAlpha');
+
+    // ----- Mesh edge program. Each edge is a quad expanded from a line
+    // segment: per-vertex corner aCorner = (along, side) with along∈{0,1},
+    // side∈{-1,1}; per-instance attrs are the segment endpoints and
+    // (halfWidth, alpha). The vertex shader places the four corners along
+    // the segment with `halfWidth` perpendicular offset.
+    const MESH_EDGE_VS_SRC =
+      'attribute vec2 aCorner;' +
+      'attribute vec4 aInst0;' +    // x0, y0, x1, y1
+      'attribute vec2 aInst1;' +    // halfWidth (px), alpha
+      'uniform vec2 uResolution;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  vec2 p0 = aInst0.xy;' +
+      '  vec2 p1 = aInst0.zw;' +
+      '  vec2 dlt = p1 - p0;' +
+      '  float len = length(dlt);' +
+      '  vec2 dir = len > 0.0001 ? dlt / len : vec2(1.0, 0.0);' +
+      '  vec2 perp = vec2(-dir.y, dir.x);' +
+      '  vec2 mid = mix(p0, p1, aCorner.x) + perp * (aCorner.y * aInst1.x);' +
+      '  vec2 ndc = (mid / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vAlpha = aInst1.y;' +
+      '}';
+    const MESH_EDGE_FS_SRC =
+      'precision mediump float;' +
+      'varying float vAlpha;' +
+      // Premultiplied white * vAlpha. Additive blend integrates correctly.
+      'void main() { gl_FragColor = vec4(vAlpha, vAlpha, vAlpha, vAlpha); }';
+    _meshEdgeProg = lattGL.createProgram();
+    lattGL.attachShader(_meshEdgeProg, compile(lattGL.VERTEX_SHADER, MESH_EDGE_VS_SRC));
+    lattGL.attachShader(_meshEdgeProg, compile(lattGL.FRAGMENT_SHADER, MESH_EDGE_FS_SRC));
+    lattGL.linkProgram(_meshEdgeProg);
+    if (!lattGL.getProgramParameter(_meshEdgeProg, lattGL.LINK_STATUS)) {
+      throw new Error('mesh edge program link: ' + lattGL.getProgramInfoLog(_meshEdgeProg));
+    }
+    _meshEdgeACorner = lattGL.getAttribLocation(_meshEdgeProg, 'aCorner');
+    _meshEdgeAInst0  = lattGL.getAttribLocation(_meshEdgeProg, 'aInst0');
+    _meshEdgeAInst1  = lattGL.getAttribLocation(_meshEdgeProg, 'aInst1');
+    _meshEdgeURes    = lattGL.getUniformLocation(_meshEdgeProg, 'uResolution');
+
+    // Triangle-strip corners for line expansion: (along, side) ordered so
+    // adjacent triangles share an edge.
+    _meshEdgeCornerBuf = lattGL.createBuffer();
+    lattGL.bindBuffer(lattGL.ARRAY_BUFFER, _meshEdgeCornerBuf);
+    lattGL.bufferData(lattGL.ARRAY_BUFFER, new Float32Array([
+      0.0, -1.0,
+      1.0, -1.0,
+      0.0,  1.0,
+      1.0,  1.0,
+    ]), lattGL.STATIC_DRAW);
+    _meshEdgeInstBuf = lattGL.createBuffer();
+
+    // ----- Mesh vertex program. Hard-edge anti-aliased circle for each
+    // mesh vertex. Per-instance attrs: (x, y, radius, alpha). Shared unit
+    // quad VBO with the lattice/sparks/flyouts.
+    const MESH_VERT_VS_SRC =
+      'attribute vec2 aCorner;' +
+      'attribute vec4 aInst;' +     // x, y, radius, alpha
+      'uniform vec2 uResolution;' +
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  float r = aInst.z;' +
+      '  vec2 px = aInst.xy + aCorner * (r * 2.0);' +
+      '  vec2 ndc = (px / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vUv = aCorner + 0.5;' +
+      '  vAlpha = aInst.w;' +
+      '}';
+    const MESH_VERT_FS_SRC =
+      'precision mediump float;' +
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  float dist = length(vUv - 0.5) * 2.0;' +
+      // Hard circle with a 1-pixel antialias band at the edge. The
+      // smoothstep maps dist∈[0.92, 1.0] to alpha∈[1, 0].
+      '  float a = vAlpha * (1.0 - smoothstep(0.92, 1.0, dist));' +
+      '  gl_FragColor = vec4(a, a, a, a);' +
+      '}';
+    _meshVertProg = lattGL.createProgram();
+    lattGL.attachShader(_meshVertProg, compile(lattGL.VERTEX_SHADER, MESH_VERT_VS_SRC));
+    lattGL.attachShader(_meshVertProg, compile(lattGL.FRAGMENT_SHADER, MESH_VERT_FS_SRC));
+    lattGL.linkProgram(_meshVertProg);
+    if (!lattGL.getProgramParameter(_meshVertProg, lattGL.LINK_STATUS)) {
+      throw new Error('mesh vert program link: ' + lattGL.getProgramInfoLog(_meshVertProg));
+    }
+    _meshVertACorner = lattGL.getAttribLocation(_meshVertProg, 'aCorner');
+    _meshVertAInst   = lattGL.getAttribLocation(_meshVertProg, 'aInst');
+    _meshVertURes    = lattGL.getUniformLocation(_meshVertProg, 'uResolution');
+    _meshVertInstBuf = lattGL.createBuffer();
+
+    // ----- Blit program. Maps a unit quad to a destination rect (CSS px,
+    // optionally rotated around uCenter) and samples a source rect from
+    // uTex. Source UV is computed in CSS px then Y-flipped because
+    // _contentTex (and the legacy upload-FLIP_Y path the twist shader was
+    // written against) places screen-bottom at v=0.
+    const BLIT_VS_SRC =
+      'attribute vec2 aPos;' +     // unit quad [-0.5, 0.5]
+      'uniform vec4 uDest;' +      // (x, y, w, h) in CSS px
+      'uniform vec4 uSrc;' +       // (x, y, w, h) in CSS px
+      'uniform vec2 uResolution;' +
+      'uniform vec2 uCenter;' +    // rotation pivot in CSS px
+      'uniform float uAngle;' +    // radians; 0 = no rotation
+      'varying vec2 vUv;' +
+      'void main() {' +
+      '  vec2 dst = uDest.xy + (aPos + 0.5) * uDest.zw;' +
+      '  if (uAngle != 0.0) {' +
+      '    vec2 d = dst - uCenter;' +
+      '    float c = cos(uAngle), s = sin(uAngle);' +
+      '    dst = uCenter + vec2(c * d.x - s * d.y, s * d.x + c * d.y);' +
+      '  }' +
+      '  vec2 ndc = (dst / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vec2 srcPx = uSrc.xy + (aPos + 0.5) * uSrc.zw;' +
+      '  vUv = vec2(srcPx.x / uResolution.x, 1.0 - srcPx.y / uResolution.y);' +
+      '}';
+    const BLIT_FS_SRC =
+      'precision mediump float;' +
+      'varying vec2 vUv;' +
+      'uniform sampler2D uTex;' +
+      'void main() { gl_FragColor = texture2D(uTex, vUv); }';
+    _blitProg = lattGL.createProgram();
+    lattGL.attachShader(_blitProg, compile(lattGL.VERTEX_SHADER, BLIT_VS_SRC));
+    lattGL.attachShader(_blitProg, compile(lattGL.FRAGMENT_SHADER, BLIT_FS_SRC));
+    lattGL.linkProgram(_blitProg);
+    if (!lattGL.getProgramParameter(_blitProg, lattGL.LINK_STATUS)) {
+      throw new Error('blit program link: ' + lattGL.getProgramInfoLog(_blitProg));
+    }
+    _blitAPos    = lattGL.getAttribLocation(_blitProg, 'aPos');
+    _blitUDest   = lattGL.getUniformLocation(_blitProg, 'uDest');
+    _blitUSrc    = lattGL.getUniformLocation(_blitProg, 'uSrc');
+    _blitURes    = lattGL.getUniformLocation(_blitProg, 'uResolution');
+    _blitUCenter = lattGL.getUniformLocation(_blitProg, 'uCenter');
+    _blitUAngle  = lattGL.getUniformLocation(_blitProg, 'uAngle');
+    _blitUTex    = lattGL.getUniformLocation(_blitProg, 'uTex');
+    _blitQuadBuf = lattGL.createBuffer();
+    lattGL.bindBuffer(lattGL.ARRAY_BUFFER, _blitQuadBuf);
+    lattGL.bufferData(lattGL.ARRAY_BUFFER, new Float32Array([
+      -0.5, -0.5,
+       0.5, -0.5,
+      -0.5,  0.5,
+       0.5,  0.5,
+    ]), lattGL.STATIC_DRAW);
+
     // Bake fill + edge sprites per silhouette and upload as GL textures.
     // Done once at init using Canvas2D's evenodd fill (preserves holes in
     // umbrella/eye/skyline/speaker). The path coordinate range is roughly
@@ -2263,19 +2469,65 @@ function setupLattice() {
     // drawScale of N gives an N-CSS-pixel silhouette in screen space.
     bakeSilhouetteSprites();
 
+    // ----- Content FBO. All per-frame content rendering writes into
+    // _contentTex via this FBO; the dither's twist pass then samples
+    // _contentTex directly. Allocated at ditherCanvas dimensions and
+    // reallocated on resize (see resizeContent below).
+    _contentTex = lattGL.createTexture();
+    lattGL.bindTexture(lattGL.TEXTURE_2D, _contentTex);
+    lattGL.texImage2D(
+      lattGL.TEXTURE_2D, 0, lattGL.RGBA,
+      ditherCanvas.width, ditherCanvas.height, 0,
+      lattGL.RGBA, lattGL.UNSIGNED_BYTE, null
+    );
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_MIN_FILTER, lattGL.LINEAR);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_MAG_FILTER, lattGL.LINEAR);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_S, lattGL.CLAMP_TO_EDGE);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_T, lattGL.CLAMP_TO_EDGE);
+
+    _contentFbo = lattGL.createFramebuffer();
+    lattGL.bindFramebuffer(lattGL.FRAMEBUFFER, _contentFbo);
+    lattGL.framebufferTexture2D(
+      lattGL.FRAMEBUFFER, lattGL.COLOR_ATTACHMENT0,
+      lattGL.TEXTURE_2D, _contentTex, 0
+    );
+    const cFbStatus = lattGL.checkFramebufferStatus(lattGL.FRAMEBUFFER);
+    if (cFbStatus !== lattGL.FRAMEBUFFER_COMPLETE) {
+      throw new Error('content FBO incomplete: 0x' + cFbStatus.toString(16));
+    }
+    lattGL.bindFramebuffer(lattGL.FRAMEBUFFER, null);
+
     _lattUseGL = true;
   } catch (e) {
-    try { console.warn('[ambient_viz] lattice GL setup failed, using Canvas2D fallback:', e && (e.message || e)); } catch (_) {}
+    try { console.warn('[ambient_viz] content GL setup failed, using Canvas2D fallback:', e && (e.message || e)); } catch (_) {}
     _lattUseGL = false;
-    lattGL = null;
+    // Don't null lattGL — it aliases ditherGL, which the dither pass still
+    // needs. _lattUseGL=false is the only gate for the GL content path.
     _lattInstExt = null;
   }
 }
 
-function resizeLattice() {
-  if (!lattCanvas) return;
-  lattCanvas.width = Math.max(1, canvas.width);
-  lattCanvas.height = Math.max(1, canvas.height);
+// Resize the content FBO's color attachment to match ditherCanvas. Called
+// from the shared resize handler when the viewport changes. The FBO retains
+// the same texture handle (framebufferTexture2D is bound by handle, not
+// data), so no rebind is needed after the reallocation.
+function resizeContent() {
+  if (!_lattUseGL || !_contentTex) return;
+  lattGL.bindTexture(lattGL.TEXTURE_2D, _contentTex);
+  lattGL.texImage2D(
+    lattGL.TEXTURE_2D, 0, lattGL.RGBA,
+    ditherCanvas.width, ditherCanvas.height, 0,
+    lattGL.RGBA, lattGL.UNSIGNED_BYTE, null
+  );
+  // Scratch and freeze textures get reallocated lazily; just invalidate.
+  if (_contentScratchTex) {
+    lattGL.deleteTexture(_contentScratchTex);
+    _contentScratchTex = null;
+  }
+  if (_freezeTex) {
+    lattGL.deleteTexture(_freezeTex);
+    _freezeTex = null;
+  }
 }
 
 // Per frame: upload current particleCanvas as the sprite, push positions
@@ -2284,19 +2536,26 @@ function resizeLattice() {
 // shader maps to NDC using uResolution=(W,H). instanceCount is the number
 // of points (instancePos.length / 2). Returns true if the GL draw ran,
 // false if we fell back (caller should then run the Canvas2D path).
-// Clear the shared content GL canvas and set the additive blend mode
-// used by all content programs (lattice, sparks, flyouts). Called once
-// per frame before any content GL drawing. Sparks/lattice/flyouts then
-// accumulate into the same canvas; a single drawImage composites it
-// onto the main Canvas2D at the end of the content section.
+// Bind the content FBO and reset blend state for additive content draws.
+// Called at the top of the content section (or before glRestoreFreeze in
+// the frozen branch) so all subsequent draws — fade, flyouts, meshes,
+// sparks, lattice, slices — accumulate into _contentTex. No clear: the
+// fade pass (glFade) is the per-frame "soft clear" that preserves the
+// previous frame's trail (matches the original Canvas2D fade-fillRect).
 function clearContentGL() {
   if (!_lattUseGL) return;
   const gl = lattGL;
-  gl.viewport(0, 0, lattCanvas.width, lattCanvas.height);
-  gl.clearColor(0, 0, 0, 0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, _contentFbo);
+  gl.viewport(0, 0, ditherCanvas.width, ditherCanvas.height);
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.ONE, gl.ONE);  // additive (matches Canvas2D 'lighter')
+}
+
+// Unbind the content FBO so the dither pass can write to the default
+// framebuffer (= ditherCanvas). Called at the end of the content section.
+function unbindContentGL() {
+  if (!_lattUseGL) return;
+  lattGL.bindFramebuffer(lattGL.FRAMEBUFFER, null);
 }
 
 function applyLattice(instancePos, instanceCount) {
@@ -2534,6 +2793,282 @@ function applyFlyouts() {
   return drew;
 }
 
+// Per-frame fade darken. Equivalent to the legacy
+// `ctx.fillRect(0,0,W,H) with rgba(0,0,0,alpha)` source-over on main.
+// Briefly switches the blend to source-over, then restores additive so
+// subsequent content layers behave correctly.
+function glFade(alpha) {
+  if (!_lattUseGL || alpha <= 0) return;
+  const gl = lattGL;
+  gl.useProgram(_fadeProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _ditherQuad);  // fullscreen [-1,1] quad
+  gl.enableVertexAttribArray(_fadeAPos);
+  gl.vertexAttribPointer(_fadeAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform1f(_fadeUAlpha, alpha);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.blendFunc(gl.ONE, gl.ONE);  // restore additive for subsequent layers
+}
+
+// Append a mesh edge instance into the per-frame edge buffer.
+function meshEdgeAppend(x0, y0, x1, y1, halfWidth, alpha) {
+  if (_meshEdgeData === null || _meshEdgeCap < 32) {
+    _meshEdgeCap = 32;
+    _meshEdgeData = new Float32Array(MESH_EDGE_STRIDE * _meshEdgeCap);
+  }
+  // Caller passes an `index` via the global `_meshEdgeCount`; grow if needed.
+  if (_meshEdgeCount >= _meshEdgeCap) {
+    const newCap = _meshEdgeCap * 2;
+    const nd = new Float32Array(MESH_EDGE_STRIDE * newCap);
+    nd.set(_meshEdgeData);
+    _meshEdgeData = nd;
+    _meshEdgeCap = newCap;
+  }
+  const off = _meshEdgeCount * MESH_EDGE_STRIDE;
+  _meshEdgeData[off]     = x0;
+  _meshEdgeData[off + 1] = y0;
+  _meshEdgeData[off + 2] = x1;
+  _meshEdgeData[off + 3] = y1;
+  _meshEdgeData[off + 4] = halfWidth;
+  _meshEdgeData[off + 5] = alpha;
+  // off+6, off+7 unused (stride padding for vec4+vec2 layout alignment).
+  _meshEdgeCount++;
+}
+
+function meshVertAppend(x, y, radius, alpha) {
+  if (_meshVertData === null || _meshVertCap < 32) {
+    _meshVertCap = 32;
+    _meshVertData = new Float32Array(MESH_VERT_STRIDE * _meshVertCap);
+  }
+  if (_meshVertCount >= _meshVertCap) {
+    const newCap = _meshVertCap * 2;
+    const nd = new Float32Array(MESH_VERT_STRIDE * newCap);
+    nd.set(_meshVertData);
+    _meshVertData = nd;
+    _meshVertCap = newCap;
+  }
+  const off = _meshVertCount * MESH_VERT_STRIDE;
+  _meshVertData[off]     = x;
+  _meshVertData[off + 1] = y;
+  _meshVertData[off + 2] = radius;
+  _meshVertData[off + 3] = alpha;
+  _meshVertCount++;
+}
+
+// Render the accumulated mesh edges as one instanced quad-strip draw.
+function applyMeshEdges() {
+  if (!_lattUseGL || _meshEdgeCount <= 0) return false;
+  const gl = lattGL;
+  gl.useProgram(_meshEdgeProg);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, _meshEdgeCornerBuf);
+  gl.enableVertexAttribArray(_meshEdgeACorner);
+  gl.vertexAttribPointer(_meshEdgeACorner, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshEdgeACorner, 0);
+
+  const view = new Float32Array(_meshEdgeData.buffer, 0, _meshEdgeCount * MESH_EDGE_STRIDE);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _meshEdgeInstBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, view, gl.DYNAMIC_DRAW);
+  const stride = MESH_EDGE_STRIDE * 4;  // 8 floats × 4 bytes
+  gl.enableVertexAttribArray(_meshEdgeAInst0);
+  gl.vertexAttribPointer(_meshEdgeAInst0, 4, gl.FLOAT, false, stride, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshEdgeAInst0, 1);
+  gl.enableVertexAttribArray(_meshEdgeAInst1);
+  gl.vertexAttribPointer(_meshEdgeAInst1, 2, gl.FLOAT, false, stride, 16);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshEdgeAInst1, 1);
+
+  gl.uniform2f(_meshEdgeURes, W, H);
+  _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, _meshEdgeCount);
+
+  _lattInstExt.vertexAttribDivisorANGLE(_meshEdgeAInst0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshEdgeAInst1, 0);
+  _meshEdgeCount = 0;
+  return true;
+}
+
+// Lazily allocate _freezeTex sized to the content FBO. Used by glCaptureFreeze
+// (copy _contentTex → _freezeTex) and glRestoreFreeze (blit _freezeTex →
+// _contentFbo).
+function ensureFreezeTex() {
+  const gl = lattGL;
+  if (_freezeTex) return;
+  const w = ditherCanvas.width;
+  const h = ditherCanvas.height;
+  _freezeTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, _freezeTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+// Capture current _contentFbo into _freezeTex and set freezeFrames. The
+// Canvas2D `captureFreeze` is the fallback path; this is the GL equivalent.
+function glCaptureFreeze() {
+  const gl = lattGL;
+  ensureFreezeTex();
+  gl.bindTexture(gl.TEXTURE_2D, _freezeTex);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, ditherCanvas.width, ditherCanvas.height);
+  // Reuse the legacy freezeFrames cadence so the dev-panel display + the
+  // replay countdown match the Canvas2D path.
+  const base = FREEZE_FRAMES_MIN +
+    Math.floor(Math.random() * (FREEZE_FRAMES_MAX - FREEZE_FRAMES_MIN + 1));
+  freezeFrames = base * (Math.random() < 0.5 ? 1 : 2);
+  freezeMono = Math.random() < FREEZE_MONO_CHANCE;
+}
+
+// Replay the last captured freeze into _contentFbo. Source-over (no blend)
+// because the freeze should REPLACE the FBO contents (it's the full scene,
+// not an additive overlay). Called instead of the legacy `restoreFreeze`
+// when GL content is active.
+function glRestoreFreeze() {
+  if (!_freezeTex) return;
+  const gl = lattGL;
+  gl.useProgram(_blitProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _blitQuadBuf);
+  gl.enableVertexAttribArray(_blitAPos);
+  gl.vertexAttribPointer(_blitAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _freezeTex);
+  gl.uniform1i(_blitUTex, 0);
+  gl.uniform2f(_blitURes, W, H);
+  gl.uniform2f(_blitUCenter, W * 0.5, H * 0.5);
+  gl.uniform1f(_blitUAngle, 0);
+  gl.uniform4f(_blitUDest, 0, 0, W, H);
+  gl.uniform4f(_blitUSrc, 0, 0, W, H);
+  gl.disable(gl.BLEND);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+}
+
+// Snapshot the current _contentFbo into _contentScratchTex so subsequent
+// blit passes can sample a stable copy while writing back to _contentFbo.
+// Allocates the scratch texture lazily on first call (and after a resize).
+// Requires _contentFbo to be currently bound (the source for copyTexSubImage2D).
+function snapshotContentToScratch() {
+  const gl = lattGL;
+  const w = ditherCanvas.width;
+  const h = ditherCanvas.height;
+  if (!_contentScratchTex) {
+    _contentScratchTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, _contentScratchTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  } else {
+    gl.bindTexture(gl.TEXTURE_2D, _contentScratchTex);
+  }
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+}
+
+// Render the in-flight slice list (slice tears) into the content FBO via
+// the blit program: snapshot the FBO, then per slice blit a horizontal
+// strip from scratch to the destination strip with additive blend. Each
+// slice's `mono`/regular flag pushes a region for the post-dither mono/
+// inversion overlay (unchanged from the Canvas2D path).
+function applySlicesGL(W_, H_, dpr_) {
+  if (!_lattUseGL || slices.length <= 0) return;
+  const gl = lattGL;
+  // Capture current FBO content as scratch source.
+  snapshotContentToScratch();
+
+  gl.useProgram(_blitProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _blitQuadBuf);
+  gl.enableVertexAttribArray(_blitAPos);
+  gl.vertexAttribPointer(_blitAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _contentScratchTex);
+  gl.uniform1i(_blitUTex, 0);
+  gl.uniform2f(_blitURes, W_, H_);
+  gl.uniform2f(_blitUCenter, W_ * 0.5, H_ * 0.5);
+  // Slices are additive (matched the legacy 'lighter' GCO). The content
+  // FBO blend is already additive at this point in the frame; leave as-is.
+  // Walk slices in reverse: aging + splice on death (mirrors original).
+  for (let i = slices.length - 1; i >= 0; i--) {
+    const s = slices[i];
+    s.life -= dt;
+    if (s.life <= 0) { slices.splice(i, 1); continue; }
+    const sy = Math.max(0, Math.min(H_ - 1, s.y));
+    const sh = Math.max(1, Math.min(H_ - sy, s.h * viewportScale));
+    // Push region for post-dither mono/invert overlay. (Unchanged.)
+    (s.mono ? monoRegions : inversionRegions).push({
+      x: s.dx, y: sy, w: W_, h: sh, angle: s.angle || 0,
+    });
+    gl.uniform4f(_blitUDest, s.dx, sy, W_, sh);
+    gl.uniform4f(_blitUSrc, 0, sy, W_, sh);
+    gl.uniform1f(_blitUAngle, s.angle || 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+}
+
+// Same blit program, but with source-over semantics (no blend). Swaps
+// random tile pairs to scramble blocks of the content FBO. Matches the
+// legacy applyBlockShuffle.
+function applyBlockShuffleGL(W_, H_) {
+  if (!_lattUseGL) return;
+  const gl = lattGL;
+  snapshotContentToScratch();
+
+  const tilesX = 5 + Math.floor(Math.random() * 6);
+  const tilesY = 3 + Math.floor(Math.random() * 5);
+  const tileW = W_ / tilesX;
+  const tileH = H_ / tilesY;
+  const count = 4 + Math.floor(Math.random() * 6);
+
+  gl.useProgram(_blitProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _blitQuadBuf);
+  gl.enableVertexAttribArray(_blitAPos);
+  gl.vertexAttribPointer(_blitAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _contentScratchTex);
+  gl.uniform1i(_blitUTex, 0);
+  gl.uniform2f(_blitURes, W_, H_);
+  gl.uniform2f(_blitUCenter, W_ * 0.5, H_ * 0.5);
+  gl.uniform1f(_blitUAngle, 0);
+  // Source-over: replace pixels — disable blend so source overwrites dest.
+  gl.disable(gl.BLEND);
+  for (let i = 0; i < count; i++) {
+    const ax = Math.floor(Math.random() * tilesX);
+    const ay = Math.floor(Math.random() * tilesY);
+    const bx = Math.floor(Math.random() * tilesX);
+    const by = Math.floor(Math.random() * tilesY);
+    gl.uniform4f(_blitUDest, bx * tileW, by * tileH, tileW, tileH);
+    gl.uniform4f(_blitUSrc,  ax * tileW, ay * tileH, tileW, tileH);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);  // restore additive for any following layers
+}
+
+function applyMeshVerts() {
+  if (!_lattUseGL || _meshVertCount <= 0) return false;
+  const gl = lattGL;
+  gl.useProgram(_meshVertProg);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattQuad);  // shared -0.5..0.5 unit quad
+  gl.enableVertexAttribArray(_meshVertACorner);
+  gl.vertexAttribPointer(_meshVertACorner, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshVertACorner, 0);
+
+  const view = new Float32Array(_meshVertData.buffer, 0, _meshVertCount * MESH_VERT_STRIDE);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _meshVertInstBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, view, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(_meshVertAInst);
+  gl.vertexAttribPointer(_meshVertAInst, 4, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_meshVertAInst, 1);
+
+  gl.uniform2f(_meshVertURes, W, H);
+  _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, _meshVertCount);
+
+  _lattInstExt.vertexAttribDivisorANGLE(_meshVertAInst, 0);
+  _meshVertCount = 0;
+  return true;
+}
+
 
 function resizeFreeze() {
   freezeCanvas.width = canvas.width;
@@ -2678,21 +3213,35 @@ function frame(now) {
 
   if (freezeFrames > 0) {
     _pmark('frz');
-    restoreFreeze();
+    if (_lattUseGL) {
+      // Bind the content FBO and replay the captured _freezeTex into it.
+      // The freeze frame is the FULL pre-dither scene; replaying then
+      // running the dither pass over it yields a fresh per-frame dither
+      // pattern over a static image — matching the original behavior
+      // where each replayed freeze got re-dithered every frame.
+      clearContentGL();
+      glRestoreFreeze();
+    } else {
+      restoreFreeze();
+    }
     freezeFrames -= dt;
     // Twist is now applied inside the merged dither pass downstream
     // (uTwist/uPinch uniforms). Previously had an explicit applyTwist
     // call here; removed to drop the second per-frame texImage2D.
   } else {
     _pmark('fly');
-    // Clear the shared content GL canvas at the start of the first GL
-    // content section. Flyouts, sparks, and lattice all accumulate into it
-    // before a single composite onto the main Canvas2D below. No-op on the
-    // Canvas2D fallback path.
+    // Bind the content FBO so subsequent content layers (fade, flyouts,
+    // meshes, sparks, lattice, slices) accumulate into _contentTex.
+    // No-op on the Canvas2D fallback path; that path keeps drawing to
+    // the main canvas as before.
     if (_lattUseGL) clearContentGL();
     const fade = 0.06 + 0.05 * (1 - smoothLevel);
-    ctx.fillStyle = 'rgba(0,0,0,' + fade + ')';
-    ctx.fillRect(0, 0, W, H);
+    if (_lattUseGL) {
+      glFade(fade);
+    } else {
+      ctx.fillStyle = 'rgba(0,0,0,' + fade + ')';
+      ctx.fillRect(0, 0, W, H);
+    }
 
     ctx.globalCompositeOperation = 'lighter';
 
@@ -2833,29 +3382,53 @@ function frame(now) {
 
         // edges first so vertex circles render on top
         const edges = mesh.edges;
-        ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.55) + ')';
-        ctx.lineWidth = Math.max(2.4, 2.4 + sc * 0.5) * viewportScale;
-        ctx.beginPath();
-        for (let j = 0; j < edges.length; j++) {
-          const e = edges[j];
-          const x0 = projX[e[0]], y0 = projY[e[0]];
-          const x1 = projX[e[1]], y1 = projY[e[1]];
-          if (x0 < -1e5 || x1 < -1e5) continue;
-          ctx.moveTo(x0, y0);
-          ctx.lineTo(x1, y1);
+        const edgeAlpha = a * 0.55;
+        const edgeHalfWidth = Math.max(2.4, 2.4 + sc * 0.5) * viewportScale * 0.5;
+        if (_lattUseGL) {
+          for (let j = 0; j < edges.length; j++) {
+            const e = edges[j];
+            const x0 = projX[e[0]], y0 = projY[e[0]];
+            const x1 = projX[e[1]], y1 = projY[e[1]];
+            if (x0 < -1e5 || x1 < -1e5) continue;
+            meshEdgeAppend(x0, y0, x1, y1, edgeHalfWidth, edgeAlpha);
+          }
+        } else {
+          ctx.strokeStyle = 'rgba(255,255,255,' + edgeAlpha + ')';
+          ctx.lineWidth = edgeHalfWidth * 2;
+          ctx.beginPath();
+          for (let j = 0; j < edges.length; j++) {
+            const e = edges[j];
+            const x0 = projX[e[0]], y0 = projY[e[0]];
+            const x1 = projX[e[1]], y1 = projY[e[1]];
+            if (x0 < -1e5 || x1 < -1e5) continue;
+            ctx.moveTo(x0, y0);
+            ctx.lineTo(x1, y1);
+          }
+          ctx.stroke();
         }
-        ctx.stroke();
 
         // vertices
         const vertexR = Math.max(4.4, 5.0 + sc * 1.0) * viewportScale;
-        ctx.fillStyle = 'rgba(255,255,255,' + a + ')';
-        for (let j = 0; j < verts.length; j++) {
-          const x = projX[j], y = projY[j];
-          if (x < -1e5) continue;
-          ctx.beginPath();
-          ctx.arc(x, y, vertexR, 0, Math.PI * 2);
-          ctx.fill();
+        if (_lattUseGL) {
+          for (let j = 0; j < verts.length; j++) {
+            const x = projX[j], y = projY[j];
+            if (x < -1e5) continue;
+            meshVertAppend(x, y, vertexR, a);
+          }
+        } else {
+          ctx.fillStyle = 'rgba(255,255,255,' + a + ')';
+          for (let j = 0; j < verts.length; j++) {
+            const x = projX[j], y = projY[j];
+            if (x < -1e5) continue;
+            ctx.beginPath();
+            ctx.arc(x, y, vertexR, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
+      }
+      if (_lattUseGL) {
+        applyMeshEdges();
+        applyMeshVerts();
       }
     }
 
@@ -2962,13 +3535,10 @@ function frame(now) {
         ctx.drawImage(particleCanvas, x, y);
       }
     }
-    // Single composite of all GL content (sparks + lattice + future
-    // flyouts) onto the main Canvas2D. 'lighter' matches the additive
-    // semantics the GL programs accumulate with internally.
-    if (_lattUseGL) {
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.drawImage(lattCanvas, 0, 0, lattCanvas.width, lattCanvas.height, 0, 0, W, H);
-    }
+    // Phase 3: GL content stays in _contentFbo / _contentTex. The dither
+    // pass downstream samples _contentTex directly — no composite onto the
+    // main Canvas2D needed here. Canvas2D fallback composites onto main as
+    // a side effect of having drawn directly to main throughout this block.
 
     // Twist used to run here as its own WebGL pass; it now folds into
     // the merged dither pass downstream. Aesthetic consequence: scanlines
@@ -2976,7 +3546,9 @@ function frame(now) {
     // content, where they used to be applied untwisted on top of a
     // twisted scene. Acceptable.
     _pmark('slc');
-    if (slices.length) {
+    if (_lattUseGL) {
+      applySlicesGL(W, H, dpr);
+    } else if (slices.length) {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalCompositeOperation = 'lighter';
@@ -3012,11 +3584,13 @@ function frame(now) {
 
     _pmark('frz');
     if (pendingFreeze) {
-      captureFreeze();
+      if (_lattUseGL) glCaptureFreeze();
+      else captureFreeze();
       pendingFreeze = false;
     }
     if (pendingShuffle) {
-      applyBlockShuffle();
+      if (_lattUseGL) applyBlockShuffleGL(W, H);
+      else applyBlockShuffle();
       pendingShuffle = false;
     }
   }
@@ -3228,7 +3802,9 @@ host.onmessage = function (e) {
     rebuildScanlineTile();
     rebuildParticleTile();
     if (ditherCanvas) resizeDither();
-    if (lattCanvas) resizeLattice();
+    // resizeContent must run after resizeDither — the content FBO texture
+    // is sized to ditherCanvas's dimensions.
+    if (_contentTex) resizeContent();
     if (freezeCanvas) resizeFreeze();
     // Drop any in-flight slices: their s.y/s.dx are baked in the old
     // viewport's coordinate system, and they'd render bars at stale
