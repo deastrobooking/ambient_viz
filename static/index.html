@@ -643,6 +643,12 @@ let KICKS_PER_SHAPE_CYCLE = 16;
 let KICKS_PER_TWIST = 8;
 let MAX_TWIST_DEG = 720;
 let TWIST_PINCH = 0.3;
+// Critically-damped spring frequency for the twist/pinch easing. Settling
+// time is ~0.6/Hz seconds (so 1.0 Hz ≈ 600ms to come to rest). Smaller =
+// smoother but laggier; larger = snappier. The previous single-pole lerp
+// behaved like ≈10 Hz (~100ms settling) and was visibly jumpy at each
+// kick because velocity jumped from 0 to high.
+let TWIST_SPRING_HZ = 1.0;
 let LATTICE_SPACING = 24;
 let FREEZE_MONO_CHANCE = 1 / 8;
 let SLICE_BURST_SCALE = 1.0;
@@ -1369,6 +1375,10 @@ let colorIndex = 0, kickCount = 0;
 let twistKickCount = 0;
 let currentTwist = 0;
 let currentPinch = 0;
+// Spring-damper velocity state for the twist/pinch easing. Updated each
+// frame; integrated into currentTwist/currentPinch.
+let twistVel = 0;
+let pinchVel = 0;
 let tintR = COLOR_PALETTE[0][0];
 let tintG = COLOR_PALETTE[0][1];
 let tintB = COLOR_PALETTE[0][2];
@@ -3312,9 +3322,20 @@ function frame(now) {
   const _twistProgress = _twistPhase <= 1.0 ? _twistPhase : (2.0 - _twistPhase);
   const _twistTargetRad = _twistProgress * MAX_TWIST_DEG * Math.PI / 180;
   const _twistPinchTarget = _twistProgress * TWIST_PINCH;
-  const _twistLerp = Math.min(1, 0.16 * dt);
-  currentTwist += (_twistTargetRad - currentTwist) * _twistLerp;
-  currentPinch += (_twistPinchTarget - currentPinch) * _twistLerp;
+  // Critically-damped spring (no overshoot) toward target. Natural
+  // frequency ω = 2π·TWIST_SPRING_HZ in rad/sec → rad/(60fps-frame) via
+  // /60. Acceleration = ω²·(target - x) - 2ω·v; integrate v, then x.
+  // The spring's velocity is 0 at the moment of a kick-driven target
+  // jump, so the visible motion ramps in smoothly instead of snapping.
+  const _twistW = TWIST_SPRING_HZ * 2.0 * Math.PI / 60.0;
+  const _twistKp = _twistW * _twistW;
+  const _twistKd = 2.0 * _twistW;
+  const _accelT = (_twistTargetRad - currentTwist) * _twistKp - twistVel * _twistKd;
+  const _accelP = (_twistPinchTarget - currentPinch) * _twistKp - pinchVel * _twistKd;
+  twistVel += _accelT * dt;
+  pinchVel += _accelP * dt;
+  currentTwist += twistVel * dt;
+  currentPinch += pinchVel * dt;
 
   midBaseline = midBaseline * 0.97 + b.mid * 0.03;
   const midDev = Math.max(0, b.mid - midBaseline);
@@ -3920,6 +3941,7 @@ function applyParam(name, v) {
       break;
     case 'maxTwistDeg': MAX_TWIST_DEG = v; break;
     case 'twistPinch': TWIST_PINCH = v; break;
+    case 'twistSpringHz': TWIST_SPRING_HZ = Math.max(0.05, v); break;
   }
 }
 function applyParams(p) {
@@ -4857,6 +4879,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       min: 0, max: 1, step: 0.01,
       fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('twistPinch', v),
+    },
+    twistSpringHz: {
+      type: 'continuous', def: 1.0,
+      min: 0.1, max: 8.0, step: 0.1,
+      fmt: v => v.toFixed(1), editor: true,
+      setLive: v => setParam('twistSpringHz', v),
     },
   };
   const PARAM_NAMES = Object.keys(PARAMS);
