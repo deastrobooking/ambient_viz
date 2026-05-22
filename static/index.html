@@ -1372,13 +1372,17 @@ let pendingFreeze = false, pendingShuffle = false;
 let ditherPhaseX = 0, ditherPhaseY = 0;
 let colorIndex = 0, kickCount = 0;
 // beatClock accumulates total elapsed beats at the authored BPM (set by
-// the `bpm` lane via CURRENT_BPM). The twist is driven by a triangle
-// wave over beatClock: phase = (beatClock / KICKS_PER_TWIST) % 2, and
-// progress = (phase <= 1 ? phase : 2 - phase). So the first K beats
-// wind the twist up to MAX_TWIST_DEG, the next K beats unwind it back
-// to zero, then the cycle repeats. (Previously this was driven by
-// detected kicks; now it's tempo-driven so authored BPM controls the
-// twist rhythm regardless of whether kicks are detected.)
+// the `bpm` lane via CURRENT_BPM). The twist is driven by a *signed*
+// triangle wave over beatClock with four quarter-cycles of K beats each
+// (K = KICKS_PER_TWIST). phase = (beatClock / K) % 4, progress ∈ [-1, +1]:
+//   phase 0..1: 0 → +1   (twist clockwise to +MAX_TWIST_DEG)
+//   phase 1..2: +1 → 0   (untwist counter-clockwise back to neutral)
+//   phase 2..3: 0 → -1   (twist counter-clockwise to -MAX_TWIST_DEG)
+//   phase 3..4: -1 → 0   (untwist clockwise back to neutral)
+// Pinch uses |progress| so it peaks at both ±twist extremes and rests
+// at neutral, since pinch is an amplitude effect (negative pinch would
+// bulge outward in the shader). Full cycle is 4K beats — double the
+// wall-clock period of the previous 2K wind/unwind-only cycle.
 let beatClock = 0;
 let currentTwist = 0;
 let currentPinch = 0;
@@ -3324,14 +3328,18 @@ function frame(now) {
   beatClock += CURRENT_BPM * dt / 3600;
 
   // Ease the rendered twist toward a beat-driven target. The clock
-  // produces a triangle wave: progress climbs 0→1 over KICKS_PER_TWIST
-  // beats (wind up), then falls 1→0 over the next KICKS_PER_TWIST
-  // beats (unwind), then repeats.
+  // produces a *signed* triangle wave with four K-beat quarters:
+  // CW wind → CCW unwind → CCW wind → CW unwind → repeat.
+  // See the comment block on `let beatClock` for the phase table.
   const _twistDenom = Math.max(1, KICKS_PER_TWIST);
-  const _twistPhase = (beatClock / _twistDenom) % 2.0;
-  const _twistProgress = _twistPhase <= 1.0 ? _twistPhase : (2.0 - _twistPhase);
+  const _twistPhase = (beatClock / _twistDenom) % 4.0;
+  const _twistProgress =
+    _twistPhase < 1.0 ? _twistPhase :
+    _twistPhase < 3.0 ? (2.0 - _twistPhase) :
+                        (_twistPhase - 4.0);
   const _twistTargetRad = _twistProgress * MAX_TWIST_DEG * Math.PI / 180;
-  const _twistPinchTarget = _twistProgress * TWIST_PINCH;
+  // Pinch tracks twist magnitude, not direction: peaks at both ±extremes.
+  const _twistPinchTarget = Math.abs(_twistProgress) * TWIST_PINCH;
   // Critically-damped spring (no overshoot) toward target. Natural
   // frequency ω = 2π·TWIST_SPRING_HZ in rad/sec → rad/(60fps-frame) via
   // /60. Acceleration = ω²·(target - x) - 2ω·v; integrate v, then x.
