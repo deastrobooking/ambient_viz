@@ -502,6 +502,7 @@
         <button id="dev-rec" class="dev-btn">● rec</button>
         <button id="dev-save" class="dev-btn">save</button>
         <label class="dev-btn dev-load-btn">load<input type="file" id="dev-load" accept=".json" style="display:none"></label>
+        <button id="dev-wipe" class="dev-btn" title="Clear localStorage timeline and reload">wipe local</button>
       </div>
       <div id="dev-params"></div>
       <div class="dev-keys-header">
@@ -5024,6 +5025,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   const devRecBtn = document.getElementById('dev-rec');
   const devSaveBtn = document.getElementById('dev-save');
   const devLoadInput = document.getElementById('dev-load');
+  const devWipeBtn = document.getElementById('dev-wipe');
   const devParamsEl = document.getElementById('dev-params');
   const devKeysEl = document.getElementById('dev-keys');
   const devKeysCount = document.getElementById('dev-keys-count');
@@ -5227,6 +5229,20 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     devLoadInput.value = '';
   });
 
+  // Wipe the localStorage timeline (lanes + manual + armed) and reload.
+  // After the reload, lanes/manual will come from PARAMS defaults +
+  // whatever the server's .timeline.json provides. Also exposed as
+  // `window.clearTimelineSession()` for console / scripted use.
+  function clearTimelineSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
+  }
+  window.clearTimelineSession = clearTimelineSession;
+  devWipeBtn.addEventListener('click', () => {
+    if (!confirm('Clear local timeline state and reload? Unsaved lane edits will be lost.')) return;
+    clearTimelineSession();
+    location.reload();
+  });
+
   // --- localStorage autosave ---
   const SESSION_KEY = 'ambient_viz_session_v1';
   let saveTimer = null;
@@ -5244,6 +5260,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     }, 200);
   }
   (function restoreSession() {
+    // In ?lite (kiosk) mode the authored timeline.json on the server is
+    // the single source of truth — never restore from localStorage, so
+    // that whatever was authored on a dev machine and saved to disk is
+    // exactly what the kiosk plays. (The server timeline is fetched and
+    // applied on first gesture by tryAutoload below.)
+    if (liteMode) return;
     try {
       const raw = localStorage.getItem(SESSION_KEY);
       if (!raw) return;
