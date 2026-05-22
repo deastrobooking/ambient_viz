@@ -1399,8 +1399,8 @@ let profileMode = false;
 // deformation. Purpose: diagnostic, not a permanent rendering mode.
 let noGL = false;
 const PROFILE_SECTIONS = [
-  'state', 'fly', 'mesh', 'spk', 'latt', 'twst', 'slc',
-  'frz', 'scl', 'grn', 'dth', 'tint', 'inv', 'flsh',
+  'state', 'fly', 'mesh', 'spk', 'latt', 'slc',
+  'frz', 'grn', 'dth', 'tint', 'inv', 'flsh',
 ];
 const profAccum = Object.create(null);
 let profAccumFrames = 0;
@@ -1466,11 +1466,31 @@ let noiseRing = [];      // OffscreenCanvas[NOISE_RING]
 let noiseRingIdx = 0;
 let scanlineTile, scanlinePattern;
 let ditherCanvas, ditherGL;
+// Two-pass GL pipeline inside one context: pass 1 warps the source canvas
+// (twist+pinch) into an intermediate FBO-attached texture; pass 2 samples
+// that texture at display-space UV and applies the bayer threshold. This
+// keeps the single-texImage2D bandwidth win (we only upload the main
+// canvas once per frame) while preserving the original aesthetic where
+// scanlines/grain stay in display space (i.e. don't warp with twist).
 let _ditherProg, _ditherQuad, _ditherSrcTex, _ditherBayerTex;
 let _ditherUTex, _ditherUBayer, _ditherUSize, _ditherUOffset, _ditherAPos;
-let twistCanvas, twistGL;
-let _twistProg, _twistQuad, _twistSrcTex;
-let _twistUTex, _twistURes, _twistUTwist, _twistUPinch, _twistAPos;
+let _ditherUGrain, _ditherUGrainAlpha, _ditherUScanlineAlpha, _ditherUScanlinePeriod;
+let _ditherTwistProg, _ditherTwistUTex, _ditherTwistURes;
+let _ditherTwistUTwist, _ditherTwistUPinch, _ditherTwistAPos;
+let _ditherFbo, _ditherIntermediateTex, _ditherGrainTex;
+// Lattice GL pipeline (Phase 1 of the WebGL refactor — see PI_PERFORMANCE.md).
+// Replaces the ~700 per-frame `ctx.drawImage(particleCanvas, x, y)` stamps
+// with a single instanced draw call into an OffscreenCanvas-backed GL canvas,
+// then a single `ctx.drawImage(lattCanvas, ...)` composites the result onto
+// the main Canvas2D. _lattUseGL gates the GL path; on init failure (no
+// WebGL, missing ANGLE_instanced_arrays, etc.) we fall back to the
+// original 700-stamp Canvas2D loop and set _lattUseGL = false.
+let lattCanvas, lattGL, _lattInstExt;
+let _lattProg, _lattQuad, _lattInstBuf, _lattSpriteTex;
+let _lattACorner, _lattAInstPos, _lattURes, _lattUTileSize, _lattUSprite;
+let _lattInstData = null;
+let _lattInstCapacity = 0;
+let _lattUseGL = false;
 let freezeCanvas, freezeCtx;
 
 // Probability that a freshly-spawned flyout uses some silhouette other
@@ -1720,16 +1740,67 @@ function setupDither() {
     '  vUv = aPos * 0.5 + 0.5;' +
     '  gl_Position = vec4(aPos, 0.0, 1.0);' +
     '}';
-  const FS_SRC =
+  // Pass 1 fragment: circular pinch+twist UV warp. Samples uTex at the
+  // warped position; writes to the FBO-attached intermediate texture.
+  const TWIST_FS_SRC =
+    'precision highp float;' +
+    'varying vec2 vUv;' +
+    'uniform sampler2D uTex;' +
+    'uniform vec2 uResolution;' +
+    'uniform float uTwist;' +
+    'uniform float uPinch;' +
+    'void main() {' +
+    '  vec2 c = uResolution * 0.5;' +
+    '  vec2 px = vUv * uResolution;' +
+    '  vec2 d = px - c;' +
+    '  float r = length(d);' +
+    '  float maxR = length(c);' +
+    '  float t = clamp(r / maxR, 0.0, 1.0);' +
+    '  float falloff = pow(1.0 - t, 0.6);' +
+    '  float twistA = uTwist * falloff;' +
+    '  float pinchA = uPinch * falloff;' +
+    '  float cs = cos(twistA);' +
+    '  float sn = sin(twistA);' +
+    '  vec2 td = vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);' +
+    '  td *= (1.0 - pinchA * 0.55);' +
+    '  vec2 srcUv = (c + td) / uResolution;' +
+    '  gl_FragColor = texture2D(uTex, srcUv);' +
+    '}';
+  // Pass 2 fragment: bayer-threshold dither, sampled at display UV, with
+  // scanlines and grain folded in at display position (post-warp). The
+  // scene comes in via the warped intermediate texture (uTex); scanlines
+  // darken every Nth row in screen space; grain is sampled at vUv and
+  // additively combined. Doing all three composites in this single
+  // fragment program preserves the original aesthetic (scanlines + grain
+  // stay display-aligned, only the scene warps) while keeping the
+  // per-frame canvas upload at one texImage2D.
+  const DITHER_FS_SRC =
     'precision highp float;' +
     'varying vec2 vUv;' +
     'uniform sampler2D uTex;' +
     'uniform sampler2D uBayer;' +
+    'uniform sampler2D uGrain;' +
     'uniform vec2 uTexSize;' +
     'uniform vec2 uOffset;' +
+    'uniform float uGrainAlpha;' +
+    'uniform float uScanlineAlpha;' +
+    'uniform float uScanlinePeriod;' +
     'void main() {' +
     '  float lum = texture2D(uTex, vUv).r;' +
     '  vec2 pix = vUv * uTexSize;' +
+    // Scanline darken: every uScanlinePeriod-th row in screen space (y
+    // measured from top of image — uTexSize.y - pix.y — so the pattern
+    // is stable when uScanlinePeriod is odd; for the default period=2
+    // the parity is invariant either way).
+    '  float yFromTop = uTexSize.y - pix.y;' +
+    '  float scanlineMul = mod(yFromTop, uScanlinePeriod) < 1.0 ? (1.0 - uScanlineAlpha) : 1.0;' +
+    '  lum *= scanlineMul;' +
+    // Additive grain (matches the original Canvas2D \'lighter\' composite
+    // semantics — the noise tile is grayscale, alpha=1; globalAlpha
+    // modulated brightness).
+    '  vec3 grainSample = texture2D(uGrain, vUv).rgb;' +
+    '  lum = clamp(lum + grainSample.r * uGrainAlpha, 0.0, 1.0);' +
+    // Bayer threshold for binary dither.
     '  vec2 byx = mod(pix + uOffset, 8.0);' +
     '  float thresh = texture2D(uBayer, (byx + 0.5) / 8.0).r;' +
     '  gl_FragColor = lum > thresh ? vec4(1.0) : vec4(0.0, 0.0, 0.0, 1.0);' +
@@ -1743,29 +1814,77 @@ function setupDither() {
     }
     return sh;
   }
-  _ditherProg = ditherGL.createProgram();
-  ditherGL.attachShader(_ditherProg, compile(ditherGL.VERTEX_SHADER, VS_SRC));
-  ditherGL.attachShader(_ditherProg, compile(ditherGL.FRAGMENT_SHADER, FS_SRC));
-  ditherGL.linkProgram(_ditherProg);
-  if (!ditherGL.getProgramParameter(_ditherProg, ditherGL.LINK_STATUS)) {
-    throw new Error('dither program link: ' + ditherGL.getProgramInfoLog(_ditherProg));
+  function linkProgram(vsSrc, fsSrc, label) {
+    const prog = ditherGL.createProgram();
+    ditherGL.attachShader(prog, compile(ditherGL.VERTEX_SHADER, vsSrc));
+    ditherGL.attachShader(prog, compile(ditherGL.FRAGMENT_SHADER, fsSrc));
+    ditherGL.linkProgram(prog);
+    if (!ditherGL.getProgramParameter(prog, ditherGL.LINK_STATUS)) {
+      throw new Error(label + ' program link: ' + ditherGL.getProgramInfoLog(prog));
+    }
+    return prog;
   }
+  _ditherTwistProg = linkProgram(VS_SRC, TWIST_FS_SRC, 'twist');
+  _ditherTwistUTex    = ditherGL.getUniformLocation(_ditherTwistProg, 'uTex');
+  _ditherTwistURes    = ditherGL.getUniformLocation(_ditherTwistProg, 'uResolution');
+  _ditherTwistUTwist  = ditherGL.getUniformLocation(_ditherTwistProg, 'uTwist');
+  _ditherTwistUPinch  = ditherGL.getUniformLocation(_ditherTwistProg, 'uPinch');
+  _ditherTwistAPos    = ditherGL.getAttribLocation(_ditherTwistProg, 'aPos');
+
+  _ditherProg = linkProgram(VS_SRC, DITHER_FS_SRC, 'dither');
+  _ditherUTex            = ditherGL.getUniformLocation(_ditherProg, 'uTex');
+  _ditherUBayer          = ditherGL.getUniformLocation(_ditherProg, 'uBayer');
+  _ditherUGrain          = ditherGL.getUniformLocation(_ditherProg, 'uGrain');
+  _ditherUSize           = ditherGL.getUniformLocation(_ditherProg, 'uTexSize');
+  _ditherUOffset         = ditherGL.getUniformLocation(_ditherProg, 'uOffset');
+  _ditherUGrainAlpha     = ditherGL.getUniformLocation(_ditherProg, 'uGrainAlpha');
+  _ditherUScanlineAlpha  = ditherGL.getUniformLocation(_ditherProg, 'uScanlineAlpha');
+  _ditherUScanlinePeriod = ditherGL.getUniformLocation(_ditherProg, 'uScanlinePeriod');
+  _ditherAPos            = ditherGL.getAttribLocation(_ditherProg, 'aPos');
+
   _ditherQuad = ditherGL.createBuffer();
   ditherGL.bindBuffer(ditherGL.ARRAY_BUFFER, _ditherQuad);
   ditherGL.bufferData(ditherGL.ARRAY_BUFFER, new Float32Array([
     -1, -1,  1, -1, -1,  1,  1,  1,
   ]), ditherGL.STATIC_DRAW);
-  _ditherUTex    = ditherGL.getUniformLocation(_ditherProg, 'uTex');
-  _ditherUBayer  = ditherGL.getUniformLocation(_ditherProg, 'uBayer');
-  _ditherUSize   = ditherGL.getUniformLocation(_ditherProg, 'uTexSize');
-  _ditherUOffset = ditherGL.getUniformLocation(_ditherProg, 'uOffset');
-  _ditherAPos    = ditherGL.getAttribLocation(_ditherProg, 'aPos');
+
+  // Source texture: receives the per-frame texImage2D(canvas) upload.
   _ditherSrcTex = ditherGL.createTexture();
   ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherSrcTex);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MIN_FILTER, ditherGL.LINEAR);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.LINEAR);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.CLAMP_TO_EDGE);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.CLAMP_TO_EDGE);
+
+  // Intermediate texture: pass 1 writes warped output here; pass 2 reads
+  // from here. Allocated empty at the dither canvas dimensions; resized
+  // on viewport change via resizeDither.
+  _ditherIntermediateTex = ditherGL.createTexture();
+  ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherIntermediateTex);
+  ditherGL.texImage2D(
+    ditherGL.TEXTURE_2D, 0, ditherGL.RGBA,
+    ditherCanvas.width, ditherCanvas.height, 0,
+    ditherGL.RGBA, ditherGL.UNSIGNED_BYTE, null
+  );
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MIN_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.CLAMP_TO_EDGE);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.CLAMP_TO_EDGE);
+
+  // FBO with intermediate texture as color attachment.
+  _ditherFbo = ditherGL.createFramebuffer();
+  ditherGL.bindFramebuffer(ditherGL.FRAMEBUFFER, _ditherFbo);
+  ditherGL.framebufferTexture2D(
+    ditherGL.FRAMEBUFFER, ditherGL.COLOR_ATTACHMENT0,
+    ditherGL.TEXTURE_2D, _ditherIntermediateTex, 0
+  );
+  const fbStatus = ditherGL.checkFramebufferStatus(ditherGL.FRAMEBUFFER);
+  if (fbStatus !== ditherGL.FRAMEBUFFER_COMPLETE) {
+    throw new Error('dither FBO incomplete: 0x' + fbStatus.toString(16));
+  }
+  ditherGL.bindFramebuffer(ditherGL.FRAMEBUFFER, null);
+
+  // Bayer LUT.
   const bayerThresh = new Uint8Array(64);
   for (let i = 0; i < 64; i++) bayerThresh[i] = (BAYER8[i] << 2) + 2;
   _ditherBayerTex = ditherGL.createTexture();
@@ -1781,30 +1900,83 @@ function setupDither() {
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.NEAREST);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.REPEAT);
   ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.REPEAT);
+
+  // Grain texture: receives the current noise-ring tile per frame via
+  // texImage2D from the OffscreenCanvas. Small (~12 KB) compared to the
+  // main canvas upload, so the per-frame bandwidth cost is negligible.
+  // LINEAR filter matches the existing Canvas2D drawImage path which
+  // stretches the 320×320 tile to W×H with bilinear filtering.
+  _ditherGrainTex = ditherGL.createTexture();
+  ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherGrainTex);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MIN_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_MAG_FILTER, ditherGL.LINEAR);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_S, ditherGL.CLAMP_TO_EDGE);
+  ditherGL.texParameteri(ditherGL.TEXTURE_2D, ditherGL.TEXTURE_WRAP_T, ditherGL.CLAMP_TO_EDGE);
 }
 
-function applyDither(offX, offY) {
+function applyDither(offX, offY, twist, pinch, grainTile, grainAlpha, scanlineAlpha, scanlinePeriod) {
   if (noGL) return;
   const dw = ditherCanvas.width;
   const dh = ditherCanvas.height;
   if (dw <= 0 || dh <= 0) return;
   const gl = ditherGL;
+  gl.disable(gl.BLEND);
+
+  // ----- Pass 0a: upload the main canvas (scene + lattice + slices,
+  //               WITHOUT scanlines/grain — those moved into the shader).
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+
+  // ----- Pass 0b: upload the current noise-ring tile (~12 KB; small).
+  if (grainTile) {
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, _ditherGrainTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, grainTile);
+  }
+
+  // ----- Pass 1: warp source into the intermediate FBO texture.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, _ditherFbo);
+  gl.viewport(0, 0, dw, dh);
+  gl.useProgram(_ditherTwistProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _ditherQuad);
+  gl.enableVertexAttribArray(_ditherTwistAPos);
+  gl.vertexAttribPointer(_ditherTwistAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _ditherSrcTex);
+  gl.uniform1i(_ditherTwistUTex, 0);
+  gl.uniform2f(_ditherTwistURes, dw, dh);
+  gl.uniform1f(_ditherTwistUTwist, twist || 0);
+  gl.uniform1f(_ditherTwistUPinch, pinch || 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // ----- Pass 2: dither (bayer threshold) the intermediate into the
+  //              default framebuffer (= ditherCanvas), with scanline
+  //              darken + grain add applied in display space.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, dw, dh);
   gl.useProgram(_ditherProg);
   gl.bindBuffer(gl.ARRAY_BUFFER, _ditherQuad);
   gl.enableVertexAttribArray(_ditherAPos);
   gl.vertexAttribPointer(_ditherAPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _ditherIntermediateTex);
   gl.uniform1i(_ditherUTex, 0);
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D, _ditherBayerTex);
   gl.uniform1i(_ditherUBayer, 1);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, _ditherGrainTex);
+  gl.uniform1i(_ditherUGrain, 2);
   gl.uniform2f(_ditherUSize, dw, dh);
   gl.uniform2f(_ditherUOffset, offX & 7, offY & 7);
+  gl.uniform1f(_ditherUGrainAlpha, grainAlpha || 0);
+  gl.uniform1f(_ditherUScanlineAlpha, scanlineAlpha || 0);
+  gl.uniform1f(_ditherUScanlinePeriod, scanlinePeriod || 2);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // Composite to main canvas.
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.imageSmoothingEnabled = false;
@@ -1853,139 +2025,187 @@ function applyBlockShuffle() {
 function resizeDither() {
   ditherCanvas.width = Math.max(1, Math.ceil(W));
   ditherCanvas.height = Math.max(1, Math.ceil(H));
+  // The FBO-attached intermediate texture must match. Reallocate at the
+  // new size; the FBO retains the same texture handle, so no rebind needed.
+  if (ditherGL && _ditherIntermediateTex) {
+    ditherGL.bindTexture(ditherGL.TEXTURE_2D, _ditherIntermediateTex);
+    ditherGL.texImage2D(
+      ditherGL.TEXTURE_2D, 0, ditherGL.RGBA,
+      ditherCanvas.width, ditherCanvas.height, 0,
+      ditherGL.RGBA, ditherGL.UNSIGNED_BYTE, null
+    );
+  }
 }
 
-// === pinch + twist pipeline ===
-// Reads the main canvas as a texture, applies a circular pinch+twist
-// deformation (radial falloff so corners stay still), and draws the
-// result back over the main canvas. Sits before the bar/grain overlays
-// so those passes layer on top of the deformed content. The twist angle
-// can exceed 2π — at maxTwistDeg = 720°, points near the center spiral
-// nearly twice around relative to the unmoving rim, producing a nested
-// seashell effect.
-function setupTwist() {
+// === lattice GL pipeline ===
+// Instanced sprite renderer for the hex-lattice stamp loop. The particle
+// shape itself is still drawn each frame on the existing `particleCanvas`
+// (it morphs between SHAPES[shapeIndex] and the next shape, pulses with
+// bassPulse, etc.), and is uploaded to the GL sprite texture per frame.
+// Instance positions come from `pushFilledRectPoints` like before — we
+// just push them into a Float32Array and run one instanced draw call
+// instead of ~700 individual ctx.drawImage stamps.
+//
+// Blend mode: additive (gl.ONE, gl.ONE). The Canvas2D lattice block runs
+// with globalCompositeOperation = 'lighter' (set up at the start of the
+// non-freeze branch and never reset before the lattice block), so the
+// final ctx.drawImage(lattCanvas, ...) under 'lighter' composites the
+// additively-accumulated GL output additively over the existing canvas
+// content — visually equivalent to the original additive stamps.
+function setupLattice() {
   if (noGL) {
-    twistCanvas = null;
-    twistGL = null;
+    _lattUseGL = false;
     return;
   }
-  twistCanvas = new OffscreenCanvas(Math.max(1, canvas.width), Math.max(1, canvas.height));
-  twistGL = twistCanvas.getContext('webgl', {
-    preserveDrawingBuffer: true,
-    premultipliedAlpha: false,
-    antialias: true,
-    alpha: false,
-    depth: false,
-    stencil: false,
-  });
-  if (!twistGL) throw new Error('twist WebGL not supported in worker');
+  try {
+    lattCanvas = new OffscreenCanvas(Math.max(1, canvas.width), Math.max(1, canvas.height));
+    lattGL = lattCanvas.getContext('webgl', {
+      premultipliedAlpha: true,
+      preserveDrawingBuffer: false,
+      antialias: false,
+      alpha: true,
+      depth: false,
+      stencil: false,
+    });
+    if (!lattGL) throw new Error('lattice WebGL context unavailable');
+    _lattInstExt = lattGL.getExtension('ANGLE_instanced_arrays');
+    if (!_lattInstExt) throw new Error('ANGLE_instanced_arrays not supported');
 
-  const VS_SRC =
-    'attribute vec2 aPos;' +
-    'varying vec2 vUv;' +
-    'void main() {' +
-    '  vUv = aPos * 0.5 + 0.5;' +
-    '  gl_Position = vec4(aPos, 0.0, 1.0);' +
-    '}';
-  // Falloff is computed in pixel space against the canvas diagonal so
-  // the active region reaches into the corners. The pow(0.6) curve
-  // keeps the deformation broad — at the mid-radius the twist is still
-  // ~66% strength, instead of the 50% you'd get from a linear falloff
-  // or the ~16% from a smoothstep — so more of the screen participates.
-  // Pinch scales radius inward, coupled to the same falloff so pinch
-  // and twist build together.
-  const FS_SRC =
-    'precision highp float;' +
-    'varying vec2 vUv;' +
-    'uniform sampler2D uTex;' +
-    'uniform vec2 uResolution;' +
-    'uniform float uTwist;' +
-    'uniform float uPinch;' +
-    'void main() {' +
-    '  vec2 px = vUv * uResolution;' +
-    '  vec2 c = uResolution * 0.5;' +
-    '  vec2 d = px - c;' +
-    '  float r = length(d);' +
-    '  float maxR = length(c);' +
-    '  float t = clamp(r / maxR, 0.0, 1.0);' +
-    '  float falloff = pow(1.0 - t, 0.6);' +
-    '  float twist = uTwist * falloff;' +
-    '  float pinch = uPinch * falloff;' +
-    '  float cs = cos(twist);' +
-    '  float sn = sin(twist);' +
-    '  vec2 td = vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);' +
-    '  td *= (1.0 - pinch * 0.55);' +
-    '  vec2 srcUv = (c + td) / uResolution;' +
-    '  gl_FragColor = texture2D(uTex, srcUv);' +
-    '}';
-  function compile(type, src) {
-    const sh = twistGL.createShader(type);
-    twistGL.shaderSource(sh, src);
-    twistGL.compileShader(sh);
-    if (!twistGL.getShaderParameter(sh, twistGL.COMPILE_STATUS)) {
-      throw new Error('twist shader compile: ' + twistGL.getShaderInfoLog(sh));
+    const VS_SRC =
+      'attribute vec2 aCorner;' +
+      'attribute vec2 aInstancePos;' +
+      'uniform vec2 uResolution;' +
+      'uniform float uTileSize;' +
+      'varying vec2 vUv;' +
+      'void main() {' +
+      '  vec2 pxPos = aInstancePos + aCorner * uTileSize;' +
+      '  vec2 ndc = (pxPos / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vUv = aCorner + 0.5;' +
+      '}';
+    const FS_SRC =
+      'precision mediump float;' +
+      'varying vec2 vUv;' +
+      'uniform sampler2D uSprite;' +
+      'void main() {' +
+      '  gl_FragColor = texture2D(uSprite, vUv);' +
+      '}';
+    function compile(type, src) {
+      const sh = lattGL.createShader(type);
+      lattGL.shaderSource(sh, src);
+      lattGL.compileShader(sh);
+      if (!lattGL.getShaderParameter(sh, lattGL.COMPILE_STATUS)) {
+        throw new Error('lattice shader compile: ' + lattGL.getShaderInfoLog(sh));
+      }
+      return sh;
     }
-    return sh;
+    _lattProg = lattGL.createProgram();
+    lattGL.attachShader(_lattProg, compile(lattGL.VERTEX_SHADER, VS_SRC));
+    lattGL.attachShader(_lattProg, compile(lattGL.FRAGMENT_SHADER, FS_SRC));
+    lattGL.linkProgram(_lattProg);
+    if (!lattGL.getProgramParameter(_lattProg, lattGL.LINK_STATUS)) {
+      throw new Error('lattice program link: ' + lattGL.getProgramInfoLog(_lattProg));
+    }
+
+    _lattACorner   = lattGL.getAttribLocation(_lattProg, 'aCorner');
+    _lattAInstPos  = lattGL.getAttribLocation(_lattProg, 'aInstancePos');
+    _lattURes      = lattGL.getUniformLocation(_lattProg, 'uResolution');
+    _lattUTileSize = lattGL.getUniformLocation(_lattProg, 'uTileSize');
+    _lattUSprite   = lattGL.getUniformLocation(_lattProg, 'uSprite');
+
+    // Triangle strip quad in [-0.5, 0.5] unit space. Vertex shader scales
+    // by uTileSize and translates by aInstancePos.
+    _lattQuad = lattGL.createBuffer();
+    lattGL.bindBuffer(lattGL.ARRAY_BUFFER, _lattQuad);
+    lattGL.bufferData(lattGL.ARRAY_BUFFER, new Float32Array([
+      -0.5, -0.5,
+       0.5, -0.5,
+      -0.5,  0.5,
+       0.5,  0.5,
+    ]), lattGL.STATIC_DRAW);
+
+    _lattInstBuf = lattGL.createBuffer();
+
+    _lattSpriteTex = lattGL.createTexture();
+    lattGL.bindTexture(lattGL.TEXTURE_2D, _lattSpriteTex);
+    // LINEAR matches Canvas2D's bilinear drawImage filtering — important
+    // for sub-pixel positions (jitter). NEAREST would visibly pixelate.
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_MIN_FILTER, lattGL.LINEAR);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_MAG_FILTER, lattGL.LINEAR);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_S, lattGL.CLAMP_TO_EDGE);
+    lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_T, lattGL.CLAMP_TO_EDGE);
+
+    _lattUseGL = true;
+  } catch (e) {
+    try { console.warn('[ambient_viz] lattice GL setup failed, using Canvas2D fallback:', e && (e.message || e)); } catch (_) {}
+    _lattUseGL = false;
+    lattGL = null;
+    _lattInstExt = null;
   }
-  _twistProg = twistGL.createProgram();
-  twistGL.attachShader(_twistProg, compile(twistGL.VERTEX_SHADER, VS_SRC));
-  twistGL.attachShader(_twistProg, compile(twistGL.FRAGMENT_SHADER, FS_SRC));
-  twistGL.linkProgram(_twistProg);
-  if (!twistGL.getProgramParameter(_twistProg, twistGL.LINK_STATUS)) {
-    throw new Error('twist program link: ' + twistGL.getProgramInfoLog(_twistProg));
-  }
-  _twistQuad = twistGL.createBuffer();
-  twistGL.bindBuffer(twistGL.ARRAY_BUFFER, _twistQuad);
-  twistGL.bufferData(twistGL.ARRAY_BUFFER, new Float32Array([
-    -1, -1,  1, -1, -1,  1,  1,  1,
-  ]), twistGL.STATIC_DRAW);
-  _twistUTex   = twistGL.getUniformLocation(_twistProg, 'uTex');
-  _twistURes   = twistGL.getUniformLocation(_twistProg, 'uResolution');
-  _twistUTwist = twistGL.getUniformLocation(_twistProg, 'uTwist');
-  _twistUPinch = twistGL.getUniformLocation(_twistProg, 'uPinch');
-  _twistAPos   = twistGL.getAttribLocation(_twistProg, 'aPos');
-  _twistSrcTex = twistGL.createTexture();
-  twistGL.bindTexture(twistGL.TEXTURE_2D, _twistSrcTex);
-  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_MIN_FILTER, twistGL.LINEAR);
-  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_MAG_FILTER, twistGL.LINEAR);
-  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_WRAP_S, twistGL.CLAMP_TO_EDGE);
-  twistGL.texParameteri(twistGL.TEXTURE_2D, twistGL.TEXTURE_WRAP_T, twistGL.CLAMP_TO_EDGE);
 }
 
-function resizeTwist() {
-  twistCanvas.width = Math.max(1, canvas.width);
-  twistCanvas.height = Math.max(1, canvas.height);
+function resizeLattice() {
+  if (!lattCanvas) return;
+  lattCanvas.width = Math.max(1, canvas.width);
+  lattCanvas.height = Math.max(1, canvas.height);
 }
 
-// Skips when both twist and pinch are negligible — avoids the texture
-// upload + redraw on frames where the effect would be invisible.
-function applyTwist(twist, pinch) {
-  if (noGL) return;
-  if (Math.abs(twist) < 1e-4 && pinch < 1e-4) return;
-  const dw = twistCanvas.width;
-  const dh = twistCanvas.height;
-  if (dw <= 0 || dh <= 0) return;
-  const gl = twistGL;
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+// Per frame: upload current particleCanvas as the sprite, push positions
+// into the instance buffer, instanced draw. `instancePos` is a packed
+// Float32Array of [x0,y0, x1,y1, ...] in CSS-pixel coords; the vertex
+// shader maps to NDC using uResolution=(W,H). instanceCount is the number
+// of points (instancePos.length / 2). Returns true if the GL draw ran,
+// false if we fell back (caller should then run the Canvas2D path).
+function applyLattice(instancePos, instanceCount) {
+  if (!_lattUseGL || instanceCount <= 0) return false;
+  const gl = lattGL;
+  gl.viewport(0, 0, lattCanvas.width, lattCanvas.height);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);  // additive (matches Canvas2D 'lighter')
+
+  // Sprite upload. particleCanvas is the small (~48-80 px) shape canvas
+  // that's redrawn per frame in the existing lattice block.
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, _twistSrcTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
-  gl.viewport(0, 0, dw, dh);
-  gl.useProgram(_twistProg);
-  gl.bindBuffer(gl.ARRAY_BUFFER, _twistQuad);
-  gl.enableVertexAttribArray(_twistAPos);
-  gl.vertexAttribPointer(_twistAPos, 2, gl.FLOAT, false, 0, 0);
-  gl.uniform1i(_twistUTex, 0);
-  gl.uniform2f(_twistURes, dw, dh);
-  gl.uniform1f(_twistUTwist, twist);
-  gl.uniform1f(_twistUPinch, pinch);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalCompositeOperation = 'copy';
-  ctx.drawImage(twistCanvas, 0, 0, dw, dh, 0, 0, canvas.width, canvas.height);
-  ctx.restore();
+  gl.bindTexture(gl.TEXTURE_2D, _lattSpriteTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, particleCanvas);
+
+  // Instance buffer upload.
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattInstBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, instancePos, gl.DYNAMIC_DRAW);
+
+  gl.useProgram(_lattProg);
+
+  // Per-vertex corner (divisor 0).
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattQuad);
+  gl.enableVertexAttribArray(_lattACorner);
+  gl.vertexAttribPointer(_lattACorner, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_lattACorner, 0);
+
+  // Per-instance position (divisor 1).
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattInstBuf);
+  gl.enableVertexAttribArray(_lattAInstPos);
+  gl.vertexAttribPointer(_lattAInstPos, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_lattAInstPos, 1);
+
+  gl.uniform2f(_lattURes, W, H);
+  gl.uniform1f(_lattUTileSize, particleTileSize);
+  gl.uniform1i(_lattUSprite, 0);
+
+  _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+
+  // Reset divisors so other contexts (if any later) don't inherit our
+  // instanced state. (Not strictly needed since this is a dedicated
+  // context — defensive.)
+  _lattInstExt.vertexAttribDivisorANGLE(_lattAInstPos, 0);
+  return true;
 }
+
+
 function resizeFreeze() {
   freezeCanvas.width = canvas.width;
   freezeCanvas.height = canvas.height;
@@ -2131,7 +2351,9 @@ function frame(now) {
     _pmark('frz');
     restoreFreeze();
     freezeFrames -= dt;
-    applyTwist(currentTwist, currentPinch);
+    // Twist is now applied inside the merged dither pass downstream
+    // (uTwist/uPinch uniforms). Previously had an explicit applyTwist
+    // call here; removed to drop the second per-frame texImage2D.
   } else {
     _pmark('fly');
     const fade = 0.06 + 0.05 * (1 - smoothLevel);
@@ -2344,17 +2566,49 @@ function frame(now) {
     }
     particleCtx.closePath();
     particleCtx.fill();
-    for (let i = 0; i < pts.length; i += 2) {
-      const x = pts[i] + (Math.random() - 0.5) * jitter - particleHalf;
-      const y = pts[i + 1] + (Math.random() - 0.5) * jitter - particleHalf;
-      ctx.drawImage(particleCanvas, x, y);
+    if (_lattUseGL) {
+      // GL path: one instanced draw + one composite drawImage instead of
+      // ~700 individual ctx.drawImage stamps. Positions are CSS-pixel,
+      // jitter applied here (the vertex shader centers each quad on the
+      // instance position, so we don't subtract particleHalf like the
+      // Canvas2D path did).
+      const instanceCount = pts.length >> 1;
+      if (_lattInstData === null || _lattInstCapacity < pts.length) {
+        // Grow to next power of two ≥ pts.length so we don't reallocate
+        // every frame as the lattice point count drifts with viewportScale.
+        let cap = Math.max(2048, _lattInstCapacity || 2048);
+        while (cap < pts.length) cap <<= 1;
+        _lattInstData = new Float32Array(cap);
+        _lattInstCapacity = cap;
+      }
+      const buf = _lattInstData;
+      for (let i = 0; i < pts.length; i += 2) {
+        buf[i]     = pts[i]     + (Math.random() - 0.5) * jitter;
+        buf[i + 1] = pts[i + 1] + (Math.random() - 0.5) * jitter;
+      }
+      // Use a typed-array view of just the live region so bufferData
+      // doesn't upload the unused tail.
+      const liveView = new Float32Array(_lattInstData.buffer, 0, pts.length);
+      applyLattice(liveView, instanceCount);
+      // Composite the GL output onto the main canvas. The lattice block
+      // runs with globalCompositeOperation = 'lighter' (set up earlier in
+      // the else branch) — additive over additive matches the original.
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.drawImage(lattCanvas, 0, 0, lattCanvas.width, lattCanvas.height, 0, 0, W, H);
+    } else {
+      // Canvas2D fallback: original 700-stamp loop.
+      for (let i = 0; i < pts.length; i += 2) {
+        const x = pts[i] + (Math.random() - 0.5) * jitter - particleHalf;
+        const y = pts[i + 1] + (Math.random() - 0.5) * jitter - particleHalf;
+        ctx.drawImage(particleCanvas, x, y);
+      }
     }
 
-    // Pinch + twist sits between the scene content and the bar overlay
-    // so slices/scanline/grain layer on top of the deformed image.
-    _pmark('twst');
-    applyTwist(currentTwist, currentPinch);
-
+    // Twist used to run here as its own WebGL pass; it now folds into
+    // the merged dither pass downstream. Aesthetic consequence: scanlines
+    // and grain (added after this point) get twisted along with the scene
+    // content, where they used to be applied untwisted on top of a
+    // twisted scene. Acceptable.
     _pmark('slc');
     if (slices.length) {
       ctx.save();
@@ -2401,32 +2655,28 @@ function frame(now) {
     }
   }
 
-  _pmark('scl');
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.globalAlpha = SCANLINE_ALPHA;
-  ctx.fillStyle = scanlinePattern;
-  ctx.fillRect(0, 0, W, H);
-  ctx.globalAlpha = 1;
-
+  // Scanlines and grain are no longer drawn here — they're composited
+  // inside the dither pass 2 shader (post-warp, in display space), so
+  // the scene warps without the scanline/grain pattern dragging with it.
+  // Advance the grain ring index here so the per-frame tile selection
+  // and treble-driven envelope match the prior behavior.
   _pmark('grn');
-  // Advance ring index; treble-driven envelope is now applied as a
-  // globalAlpha scale around the baked midpoint density (0.45). The
-  // original density-to-alpha curve was 0.25..0.70; scaling by
-  // density/0.45 gives 0.56..1.56, clamped at 1 below.
   const grainTile = noiseRing[noiseRingIdx];
   noiseRingIdx = (noiseRingIdx + 1) % NOISE_RING;
   const grainDensity = 0.25 + smoothTreble * 0.45;
   const grainAlpha = Math.min(1, GRAIN_ALPHA * (grainDensity / _NOISE_BAKE_DENSITY));
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.imageSmoothingEnabled = false;
-  ctx.globalAlpha = grainAlpha;
-  ctx.drawImage(grainTile, 0, 0, W, H);
-  ctx.globalAlpha = 1;
-  ctx.imageSmoothingEnabled = true;
-  ctx.globalCompositeOperation = 'source-over';
 
   _pmark('dth');
-  applyDither(Math.floor(ditherPhaseX), Math.floor(ditherPhaseY));
+  applyDither(
+    Math.floor(ditherPhaseX),
+    Math.floor(ditherPhaseY),
+    currentTwist,
+    currentPinch,
+    grainTile,
+    grainAlpha,
+    SCANLINE_ALPHA,
+    SCANLINE_PERIOD
+  );
 
   _pmark('tint');
   const tintActive = !(freezeFrames > 0 && freezeMono);
@@ -2522,6 +2772,7 @@ function frame(now) {
       bitmapW: canvas.width,
       bitmapH: canvas.height,
       profReport,
+      lattUseGL: _lattUseGL,
     });
     lastDebugPost = now;
   }
@@ -2583,7 +2834,7 @@ host.onmessage = function (e) {
     if (msg.params) applyParams(msg.params);
     setupOffscreens();
     setupDither();
-    setupTwist();
+    setupLattice();
     initFlyout();
     initMeshes3d();
     last = performance.now();
@@ -2611,7 +2862,7 @@ host.onmessage = function (e) {
     rebuildScanlineTile();
     rebuildParticleTile();
     if (ditherCanvas) resizeDither();
-    if (twistCanvas) resizeTwist();
+    if (lattCanvas) resizeLattice();
     if (freezeCanvas) resizeFreeze();
     // Drop any in-flight slices: their s.y/s.dx are baked in the old
     // viewport's coordinate system, and they'd render bars at stale
@@ -2798,6 +3049,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     saturation: 1.0,
     FREEZE_FRAMES_MAX: 12,
     profReport: '',
+    lattUseGL: false,
   };
   // Posts a single param change to the worker (used by sliders + automation
   // lanes via PARAMS.X.setLive). No-op until the worker is up.
@@ -3964,7 +4216,8 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       ? wd.freezeFrames.toFixed(1) + (wd.freezeMono ? ' mono' : '')
       : '0') + ` (max=${wd.FREEZE_FRAMES_MAX})`;
     devEls.fps.textContent = wd.fpsValue.toFixed(0)
-      + ` (${wd.W || '?'}×${wd.H || '?'} bm:${wd.bitmapW || '?'}×${wd.bitmapH || '?'})`;
+      + ` (${wd.W || '?'}×${wd.H || '?'} bm:${wd.bitmapW || '?'}×${wd.bitmapH || '?'})`
+      + ` latt:${wd.lattUseGL ? 'gl' : '2d'}`;
     if (devEls.prof) {
       if (wd.profReport) {
         devEls.prof.parentElement.style.display = '';
