@@ -2759,6 +2759,16 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   const LITE_MAX_H = 720;
   if (liteMode) document.body.classList.add('lite-kiosk');
 
+  // ?bitmap=N: caps render bitmap *height* to N (width scales from the
+  // viewport's aspect ratio). Overrides ?lite's 720 cap when smaller.
+  // Used to drop GPU bandwidth on Pi 4: every per-frame texImage2D scales
+  // linearly with bitmap pixel count, so 480 vs 720 = ~2.25× less GPU
+  // work in the dither/twist passes. CSS canvas size stays at 100vw×100vh
+  // — browser upscales the smaller bitmap. Visual: chunkier dither, more
+  // CRT-y. Set N=0 to disable. Reasonable values: 360, 480, 540, 720.
+  const _bitmapMatch = location.search.match(/[?&]bitmap=(\d+)/);
+  const bitmapHeight = _bitmapMatch ? Math.max(0, parseInt(_bitmapMatch[1], 10)) : 0;
+
   // ?profile=1: enable per-section render timing inside the worker. The
   // worker posts a formatted "total:Xms latt:1.2 grn:0.8 ..." breakdown
   // in its debug snapshot; the dev panel shows it under fps and the
@@ -2826,12 +2836,18 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   let W = 0, H = 0;
   function computeDpr() {
     let d = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth, h = window.innerHeight;
     if (liteMode) {
       // Clamp bitmap to LITE_MAX_W × LITE_MAX_H. Browser upscales the
       // smaller bitmap to fill the 100vw × 100vh canvas.
-      const w = window.innerWidth, h = window.innerHeight;
       if (w > 0) d = Math.min(d, LITE_MAX_W / w);
       if (h > 0) d = Math.min(d, LITE_MAX_H / h);
+    }
+    if (bitmapHeight > 0 && h > 0) {
+      // ?bitmap=N caps bitmap height to N (width scales w/ viewport
+      // aspect via the same dpr). Applied on top of lite's cap, so the
+      // tighter constraint wins.
+      d = Math.min(d, bitmapHeight / h);
     }
     return d;
   }

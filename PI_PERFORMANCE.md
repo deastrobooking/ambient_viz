@@ -4,10 +4,24 @@ Reference target: Raspberry Pi 4 Model B (VideoCore VI, single-channel
 LPDDR4) running Chromium at 1080p. Same advice applies to other weak
 GPUs, low-end ARM Chromebooks, etc.
 
-The visualizer's per-frame budget at 1080p is dominated by **Canvas2D
-fillrate** and **stamp count**, not WebGL. The dither pass is the only
-WebGL work; everything else is software-rasterized 2D. The 8GB of RAM on
-the Pi 4 is irrelevant — this workload is not memory-bound.
+**Revised diagnosis (after measurement, supersedes the earlier note):**
+On a Pi 4 the actual bottleneck is **GPU memory bandwidth on the per-frame
+WebGL texture uploads**, not Canvas2D fillrate or stamp count. The
+dither and twist passes each do a `texImage2D(canvas)` per frame, which
+copies the entire main canvas into a GL texture (~3.7 MB at 720p × 2
+passes × 60 Hz = ~440 MB/s sustained). The V3D memory bus saturates
+before the dither shader even runs, and per-frame work spills across
+multiple vsync periods — observable as fps locked at 8–9 even though
+the JS work is only 12–15 ms per frame.
+
+Canvas2D CPU profiling (lattice, grain regen, etc.) significantly
+*undercounted* this because `gl.drawArrays()` returns instantly; the
+GPU bandwidth cost is invisible to `performance.now()` instrumentation.
+
+**The big lever** is therefore: shrink the bitmap that gets uploaded.
+`?bitmap=N` caps render height to N pixels (browser upscales for
+display). 360p ≈ 4× less GPU bandwidth than 720p and gets to acceptable
+fps; the dither aesthetic actually *benefits* from chunkier upscaling.
 
 Items are grouped by approximate impact. Numbers in parens are the
 default values in `static/index.html`. Many of these are already exposed as
@@ -208,20 +222,23 @@ Set `flashTrigger` very high (e.g. `0.5`) so it effectively never fires.
 
 ---
 
-## How `?lite` configures things
+## URL flags for low-power devices
 
-Adding `?lite` (or `?lite=1`) to the URL applies:
+| Flag | Effect |
+|---|---|
+| `?lite=1` | Hides all DOM overlays (UI, timeline, editor, drop hints) so the compositor merges only the canvas. Caps bitmap to 1280×720. Bumps `LATTICE_SPACING` 24 → 36 |
+| `?bitmap=N` | Caps render bitmap height to N px. Width scales with viewport aspect. Browser upscales to fill display. **Highest-leverage knob on Pi 4** — GPU bandwidth scales with bitmap² |
+| `?profile=1` | Enables per-section worker render timing. Logs to console once/sec and shows in dev panel. Cost: ~14 `performance.now()` calls/frame |
+| `?nogl=1` | Skips dither + twist WebGL passes. Diagnostic for engines that can't get a WebGL context on `OffscreenCanvas` (e.g. cog/WPEWebKit). Visual cost: no dither, no twist |
+| `?nooffscreen=1` | Forces main-thread renderer (worker path is the default). For engines where `transferControlToOffscreen` fails silently |
 
-| Lever | Default | Lite |
-|---|---|---|
-| Max bitmap | `min(devicePixelRatio, 2)` × viewport | clamped to 1280×720 |
-| `LATTICE_SPACING` | 24 | 36 |
+**Pi 4 kiosk recommended:** `?lite=1&bitmap=360`. Gets to acceptable fps
+by reducing WebGL texture upload bandwidth ~4×. Chunky dither aesthetic
+is on-brand.
 
-Both can still be overridden live from the dev panel after load.
-
-To go further on a Pi, the next levers worth pulling (in order) are:
-`mesh3dCount` → 0, `grainAlpha` → 0.2, `FLYOUT_COUNT` → 5
-(code change), `sliceBurstScale` → 0.5.
+To go further: lower `bitmap` (`240`?), disable mesh3d (slider:
+`mesh3dCount → 0`), reduce `FLYOUT_COUNT` (constant in
+`static/index.html`, requires reload).
 
 ---
 

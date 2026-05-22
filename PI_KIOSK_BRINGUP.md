@@ -456,12 +456,18 @@ For Chromium kiosk autostart, add to `~/.config/autostart/kiosk.desktop`:
 [Desktop Entry]
 Type=Application
 Name=ambient_viz kiosk
-Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required http://localhost:8080/?lite
+Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required http://localhost:8080/?lite=1&bitmap=360
 X-GNOME-Autostart-enabled=true
 ```
 
-`?lite` clamps the render bitmap to 1280×720 — recommended for Pi 4.
-Drop it if your Pi handles 1080p fine.
+`?lite=1` hides DOM overlays and sparsens the lattice.
+`?bitmap=360` caps render bitmap height to 360px (browser upscales to
+fill the display). The Pi 4's V3D GPU is bandwidth-bound on the
+per-frame WebGL texture uploads (dither + twist passes); rendering at
+360p cuts that bandwidth ~4× vs 720p and is what gets us to acceptable
+fps. Aesthetic cost: chunky dither / CRT-y look, which fits the
+visualizer's vibe. Try `bitmap=480` if you want a sharper look at the
+cost of fps, or drop both flags entirely if your Pi handles native res.
 
 ---
 
