@@ -1491,6 +1491,35 @@ let _lattACorner, _lattAInstPos, _lattURes, _lattUTileSize, _lattUSprite;
 let _lattInstData = null;
 let _lattInstCapacity = 0;
 let _lattUseGL = false;
+// Sparks share the lattice's GL context; they render as instanced quads
+// with a radial falloff computed in the fragment shader (no sprite
+// texture needed — the gradient is procedural). Per-instance attributes
+// are vec4(x, y, radius_px, alpha).
+let _sparkProg;
+let _sparkACorner, _sparkAInst, _sparkURes;
+let _sparkInstBuf;
+let _sparkInstData = null;
+let _sparkInstCapacity = 0;
+// Flyouts share the lattice's GL context. Each silhouette is baked once at
+// init into two alpha-only sprites: `fill` and `edge` (the combined wide+thin
+// stroke baked at the original 0.35/0.95 alpha ratio). Per frame, flyouts
+// are grouped by silhouette name and drawn as two instanced quads per group
+// (fill, then edge). Per-instance attrs are
+// vec4(x, y, drawScale, rot) + vec2(fillAlpha, edgeAlpha). The shader picks
+// which alpha to apply via uAlphaIdx (0=fill, 1=edge).
+//
+// Visual delta from the Canvas2D path: stroke widths stay proportional to
+// the silhouette size (baked in) instead of depth-varying as CSS pixels.
+// Acceptable in the ambient context — silhouettes still read as cars/etc.
+const SILH_BAKE_PX = 384;
+const _silhTex = {};  // name → { fill: WebGLTexture, edge: WebGLTexture }
+let _flyProg;
+let _flyACorner, _flyAInst0, _flyAInst1, _flyURes, _flyUSprite, _flyUAlphaIdx;
+let _flyInstBuf;
+// Per-silhouette instance state: { data: Float32Array, count, cap }.
+// Stride: 6 floats per instance (x, y, drawScale, rot, fillAlpha, edgeAlpha).
+const FLY_STRIDE = 6;
+const _flyInstPerSilh = new Map();
 let freezeCanvas, freezeCtx;
 
 // Probability that a freshly-spawned flyout uses some silhouette other
@@ -2135,6 +2164,105 @@ function setupLattice() {
     lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_S, lattGL.CLAMP_TO_EDGE);
     lattGL.texParameteri(lattGL.TEXTURE_2D, lattGL.TEXTURE_WRAP_T, lattGL.CLAMP_TO_EDGE);
 
+    // ----- Spark program (shares this GL context with lattice).
+    // Radial falloff computed in the fragment shader from corner UV; no
+    // sprite texture needed. Per-instance vec4(x, y, radiusPx, alpha).
+    const SPARK_VS_SRC =
+      'attribute vec2 aCorner;' +
+      'attribute vec4 aInstance;' +
+      'uniform vec2 uResolution;' +
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  float r = aInstance.z;' +
+      '  vec2 pxPos = aInstance.xy + aCorner * (r * 2.0);' +
+      '  vec2 ndc = (pxPos / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vUv = aCorner + 0.5;' +
+      '  vAlpha = aInstance.w;' +
+      '}';
+    const SPARK_FS_SRC =
+      'precision mediump float;' +
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  float dist = length(vUv - 0.5) * 2.0;' +
+      '  float falloff = clamp(1.0 - dist, 0.0, 1.0);' +
+      // Match the original Canvas2D radial gradient: white center,
+      // 0.9 alpha at center, linear falloff to 0 at edge. Multiplied by
+      // per-instance vAlpha. Premultiplied so additive blend is correct.
+      '  float a = falloff * 0.9 * vAlpha;' +
+      '  gl_FragColor = vec4(a, a, a, a);' +
+      '}';
+    _sparkProg = lattGL.createProgram();
+    lattGL.attachShader(_sparkProg, compile(lattGL.VERTEX_SHADER, SPARK_VS_SRC));
+    lattGL.attachShader(_sparkProg, compile(lattGL.FRAGMENT_SHADER, SPARK_FS_SRC));
+    lattGL.linkProgram(_sparkProg);
+    if (!lattGL.getProgramParameter(_sparkProg, lattGL.LINK_STATUS)) {
+      throw new Error('spark program link: ' + lattGL.getProgramInfoLog(_sparkProg));
+    }
+    _sparkACorner = lattGL.getAttribLocation(_sparkProg, 'aCorner');
+    _sparkAInst   = lattGL.getAttribLocation(_sparkProg, 'aInstance');
+    _sparkURes    = lattGL.getUniformLocation(_sparkProg, 'uResolution');
+    _sparkInstBuf = lattGL.createBuffer();
+
+    // ----- Flyout program. Per-instance translate / rotate / scale of a
+    // unit quad, sampling an alpha-only baked silhouette sprite (fill or
+    // edge layer chosen by uAlphaIdx). Premultiplied output stacks with
+    // sparks/lattice under the shared additive blend.
+    const FLY_VS_SRC =
+      'attribute vec2 aCorner;' +
+      'attribute vec4 aInst0;' +    // x, y, drawScale, rot
+      'attribute vec2 aInst1;' +    // fillAlpha, edgeAlpha
+      'uniform vec2 uResolution;' +
+      'uniform float uAlphaIdx;' +  // 0 = fill, 1 = edge
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'void main() {' +
+      '  float c = cos(aInst0.w), s = sin(aInst0.w);' +
+      '  vec2 sized = aCorner * aInst0.z;' +
+      '  vec2 r = vec2(c * sized.x - s * sized.y, s * sized.x + c * sized.y);' +
+      '  vec2 px = aInst0.xy + r;' +
+      '  vec2 ndc = (px / uResolution) * 2.0 - 1.0;' +
+      '  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);' +
+      '  vUv = aCorner + 0.5;' +
+      '  vAlpha = mix(aInst1.x, aInst1.y, uAlphaIdx);' +
+      '}';
+    const FLY_FS_SRC =
+      'precision mediump float;' +
+      'varying vec2 vUv;' +
+      'varying float vAlpha;' +
+      'uniform sampler2D uSprite;' +
+      'void main() {' +
+      // Sprite is uploaded with PREMULTIPLY_ALPHA — sample is already
+      // premultiplied. Scale by per-instance vAlpha; additive blend
+      // accumulates into the shared content GL canvas.
+      '  vec4 t = texture2D(uSprite, vUv);' +
+      '  gl_FragColor = t * vAlpha;' +
+      '}';
+    _flyProg = lattGL.createProgram();
+    lattGL.attachShader(_flyProg, compile(lattGL.VERTEX_SHADER, FLY_VS_SRC));
+    lattGL.attachShader(_flyProg, compile(lattGL.FRAGMENT_SHADER, FLY_FS_SRC));
+    lattGL.linkProgram(_flyProg);
+    if (!lattGL.getProgramParameter(_flyProg, lattGL.LINK_STATUS)) {
+      throw new Error('flyout program link: ' + lattGL.getProgramInfoLog(_flyProg));
+    }
+    _flyACorner   = lattGL.getAttribLocation(_flyProg, 'aCorner');
+    _flyAInst0    = lattGL.getAttribLocation(_flyProg, 'aInst0');
+    _flyAInst1    = lattGL.getAttribLocation(_flyProg, 'aInst1');
+    _flyURes      = lattGL.getUniformLocation(_flyProg, 'uResolution');
+    _flyUSprite   = lattGL.getUniformLocation(_flyProg, 'uSprite');
+    _flyUAlphaIdx = lattGL.getUniformLocation(_flyProg, 'uAlphaIdx');
+    _flyInstBuf   = lattGL.createBuffer();
+
+    // Bake fill + edge sprites per silhouette and upload as GL textures.
+    // Done once at init using Canvas2D's evenodd fill (preserves holes in
+    // umbrella/eye/skyline/speaker). The path coordinate range is roughly
+    // [-0.5, 0.5]; we render into a SILH_BAKE_PX² canvas centered at the
+    // midpoint. The sprite quad in the vertex shader is [-0.5, 0.5], so a
+    // drawScale of N gives an N-CSS-pixel silhouette in screen space.
+    bakeSilhouetteSprites();
+
     _lattUseGL = true;
   } catch (e) {
     try { console.warn('[ambient_viz] lattice GL setup failed, using Canvas2D fallback:', e && (e.message || e)); } catch (_) {}
@@ -2156,15 +2284,24 @@ function resizeLattice() {
 // shader maps to NDC using uResolution=(W,H). instanceCount is the number
 // of points (instancePos.length / 2). Returns true if the GL draw ran,
 // false if we fell back (caller should then run the Canvas2D path).
-function applyLattice(instancePos, instanceCount) {
-  if (!_lattUseGL || instanceCount <= 0) return false;
+// Clear the shared content GL canvas and set the additive blend mode
+// used by all content programs (lattice, sparks, flyouts). Called once
+// per frame before any content GL drawing. Sparks/lattice/flyouts then
+// accumulate into the same canvas; a single drawImage composites it
+// onto the main Canvas2D at the end of the content section.
+function clearContentGL() {
+  if (!_lattUseGL) return;
   const gl = lattGL;
   gl.viewport(0, 0, lattCanvas.width, lattCanvas.height);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
-
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.ONE, gl.ONE);  // additive (matches Canvas2D 'lighter')
+}
+
+function applyLattice(instancePos, instanceCount) {
+  if (!_lattUseGL || instanceCount <= 0) return false;
+  const gl = lattGL;
 
   // Sprite upload. particleCanvas is the small (~48-80 px) shape canvas
   // that's redrawn per frame in the existing lattice block.
@@ -2198,11 +2335,203 @@ function applyLattice(instancePos, instanceCount) {
 
   _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
 
-  // Reset divisors so other contexts (if any later) don't inherit our
-  // instanced state. (Not strictly needed since this is a dedicated
-  // context — defensive.)
+  // Reset divisors so other content programs (sparks, flyouts) don't
+  // inherit our instanced state on the shared corner attribute.
   _lattInstExt.vertexAttribDivisorANGLE(_lattAInstPos, 0);
   return true;
+}
+
+// Render sparks as instanced quads with a radial-falloff fragment shader.
+// `instanceData` is a Float32Array packed as [x0, y0, r0, a0, x1, y1, ...]
+// in CSS-pixel coords (matching applyLattice's coordinate space).
+function applySparks(instanceData, instanceCount) {
+  if (!_lattUseGL || instanceCount <= 0) return false;
+  const gl = lattGL;
+  // Assumes clearContentGL ran earlier this frame; we just keep
+  // additive blending and append our quads to the canvas.
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, _sparkInstBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, instanceData, gl.DYNAMIC_DRAW);
+
+  gl.useProgram(_sparkProg);
+
+  // Reuse the lattice's static quad VBO for the per-vertex corner attr
+  // (same -0.5..0.5 unit quad).
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattQuad);
+  gl.enableVertexAttribArray(_sparkACorner);
+  gl.vertexAttribPointer(_sparkACorner, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_sparkACorner, 0);
+
+  // Per-instance (x, y, radius, alpha).
+  gl.bindBuffer(gl.ARRAY_BUFFER, _sparkInstBuf);
+  gl.enableVertexAttribArray(_sparkAInst);
+  gl.vertexAttribPointer(_sparkAInst, 4, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_sparkAInst, 1);
+
+  gl.uniform2f(_sparkURes, W, H);
+
+  _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+
+  _lattInstExt.vertexAttribDivisorANGLE(_sparkAInst, 0);
+  return true;
+}
+
+// Bake an alpha-only sprite per silhouette per layer (fill, edge) using
+// Canvas2D Path2D. Path coords are normalized to roughly [-0.5, 0.5]; we
+// translate by SILH_BAKE_PX/2 and scale by SILH_BAKE_PX so the silhouette
+// fills the bake canvas. evenodd preserves holes (eye/speaker/umbrella/
+// skyline). Strokes are baked at fixed widths chosen to roughly match the
+// CSS-pixel widths at typical drawScale values.
+function bakeSilhouetteSprites() {
+  // Fixed stroke widths in path-coord units. The original code used
+  // max(2, 2.4 + sc*1.2) and max(1, 1 + sc*0.3) CSS px, then divided by
+  // drawScale (typical 80-280). 0.012 here ≈ 3.3 px at drawScale=275, or
+  // 8 px at drawScale=110 — a reasonable middle of the depth range. The
+  // tradeoff in PI_PERFORMANCE was noted: we lose depth-varying stroke.
+  const STROKE_WIDE_W = 0.012;
+  const STROKE_THIN_W = 0.0045;
+  for (let i = 0; i < SILHOUETTE_NAMES.length; i++) {
+    const name = SILHOUETTE_NAMES[i];
+    const path = SILHOUETTES[name].path;
+
+    const fillC = new OffscreenCanvas(SILH_BAKE_PX, SILH_BAKE_PX);
+    const fc = fillC.getContext('2d');
+    fc.translate(SILH_BAKE_PX / 2, SILH_BAKE_PX / 2);
+    fc.scale(SILH_BAKE_PX, SILH_BAKE_PX);
+    fc.fillStyle = '#fff';
+    fc.fill(path, 'evenodd');
+
+    const edgeC = new OffscreenCanvas(SILH_BAKE_PX, SILH_BAKE_PX);
+    const ec = edgeC.getContext('2d');
+    ec.translate(SILH_BAKE_PX / 2, SILH_BAKE_PX / 2);
+    ec.scale(SILH_BAKE_PX, SILH_BAKE_PX);
+    ec.lineJoin = 'round';
+    ec.lineCap = 'round';
+    // Wide dim stroke + narrow bright stroke, both white. Alpha ratios
+    // 0.35 / 0.95 mirror the original. 'lighter' makes the two strokes
+    // combine additively (matching the original render, which ran the
+    // strokes under the flyout section's 'lighter' GCO).
+    ec.globalCompositeOperation = 'lighter';
+    ec.strokeStyle = 'rgba(255,255,255,0.35)';
+    ec.lineWidth = STROKE_WIDE_W;
+    ec.stroke(path);
+    ec.strokeStyle = 'rgba(255,255,255,0.95)';
+    ec.lineWidth = STROKE_THIN_W;
+    ec.stroke(path);
+
+    const gl = lattGL;
+    const fillTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fillTex);
+    // FLIP_Y=false: with the vertex shader's `gl_Position.y = -ndc.y` and
+    // `vUv = aCorner + 0.5`, the quad's screen-top corner has vUv.y=0 and
+    // needs to sample canvas row 0 (which is also visual top in Canvas2D
+    // coords). Lattice uses FLIP_Y=true but its particle sprite is point-
+    // symmetric so the inversion isn't visible; silhouettes are not.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, fillC);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const edgeTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, edgeTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, edgeC);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    _silhTex[name] = { fill: fillTex, edge: edgeTex };
+  }
+}
+
+// Append a flyout instance into the per-silhouette buffer. Buffers grow
+// by powers of two; capacity is shared across frames so 10 flyouts won't
+// allocate after the first frame.
+function flyoutAppend(name, x, y, drawScale, rot, fillAlpha, edgeAlpha) {
+  let g = _flyInstPerSilh.get(name);
+  if (!g) {
+    g = { data: new Float32Array(FLY_STRIDE * 8), count: 0, cap: 8 };
+    _flyInstPerSilh.set(name, g);
+  }
+  if (g.count >= g.cap) {
+    const newCap = g.cap * 2;
+    const nd = new Float32Array(FLY_STRIDE * newCap);
+    nd.set(g.data);
+    g.data = nd;
+    g.cap = newCap;
+  }
+  const off = g.count * FLY_STRIDE;
+  g.data[off]     = x;
+  g.data[off + 1] = y;
+  g.data[off + 2] = drawScale;
+  g.data[off + 3] = rot;
+  g.data[off + 4] = fillAlpha;
+  g.data[off + 5] = edgeAlpha;
+  g.count++;
+}
+
+// Render all buffered flyouts into the shared content GL canvas. Two
+// instanced draws per active silhouette (fill, then edge). Resets the
+// per-silhouette `count` so next frame can refill from zero without
+// touching the underlying buffer.
+function applyFlyouts() {
+  if (!_lattUseGL) return false;
+  const gl = lattGL;
+  let drew = false;
+
+  gl.useProgram(_flyProg);
+  gl.uniform2f(_flyURes, W, H);
+  gl.uniform1i(_flyUSprite, 0);
+
+  // Per-vertex corner attr (shared static quad).
+  gl.bindBuffer(gl.ARRAY_BUFFER, _lattQuad);
+  gl.enableVertexAttribArray(_flyACorner);
+  gl.vertexAttribPointer(_flyACorner, 2, gl.FLOAT, false, 0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_flyACorner, 0);
+
+  gl.enableVertexAttribArray(_flyAInst0);
+  gl.enableVertexAttribArray(_flyAInst1);
+  _lattInstExt.vertexAttribDivisorANGLE(_flyAInst0, 1);
+  _lattInstExt.vertexAttribDivisorANGLE(_flyAInst1, 1);
+
+  const stride = FLY_STRIDE * 4;  // 6 floats × 4 bytes
+
+  _flyInstPerSilh.forEach((g, name) => {
+    if (g.count <= 0) return;
+    const tex = _silhTex[name];
+    if (!tex) { g.count = 0; return; }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, _flyInstBuf);
+    // Upload only the live region.
+    const view = new Float32Array(g.data.buffer, 0, g.count * FLY_STRIDE);
+    gl.bufferData(gl.ARRAY_BUFFER, view, gl.DYNAMIC_DRAW);
+    // aInst0 = (x, y, drawScale, rot), offset 0
+    gl.vertexAttribPointer(_flyAInst0, 4, gl.FLOAT, false, stride, 0);
+    // aInst1 = (fillAlpha, edgeAlpha), offset 16 bytes (after 4 floats)
+    gl.vertexAttribPointer(_flyAInst1, 2, gl.FLOAT, false, stride, 16);
+
+    // Fill pass.
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex.fill);
+    gl.uniform1f(_flyUAlphaIdx, 0.0);
+    _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, g.count);
+
+    // Edge pass.
+    gl.bindTexture(gl.TEXTURE_2D, tex.edge);
+    gl.uniform1f(_flyUAlphaIdx, 1.0);
+    _lattInstExt.drawArraysInstancedANGLE(gl.TRIANGLE_STRIP, 0, 4, g.count);
+
+    drew = true;
+    g.count = 0;
+  });
+
+  // Reset divisors so subsequent programs (lattice) don't inherit.
+  _lattInstExt.vertexAttribDivisorANGLE(_flyAInst0, 0);
+  _lattInstExt.vertexAttribDivisorANGLE(_flyAInst1, 0);
+  return drew;
 }
 
 
@@ -2356,6 +2685,11 @@ function frame(now) {
     // call here; removed to drop the second per-frame texImage2D.
   } else {
     _pmark('fly');
+    // Clear the shared content GL canvas at the start of the first GL
+    // content section. Flyouts, sparks, and lattice all accumulate into it
+    // before a single composite onto the main Canvas2D below. No-op on the
+    // Canvas2D fallback path.
+    if (_lattUseGL) clearContentGL();
     const fade = 0.06 + 0.05 * (1 - smoothLevel);
     ctx.fillStyle = 'rgba(0,0,0,' + fade + ')';
     ctx.fillRect(0, 0, W, H);
@@ -2401,23 +2735,32 @@ function frame(now) {
       a = Math.min(1, a * (1 + bassPulse * 0.7));
 
       const silhName = s.silhName || activeSilhouette;
-      const silh = SILHOUETTES[silhName] || SILHOUETTES[activeSilhouette] || SILHOUETTES.car;
-      const path = silh.path;
-      ctx.save();
-      ctx.translate(sx, sy);
-      ctx.rotate(rot);
-      ctx.scale(drawScale, drawScale);
-      ctx.fillStyle = 'rgba(255,255,255,' + (a * s.fillAlpha) + ')';
-      ctx.fill(path, 'evenodd');
-      const invScale = 1 / drawScale;
-      ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.35) + ')';
-      ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2) * invScale;
-      ctx.stroke(path);
-      ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.95) + ')';
-      ctx.lineWidth = Math.max(1, 1 + sc * 0.3) * invScale;
-      ctx.stroke(path);
-      ctx.restore();
+      if (_lattUseGL && _silhTex[silhName]) {
+        // Buffer per-instance attrs for the post-loop instanced draws.
+        // fillAlpha and edgeAlpha are the per-flyout multipliers applied
+        // to the baked sprites (which encode the original 0.35/0.95
+        // stroke weights at native alpha=1).
+        flyoutAppend(silhName, sx, sy, drawScale, rot, a * s.fillAlpha, a);
+      } else {
+        const silh = SILHOUETTES[silhName] || SILHOUETTES[activeSilhouette] || SILHOUETTES.car;
+        const path = silh.path;
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(rot);
+        ctx.scale(drawScale, drawScale);
+        ctx.fillStyle = 'rgba(255,255,255,' + (a * s.fillAlpha) + ')';
+        ctx.fill(path, 'evenodd');
+        const invScale = 1 / drawScale;
+        ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.35) + ')';
+        ctx.lineWidth = Math.max(2, 2.4 + sc * 1.2) * invScale;
+        ctx.stroke(path);
+        ctx.strokeStyle = 'rgba(255,255,255,' + (a * 0.95) + ')';
+        ctx.lineWidth = Math.max(1, 1 + sc * 0.3) * invScale;
+        ctx.stroke(path);
+        ctx.restore();
+      }
     }
+    if (_lattUseGL) applyFlyouts();
 
     _pmark('mesh');
     // 3D mesh wireframe layer — low-poly cylinder cluster (Renaissance
@@ -2517,6 +2860,17 @@ function frame(now) {
     }
 
     _pmark('spk');
+    // Pre-size the spark instance buffer to fit the current spark count.
+    if (_lattUseGL) {
+      const need = sparks.length * 4;
+      if (_sparkInstData === null || _sparkInstCapacity < need) {
+        let cap = Math.max(64, _sparkInstCapacity || 64);
+        while (cap < need) cap <<= 1;
+        _sparkInstData = new Float32Array(cap);
+        _sparkInstCapacity = cap;
+      }
+    }
+    let _sparkInstCount = 0;
     for (let i = sparks.length - 1; i >= 0; i--) {
       const s = sparks[i];
       // Position update scaled so sparks traverse a similar fraction of
@@ -2532,13 +2886,29 @@ function frame(now) {
       }
       const a = Math.max(0, s.life);
       const radius = s.r * viewportScale * (s.kind === 'bass' ? 1 + (1 - s.life) * 0.4 : 1);
-      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, radius * 5);
-      g.addColorStop(0, 'rgba(255,255,255,' + (0.9 * a) + ')');
-      g.addColorStop(1, 'rgba(255,255,255,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, radius * 5, 0, Math.PI * 2);
-      ctx.fill();
+      if (_lattUseGL) {
+        // Pack (x, y, drawRadius, alpha). drawRadius is radius*5 to match
+        // the original ctx.arc(s.x, s.y, radius * 5, ...).
+        const off = _sparkInstCount * 4;
+        _sparkInstData[off]     = s.x;
+        _sparkInstData[off + 1] = s.y;
+        _sparkInstData[off + 2] = radius * 5;
+        _sparkInstData[off + 3] = a;
+        _sparkInstCount++;
+      } else {
+        // Canvas2D fallback: original per-spark radial gradient + arc.
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, radius * 5);
+        g.addColorStop(0, 'rgba(255,255,255,' + (0.9 * a) + ')');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, radius * 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    if (_lattUseGL && _sparkInstCount > 0) {
+      const view = new Float32Array(_sparkInstData.buffer, 0, _sparkInstCount * 4);
+      applySparks(view, _sparkInstCount);
     }
 
     _pmark('latt');
@@ -2567,15 +2937,11 @@ function frame(now) {
     particleCtx.closePath();
     particleCtx.fill();
     if (_lattUseGL) {
-      // GL path: one instanced draw + one composite drawImage instead of
-      // ~700 individual ctx.drawImage stamps. Positions are CSS-pixel,
-      // jitter applied here (the vertex shader centers each quad on the
-      // instance position, so we don't subtract particleHalf like the
-      // Canvas2D path did).
+      // GL path: one instanced draw, accumulates into the shared content
+      // GL canvas alongside sparks (and flyouts, when phase 2b lands).
+      // Composite to main Canvas2D happens once below, after lattice.
       const instanceCount = pts.length >> 1;
       if (_lattInstData === null || _lattInstCapacity < pts.length) {
-        // Grow to next power of two ≥ pts.length so we don't reallocate
-        // every frame as the lattice point count drifts with viewportScale.
         let cap = Math.max(2048, _lattInstCapacity || 2048);
         while (cap < pts.length) cap <<= 1;
         _lattInstData = new Float32Array(cap);
@@ -2586,15 +2952,8 @@ function frame(now) {
         buf[i]     = pts[i]     + (Math.random() - 0.5) * jitter;
         buf[i + 1] = pts[i + 1] + (Math.random() - 0.5) * jitter;
       }
-      // Use a typed-array view of just the live region so bufferData
-      // doesn't upload the unused tail.
       const liveView = new Float32Array(_lattInstData.buffer, 0, pts.length);
       applyLattice(liveView, instanceCount);
-      // Composite the GL output onto the main canvas. The lattice block
-      // runs with globalCompositeOperation = 'lighter' (set up earlier in
-      // the else branch) — additive over additive matches the original.
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.drawImage(lattCanvas, 0, 0, lattCanvas.width, lattCanvas.height, 0, 0, W, H);
     } else {
       // Canvas2D fallback: original 700-stamp loop.
       for (let i = 0; i < pts.length; i += 2) {
@@ -2602,6 +2961,13 @@ function frame(now) {
         const y = pts[i + 1] + (Math.random() - 0.5) * jitter - particleHalf;
         ctx.drawImage(particleCanvas, x, y);
       }
+    }
+    // Single composite of all GL content (sparks + lattice + future
+    // flyouts) onto the main Canvas2D. 'lighter' matches the additive
+    // semantics the GL programs accumulate with internally.
+    if (_lattUseGL) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.drawImage(lattCanvas, 0, 0, lattCanvas.width, lattCanvas.height, 0, 0, W, H);
     }
 
     // Twist used to run here as its own WebGL pass; it now folds into
