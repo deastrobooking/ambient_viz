@@ -416,6 +416,19 @@
     font: inherit;
   }
   .dev-key .x:hover { color: #f55; }
+
+  /* Lite/kiosk mode: hide every DOM overlay so the page is canvas-only
+     and the compositor has no extra layers to merge. On a Pi 4, fewer
+     compositor layers can mean measurably higher fps even when each
+     layer is individually cheap. The dev panel (#dev-overlay) is still
+     toggleable with `d` or `~` for ad-hoc diagnostics during kiosk runs
+     — it starts hidden via the existing `.hidden` class set by JS. */
+  body.lite-kiosk #ui,
+  body.lite-kiosk #drophint,
+  body.lite-kiosk #drop-overlay,
+  body.lite-kiosk #editor,
+  body.lite-kiosk #editor-menu,
+  body.lite-kiosk #timeline-wrap { display: none !important; }
 </style>
 </head>
 <body>
@@ -499,6 +512,7 @@
     </div>
     <div class="dev-section">
       <div class="dev-row"><span class="k">fps</span><span class="v" id="dev-fps">--</span></div>
+      <div class="dev-row" style="display:none"><span class="k">render</span><span class="v" id="dev-prof" style="text-align:left; white-space:pre-wrap; font-size:11px"></span></div>
     </div>
   </div>
 </div>
@@ -1371,9 +1385,85 @@ let last = 0;
 let fpsAccumStart = 0, fpsAccumCount = 0, fpsValue = 0;
 let lastDebugPost = 0;
 
+// === per-section profiling (opt-in via ?profile=1) ===
+// When `profileMode` is set, frame() calls _pmark() between sections; the
+// accumulator sums the deltas per section over a 1s window, then resets.
+// Overhead per frame is ~14 performance.now() calls — measurable on a Pi
+// but only paid when explicitly enabled.
+let profileMode = false;
+// When set, both WebGL passes (dither + twist) are skipped. Engines like
+// WPEWebKit/cog don't currently support `OffscreenCanvas.getContext('webgl')`
+// (even on main), so a `?nogl=1` URL flag plumbs through to here and lets
+// the visualizer render its Canvas2D layers without the GL passes. Visual
+// cost: no dither pattern (just raw lattice/grain), no twist/pinch
+// deformation. Purpose: diagnostic, not a permanent rendering mode.
+let noGL = false;
+const PROFILE_SECTIONS = [
+  'state', 'fly', 'mesh', 'spk', 'latt', 'twst', 'slc',
+  'frz', 'scl', 'grn', 'dth', 'tint', 'inv', 'flsh',
+];
+const profAccum = Object.create(null);
+let profAccumFrames = 0;
+let profAccumStart = 0;
+let profLastMark = 0;
+let profCurSection = '';
+let profReport = '';  // formatted "fly:5.2 latt:3.8 ..." string for debug post
+function _presetFrame(t) {
+  if (!profileMode) return;
+  profLastMark = t;
+  profCurSection = '';
+}
+function _pmark(section) {
+  if (!profileMode) return;
+  const now = performance.now();
+  if (profCurSection) {
+    profAccum[profCurSection] = (profAccum[profCurSection] || 0) + (now - profLastMark);
+  }
+  profCurSection = section;
+  profLastMark = now;
+}
+function _pflush() {
+  if (!profileMode) return;
+  if (profCurSection) {
+    const now = performance.now();
+    profAccum[profCurSection] = (profAccum[profCurSection] || 0) + (now - profLastMark);
+    profCurSection = '';
+  }
+  profAccumFrames++;
+  const now = performance.now();
+  if (now - profAccumStart >= 1000) {
+    const elapsed = now - profAccumStart || 1;
+    const frames = profAccumFrames || 1;
+    // Sort by total ms desc, format as "name:per-frame-ms" (2 decimals).
+    const entries = [];
+    let total = 0;
+    for (const k of PROFILE_SECTIONS) {
+      const v = profAccum[k] || 0;
+      total += v;
+      entries.push([k, v / frames]);
+    }
+    entries.sort((a, b) => b[1] - a[1]);
+    const parts = entries
+      .filter(([, ms]) => ms >= 0.05)
+      .map(([k, ms]) => k + ':' + ms.toFixed(2));
+    profReport = 'total:' + (total / frames).toFixed(2) + 'ms  ' + parts.join('  ');
+    try { console.log('[ambient_viz/profile] fps=' + (frames * 1000 / elapsed).toFixed(1) + '  ' + profReport); } catch (_) {}
+    for (const k of PROFILE_SECTIONS) profAccum[k] = 0;
+    profAccumFrames = 0;
+    profAccumStart = now;
+  }
+}
+
 // === offscreen buffers (created in init) ===
 let particleCanvas, particleCtx;
-let noiseCanvas, noiseCtx, noiseImg;
+// Grain ring: NOISE_RING pre-baked noise tiles built once at startup,
+// cycled per frame. Replaces per-frame regenNoise (~200K Math.random()
+// + putImageData) — was 6–9 ms/frame on Pi 4, now ~0.5 ms (just a
+// drawImage). Per-frame intensity (was: threshold-driven sparse vs.
+// dense pixels) is approximated via globalAlpha modulation.
+const NOISE_RING = 24;
+let noiseRing = [];      // OffscreenCanvas[NOISE_RING]
+let noiseRingIdx = 0;
 let scanlineTile, scanlinePattern;
 let ditherCanvas, ditherGL;
 let _ditherProg, _ditherQuad, _ditherSrcTex, _ditherBayerTex;
@@ -1500,16 +1590,32 @@ function initMeshes3d() {
   ensureMesh3dCount();
 }
 
-function regenNoise(density) {
-  const data = noiseImg.data;
-  const thresh = 0.04 + density * 0.20;
-  for (let i = 0; i < data.length; i += 4) {
-    let v = 0;
-    if (Math.random() < thresh) v = 160 + Math.floor(Math.random() * 95);
-    data[i] = data[i + 1] = data[i + 2] = v;
-    data[i + 3] = 255;
+// Per-frame intensity in the original regenNoise was driven by a
+// population threshold: low density meant sparse populated pixels, high
+// density meant dense populated pixels. The ring buffer bakes at a
+// fixed mid-range threshold; the per-frame intensity envelope is
+// approximated by modulating globalAlpha on drawImage. Visually: the
+// "dense vs sparse" character is lost, replaced by "brighter vs dimmer
+// at uniform density." Acceptable for ambient grain.
+const _NOISE_BAKE_DENSITY = 0.45;  // midpoint of the original 0.25..0.70 range
+function setupNoiseRing() {
+  noiseRing = [];
+  const thresh = 0.04 + _NOISE_BAKE_DENSITY * 0.20;
+  for (let n = 0; n < NOISE_RING; n++) {
+    const oc = new OffscreenCanvas(GRAIN_RES, GRAIN_RES);
+    const octx = oc.getContext('2d');
+    const img = octx.createImageData(GRAIN_RES, GRAIN_RES);
+    const data = img.data;
+    for (let i = 0; i < data.length; i += 4) {
+      let v = 0;
+      if (Math.random() < thresh) v = 160 + Math.floor(Math.random() * 95);
+      data[i] = data[i + 1] = data[i + 2] = v;
+      data[i + 3] = 255;
+    }
+    octx.putImageData(img, 0, 0);
+    noiseRing.push(oc);
   }
-  noiseCtx.putImageData(noiseImg, 0, 0);
+  noiseRingIdx = 0;
 }
 
 function spawnSliceBurst(intensity) {
@@ -1580,9 +1686,7 @@ function setupOffscreens() {
   particleCtx = particleCanvas.getContext('2d');
   rebuildParticleTile();
 
-  noiseCanvas = new OffscreenCanvas(GRAIN_RES, GRAIN_RES);
-  noiseCtx = noiseCanvas.getContext('2d');
-  noiseImg = noiseCtx.createImageData(GRAIN_RES, GRAIN_RES);
+  setupNoiseRing();
 
   rebuildScanlineTile();
 
@@ -1592,6 +1696,13 @@ function setupOffscreens() {
 
 function setupDither() {
   ditherCanvas = new OffscreenCanvas(Math.max(1, Math.ceil(W)), Math.max(1, Math.ceil(H)));
+  if (noGL) {
+    // 2D fallback: leave ditherCanvas as a 2D-backed buffer so the
+    // mono-region pass can still sample from it (it'll sample empty
+    // contents — the mono effect collapses to a no-op).
+    ditherGL = null;
+    return;
+  }
   ditherGL = ditherCanvas.getContext('webgl', {
     preserveDrawingBuffer: true,
     premultipliedAlpha: false,
@@ -1673,6 +1784,7 @@ function setupDither() {
 }
 
 function applyDither(offX, offY) {
+  if (noGL) return;
   const dw = ditherCanvas.width;
   const dh = ditherCanvas.height;
   if (dw <= 0 || dh <= 0) return;
@@ -1752,6 +1864,11 @@ function resizeDither() {
 // nearly twice around relative to the unmoving rim, producing a nested
 // seashell effect.
 function setupTwist() {
+  if (noGL) {
+    twistCanvas = null;
+    twistGL = null;
+    return;
+  }
   twistCanvas = new OffscreenCanvas(Math.max(1, canvas.width), Math.max(1, canvas.height));
   twistGL = twistCanvas.getContext('webgl', {
     preserveDrawingBuffer: true,
@@ -1843,6 +1960,7 @@ function resizeTwist() {
 // Skips when both twist and pinch are negligible — avoids the texture
 // upload + redraw on frames where the effect would be invisible.
 function applyTwist(twist, pinch) {
+  if (noGL) return;
   if (Math.abs(twist) < 1e-4 && pinch < 1e-4) return;
   const dw = twistCanvas.width;
   const dh = twistCanvas.height;
@@ -1883,6 +2001,8 @@ function frame(now) {
     try { console.log('[ambient_viz/render] frames=' + _diagFrameCount + ' W=' + W + ' H=' + H + ' canvas=' + (canvas && canvas.width) + 'x' + (canvas && canvas.height) + ' flyouts=' + flyout.length + ' meshes3d=' + meshes3d.length + ' slices=' + slices.length); } catch (_) {}
     _diagLastLog = now;
   }
+  _presetFrame(performance.now());
+  _pmark('state');
   const dt = Math.min(50, now - last) / 16.67;
   last = now;
   inversionRegions.length = 0;
@@ -2008,10 +2128,12 @@ function frame(now) {
   }
 
   if (freezeFrames > 0) {
+    _pmark('frz');
     restoreFreeze();
     freezeFrames -= dt;
     applyTwist(currentTwist, currentPinch);
   } else {
+    _pmark('fly');
     const fade = 0.06 + 0.05 * (1 - smoothLevel);
     ctx.fillStyle = 'rgba(0,0,0,' + fade + ')';
     ctx.fillRect(0, 0, W, H);
@@ -2075,6 +2197,7 @@ function frame(now) {
       ctx.restore();
     }
 
+    _pmark('mesh');
     // 3D mesh wireframe layer — low-poly cylinder cluster (Renaissance
     // Center). Same flyout-style depth approach: spawn at Z_FAR, advance
     // toward camera scaled by mid energy, alpha curve + energy gating, bass
@@ -2171,6 +2294,7 @@ function frame(now) {
       }
     }
 
+    _pmark('spk');
     for (let i = sparks.length - 1; i >= 0; i--) {
       const s = sparks[i];
       // Position update scaled so sparks traverse a similar fraction of
@@ -2195,6 +2319,7 @@ function frame(now) {
       ctx.fill();
     }
 
+    _pmark('latt');
     const rectW = W;
     const rectH = H;
     const pulseR = (PARTICLE_BASE_R + bassPulse * PARTICLE_PULSE_AMOUNT) * viewportScale;
@@ -2227,8 +2352,10 @@ function frame(now) {
 
     // Pinch + twist sits between the scene content and the bar overlay
     // so slices/scanline/grain layer on top of the deformed image.
+    _pmark('twst');
     applyTwist(currentTwist, currentPinch);
 
+    _pmark('slc');
     if (slices.length) {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2263,6 +2390,7 @@ function frame(now) {
       ctx.restore();
     }
 
+    _pmark('frz');
     if (pendingFreeze) {
       captureFreeze();
       pendingFreeze = false;
@@ -2273,23 +2401,34 @@ function frame(now) {
     }
   }
 
+  _pmark('scl');
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = SCANLINE_ALPHA;
   ctx.fillStyle = scanlinePattern;
   ctx.fillRect(0, 0, W, H);
   ctx.globalAlpha = 1;
 
-  regenNoise(0.25 + smoothTreble * 0.45);
+  _pmark('grn');
+  // Advance ring index; treble-driven envelope is now applied as a
+  // globalAlpha scale around the baked midpoint density (0.45). The
+  // original density-to-alpha curve was 0.25..0.70; scaling by
+  // density/0.45 gives 0.56..1.56, clamped at 1 below.
+  const grainTile = noiseRing[noiseRingIdx];
+  noiseRingIdx = (noiseRingIdx + 1) % NOISE_RING;
+  const grainDensity = 0.25 + smoothTreble * 0.45;
+  const grainAlpha = Math.min(1, GRAIN_ALPHA * (grainDensity / _NOISE_BAKE_DENSITY));
   ctx.globalCompositeOperation = 'lighter';
   ctx.imageSmoothingEnabled = false;
-  ctx.globalAlpha = GRAIN_ALPHA;
-  ctx.drawImage(noiseCanvas, 0, 0, W, H);
+  ctx.globalAlpha = grainAlpha;
+  ctx.drawImage(grainTile, 0, 0, W, H);
   ctx.globalAlpha = 1;
   ctx.imageSmoothingEnabled = true;
   ctx.globalCompositeOperation = 'source-over';
 
+  _pmark('dth');
   applyDither(Math.floor(ditherPhaseX), Math.floor(ditherPhaseY));
 
+  _pmark('tint');
   const tintActive = !(freezeFrames > 0 && freezeMono);
   if (tintActive) {
     const sat = Math.max(0, Math.min(1, saturation));
@@ -2321,6 +2460,7 @@ function frame(now) {
       }
     }
   }
+  _pmark('inv');
   if (inversionRegions.length) {
     ctx.globalCompositeOperation = 'difference';
     ctx.fillStyle = '#fff';
@@ -2340,6 +2480,7 @@ function frame(now) {
     ctx.globalCompositeOperation = 'source-over';
   }
 
+  _pmark('flsh');
   if (pendingFlash) {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2354,6 +2495,8 @@ function frame(now) {
     ctx.restore();
     pendingFlash = null;
   }
+
+  _pflush();
 
   // periodic debug snapshot for the main-thread dev panel
   if (now - lastDebugPost >= 100) {
@@ -2378,6 +2521,7 @@ function frame(now) {
       W, H, dpr,
       bitmapW: canvas.width,
       bitmapH: canvas.height,
+      profReport,
     });
     lastDebugPost = now;
   }
@@ -2429,6 +2573,8 @@ host.onmessage = function (e) {
     dpr = msg.dpr;
     W = msg.W;
     H = msg.H;
+    profileMode = !!msg.profile;
+    noGL = !!msg.noGL;
     recomputeViewport();
     ctx = canvas.getContext('2d');
     canvas.width = Math.floor(W * dpr);
@@ -2442,6 +2588,7 @@ host.onmessage = function (e) {
     initMeshes3d();
     last = performance.now();
     fpsAccumStart = last;
+    profAccumStart = last;
     requestAnimationFrame(frame);
   } else if (msg.type === 'audio') {
     curBass = msg.bass;
@@ -2594,6 +2741,15 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
      navigator.maxTouchPoints > 1) ||
     (typeof DedicatedWorkerGlobalScope === 'undefined' &&
       typeof OffscreenCanvas === 'undefined');
+  // ?nooffscreen=1: force the main-thread renderer regardless of UA. Useful
+  // for engines where OffscreenCanvas is defined but Worker+transferControl
+  // fails silently (e.g. some WPEWebKit builds shipped with cog on Pi).
+  const forceMainRenderer = /[?&]nooffscreen(=|&|$)/.test(location.search);
+  // ?nogl=1: skip both WebGL passes (dither, twist). Diagnostic for
+  // engines where `OffscreenCanvas.getContext('webgl')` fails — visualizer
+  // still renders the Canvas2D layers (lattice, flyouts, slices, sparks,
+  // grain, scanlines, mesh3d).
+  const noGLMode = /[?&]nogl(=|&|$)/.test(location.search);
 
   // ?lite mode: caps the render bitmap to 1280×720 (browser upscales
   // CSS-wise) and sets a sparser lattice. Intended for low-power devices
@@ -2601,6 +2757,13 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   const liteMode = /[?&]lite(=|&|$)/.test(location.search);
   const LITE_MAX_W = 1280;
   const LITE_MAX_H = 720;
+  if (liteMode) document.body.classList.add('lite-kiosk');
+
+  // ?profile=1: enable per-section render timing inside the worker. The
+  // worker posts a formatted "total:Xms latt:1.2 grn:0.8 ..." breakdown
+  // in its debug snapshot; the dev panel shows it under fps and the
+  // worker also console.logs it once per second.
+  const profileMode = /[?&]profile(=|&|$)/.test(location.search);
 
   const canvas = document.getElementById('c');
   // Render is owned by a Worker that controls the canvas via OffscreenCanvas
@@ -2624,6 +2787,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     activeSilhouette: 'car',
     saturation: 1.0,
     FREEZE_FRAMES_MAX: 12,
+    profReport: '',
   };
   // Posts a single param change to the worker (used by sliders + automation
   // lanes via PARAMS.X.setLive). No-op until the worker is up.
@@ -3698,6 +3862,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     sliceAng: document.getElementById('dev-slice-ang'),
     freeze: document.getElementById('dev-freeze'),
     fps: document.getElementById('dev-fps'),
+    prof: document.getElementById('dev-prof'),
   };
   const PALETTE_NAMES = ['green', 'red', 'purple', 'blue', 'b&w'];
 
@@ -3725,9 +3890,15 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   devHeader.addEventListener('pointerup', endDevDrag);
   devHeader.addEventListener('pointercancel', endDevDrag);
   devClose.addEventListener('click', () => devOverlay.classList.add('hidden'));
+  // In lite/kiosk mode the dev panel is hidden by default so it doesn't
+  // add a compositor layer; `d` / `~` / backtick toggle it back when
+  // needed for ad-hoc diagnostics.
+  if (liteMode) devOverlay.classList.add('hidden');
   window.addEventListener('keydown', e => {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
-    if (e.key === 'd' || e.key === 'D') devOverlay.classList.toggle('hidden');
+    if (e.key === 'd' || e.key === 'D' || e.key === '~' || e.key === '`') {
+      devOverlay.classList.toggle('hidden');
+    }
   });
 
   // Mirror of constants/data from the worker, used only by updateDebug for
@@ -3778,6 +3949,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       : '0') + ` (max=${wd.FREEZE_FRAMES_MAX})`;
     devEls.fps.textContent = wd.fpsValue.toFixed(0)
       + ` (${wd.W || '?'}×${wd.H || '?'} bm:${wd.bitmapW || '?'}×${wd.bitmapH || '?'})`;
+    if (devEls.prof) {
+      if (wd.profReport) {
+        devEls.prof.parentElement.style.display = '';
+        devEls.prof.textContent = wd.profReport;
+      } else {
+        devEls.prof.parentElement.style.display = 'none';
+      }
+    }
   }
 
   // --- visual automation editor (bottom strip) ---
@@ -3844,6 +4023,10 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     document.body.classList.toggle('editor-visible', v);
     if (v) resizeEditor();
   }
+  // Kiosk / lite mode: the automation lane strip is dev tooling, not part
+  // of the kiosk view. Hide it by default. The `t` shortcut still toggles
+  // it back if needed.
+  if (liteMode) setEditorVisible(false);
 
   // Visible time window in seconds. Defaults to 0..60; wheel zooms; ruler
   // drag scrubs. Each frame the window slides to keep the playhead centered
@@ -4494,12 +4677,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         if (mainHandler) mainHandler({ data: msg });
       },
     };
-    console.log('[ambient_viz] posting init', { dpr, W, H });
+    console.log('[ambient_viz] posting init', { dpr, W, H, profileMode });
     renderWorker.postMessage({
       type: 'init',
       canvas: canvas,
       dpr, W, H,
       params: _initParams,
+      profile: profileMode,
+      noGL: noGLMode,
     });
     console.log('[ambient_viz] main renderer init complete');
   }
@@ -4518,10 +4703,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       canvas: _offscreen,
       dpr, W, H,
       params: _initParams,
+      profile: profileMode,
+      noGL: noGLMode,
     }, [_offscreen]);
   }
 
-  if (isiOS) {
+  if (isiOS || forceMainRenderer) {
     try {
       bootstrapMainRenderer();
     } catch (e) {
