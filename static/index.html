@@ -3909,7 +3909,7 @@ function frame(now) {
     // Floor saturation at 20% while a touch envelope is active, so the
     // touched electrode's color is always at least faintly visible even
     // if the user/timeline has saturation dialed to 0.
-    const SAT_TOUCH_FLOOR = 0.2;
+    const SAT_TOUCH_FLOOR = 0.5;
     const satRaw = Math.max(0, Math.min(1, saturation));
     const sat = Math.max(satRaw, SAT_TOUCH_FLOOR * touchActive);
     const effR = 255 - (255 - tintR) * sat;
