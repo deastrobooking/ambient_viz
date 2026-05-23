@@ -3311,15 +3311,10 @@ function frame(now) {
   }
 
   const b = { bass: curBass, mid: curMid, treble: curTreble, level: curLevel, bassFast: curBassFast };
-  // dt-correct exponential smoothing. dt is in 60fps-frames; tau values
-  // chosen so per-frame coefficient at 60fps matches the previous fixed
-  // coefficients (0.08/0.15/0.20/0.30) — i.e. behavior unchanged at 60fps,
-  // but a 30fps Pi now sees the same time constants in wall-clock terms
-  // instead of moving twice as far per frame (which read as flicker).
-  smoothLevel  += (b.level  - smoothLevel)  * (1 - Math.exp(-dt / 12));
-  smoothBass   += (b.bass   - smoothBass)   * (1 - Math.exp(-dt / 6));
-  smoothMid    += (b.mid    - smoothMid)    * (1 - Math.exp(-dt / 4.5));
-  smoothTreble += (b.treble - smoothTreble) * (1 - Math.exp(-dt / 3));
+  smoothLevel += (b.level - smoothLevel) * 0.08;
+  smoothBass += (b.bass - smoothBass) * 0.15;
+  smoothMid += (b.mid - smoothMid) * 0.20;
+  smoothTreble += (b.treble - smoothTreble) * 0.30;
 
   // Palette baseline lerp — unchanged behavior when no electrodes are touched.
   const tintTarget = COLOR_PALETTE[colorIndex];
