@@ -3311,10 +3311,10 @@ function frame(now) {
   }
 
   const b = { bass: curBass, mid: curMid, treble: curTreble, level: curLevel, bassFast: curBassFast };
-  smoothLevel += (b.level - smoothLevel) * 0.08;
-  smoothBass += (b.bass - smoothBass) * 0.15;
-  smoothMid += (b.mid - smoothMid) * 0.20;
-  smoothTreble += (b.treble - smoothTreble) * 0.30;
+  smoothLevel += (b.level - smoothLevel) * 0.05;
+  smoothBass += (b.bass - smoothBass) * 0.10;
+  smoothMid += (b.mid - smoothMid) * 0.14;
+  smoothTreble += (b.treble - smoothTreble) * 0.20;
 
   // Palette baseline lerp — unchanged behavior when no electrodes are touched.
   const tintTarget = COLOR_PALETTE[colorIndex];
