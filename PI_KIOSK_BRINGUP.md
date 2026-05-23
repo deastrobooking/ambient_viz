@@ -240,10 +240,11 @@ in `config.py` — add it there when you know the numbers).
 (start the Node bridge in another terminal first). Each electrode
 fades a distinct color into the screen's color overlay when touched
 (E0=red, E1=orange, E2=yellow, E3=lime, E4=green, E5=teal, E6=cyan,
-E7=blue, E8=purple, E9=magenta, E10=pink, E11=white). Rise τ ≈ 1.6 s,
-fall τ ≈ 3.7 s — give a touch a few seconds of hold and a few seconds
-of release to see the shift settle. Multiple simultaneous touches
-blend by weighted average.
+E7=blue, E8=purple, E9=magenta, E10=pink, E11=white). Default rise
+τ = 8 s, fall τ = 18 s — first noticeable shift takes a few seconds
+of hold; full settling takes 15-25 s. Multiple simultaneous touches
+blend by weighted average. Live-tunable from the dev panel via the
+`touchRiseS` / `touchFallS` sliders.
 
 If `touch_mask` is updating in the SSE stream but the tint isn't
 shifting, check the DevTools console for `window.AMBIENT_INPUTS.touch_mask`
@@ -251,10 +252,10 @@ shifting, check the DevTools console for `window.AMBIENT_INPUTS.touch_mask`
 wrong host, opened via `file://`). The mask flows main → worker on
 every rAF in the `audio` postMessage; no separate channel.
 
-Tuning: time constants and per-electrode colors live in the worker
-source in `static/index.html` (`TOUCH_COLORS`, `TOUCH_RISE_S`,
-`TOUCH_FALL_S`). They're not exposed as PARAM sliders yet — edit
-inline if a color or pace needs to change.
+Tuning: rise/fall time constants are dev-panel sliders (and
+timeline-automatable). Per-electrode colors are still inline in the
+worker source (`TOUCH_COLORS` in `static/index.html`) — edit if you
+need to recolor.
 
 ---
 

@@ -688,10 +688,10 @@ const TOUCH_COLORS = [
   [255, 255, 255],  // E11 white
 ];
 const TOUCH_ENV = new Float32Array(12);
-// Time constants in real seconds (not 60fps-frames — keep this in mind
-// when comparing to other smoothing constants in this file).
-const TOUCH_RISE_S = 1.6;
-const TOUCH_FALL_S = 3.7;
+// Time constants in real seconds (not 60fps-frames). `let` so they can be
+// hot-tuned via the PARAM message channel from the dev panel.
+let TOUCH_RISE_S = 8.0;
+let TOUCH_FALL_S = 18.0;
 let TOUCH_MASK = 0;
 // Palette-driven baseline tint (existing slow drift). The final tintR/G/B
 // is a mix of this and the touch overlay, recomputed each frame.
@@ -3310,7 +3310,12 @@ function frame(now) {
   }
   _presetFrame(performance.now());
   _pmark('state');
-  const dt = Math.min(50, now - last) / 16.67;
+  // `now` is performance.now() in milliseconds. dt is normalised to
+  // 60fps-frame units (≈1.0 at 60fps); dtSec is the raw elapsed seconds.
+  // Both clamp to 50ms so a tab-switch hiccup doesn't blow up animations.
+  const dtMs = Math.min(50, now - last);
+  const dt = dtMs / 16.67;
+  const dtSec = dtMs / 1000;
   last = now;
   inversionRegions.length = 0;
   monoRegions.length = 0;
@@ -3337,9 +3342,8 @@ function frame(now) {
 
   // MPR121 touch envelopes: rise while bit set, decay when cleared.
   // Weighted-average their colors, then mix with the palette baseline by
-  // the total envelope weight (capped at 1). `dt` in this file is in
-  // 60fps-frames, so convert to seconds for the (seconds-based) taus.
-  const dtSec = dt / 60;
+  // the total envelope weight (capped at 1). Taus are real seconds; dtSec
+  // is computed at the top of frame() from raw elapsed ms.
   let _tR = 0, _tG = 0, _tB = 0, _tW = 0;
   for (let i = 0; i < 12; i++) {
     const target = (TOUCH_MASK >> i) & 1;
@@ -4039,6 +4043,8 @@ function applyParam(name, v) {
     case 'twistSpringHz': TWIST_SPRING_HZ = Math.max(0.05, v); break;
     case 'bpm': CURRENT_BPM = Math.max(1, v); break;
     case 'ditherAmount': DITHER_AMOUNT = Math.max(0, Math.min(1, v)); break;
+    case 'touchRiseS': TOUCH_RISE_S = Math.max(0.1, v); break;
+    case 'touchFallS': TOUCH_FALL_S = Math.max(0.1, v); break;
   }
 }
 function applyParams(p) {
@@ -4899,6 +4905,18 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       min: 0, max: 1, step: 0.01,
       fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('ditherAmount', v),
+    },
+    touchRiseS: {
+      type: 'continuous', def: 8.0,
+      min: 0.5, max: 60, step: 0.5,
+      fmt: v => v.toFixed(1) + ' s', editor: true,
+      setLive: v => setParam('touchRiseS', v),
+    },
+    touchFallS: {
+      type: 'continuous', def: 18.0,
+      min: 0.5, max: 120, step: 0.5,
+      fmt: v => v.toFixed(1) + ' s', editor: true,
+      setLive: v => setParam('touchFallS', v),
     },
     scanlineAlpha: {
       type: 'continuous', def: 0.42,
