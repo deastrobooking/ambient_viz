@@ -240,9 +240,9 @@ in `config.py` — add it there when you know the numbers).
 (start the Node bridge in another terminal first). Each electrode
 fades a distinct color into the screen's color overlay when touched
 (E0=red, E1=orange, E2=yellow, E3=lime, E4=green, E5=teal, E6=cyan,
-E7=blue, E8=purple, E9=magenta, E10=pink, E11=white). Rise τ ≈ 12 s,
-fall τ ≈ 28 s — the tint shift is meant to be slow and ambient, so
-give a touch at least 10–20 s of hold before declaring it broken.
+E7=blue, E8=purple, E9=magenta, E10=pink, E11=white). Rise τ ≈ 96 s,
+fall τ ≈ 224 s — the tint shift is meant to be very slow and ambient,
+so hold a touch for at least a minute before declaring it broken.
 Multiple simultaneous touches blend by weighted average.
 
 If `touch_mask` is updating in the SSE stream but the tint isn't
