@@ -236,6 +236,25 @@ settles, per-channel thresholds can be tuned in `sensors/touch.py`
 via the Adafruit library's `_set_thresholds()` (not currently exposed
 in `config.py` — add it there when you know the numbers).
 
+**Visualizer effect:** Open `http://<pi-ip>:8080/` in a browser
+(start the Node bridge in another terminal first). Each electrode
+fades a distinct color into the screen's color overlay when touched
+(E0=red, E1=orange, E2=yellow, E3=lime, E4=green, E5=teal, E6=cyan,
+E7=blue, E8=purple, E9=magenta, E10=pink, E11=white). Rise τ ≈ 1.5 s,
+fall τ ≈ 3.5 s — give it a couple of seconds after touch/release to
+register. Multiple simultaneous touches blend by weighted average.
+
+If `touch_mask` is updating in the SSE stream but the tint isn't
+shifting, check the DevTools console for `window.AMBIENT_INPUTS.touch_mask`
+— if it's stuck at 0, the browser isn't seeing SSE events (firewall,
+wrong host, opened via `file://`). The mask flows main → worker on
+every rAF in the `audio` postMessage; no separate channel.
+
+Tuning: time constants and per-electrode colors live in the worker
+source in `static/index.html` (`TOUCH_COLORS`, `TOUCH_RISE_S`,
+`TOUCH_FALL_S`). They're not exposed as PARAM sliders yet — edit
+inline if a color or pace needs to change.
+
 ---
 
 ## Phase 6 — PIR alone (AM312)

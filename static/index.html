@@ -529,7 +529,7 @@
 // or a main-thread host (direct calls).
 // Receives via host.onmessage:
 //   - 'init' { canvas, dpr, W, H, params }
-//   - 'audio' { bass, mid, treble, level, bassFast } each main rAF
+//   - 'audio' { bass, mid, treble, level, bassFast, touch_mask } each main rAF
 //   - 'param' { name, value }   /  'params' { values }
 //   - 'resize' { W, H, dpr }
 // Posts back via host.postMessage:
@@ -660,6 +660,38 @@ let SLICE_BURST_SCALE = 1.0;
 let FREEZE_FRAMES_MAX = 12;
 let saturation = 1.0;
 let activeSilhouette = 'car';
+
+// === MPR121 touch → color overlay ===
+// One color per electrode E0..E11. While an electrode is touched its
+// envelope ramps up; on release it decays. The weighted sum of active
+// envelopes biases the final tint away from the palette color and
+// toward the touched electrode's color.
+//
+// Time constants are intentionally slow — kiosk feels meditative, not
+// reactive. Fall is slower than rise so released touches linger.
+const TOUCH_COLORS = [
+  [255,  40,  60],  // E0  red
+  [255, 130,  20],  // E1  orange
+  [255, 240,  40],  // E2  yellow
+  [160, 255,  40],  // E3  lime
+  [  0, 255,  65],  // E4  green
+  [  0, 220, 180],  // E5  teal
+  [  0, 200, 255],  // E6  cyan
+  [ 60, 110, 255],  // E7  blue
+  [180,  30, 255],  // E8  purple
+  [255,  40, 220],  // E9  magenta
+  [255, 130, 200],  // E10 pink
+  [255, 255, 255],  // E11 white
+];
+const TOUCH_ENV = new Float32Array(12);
+const TOUCH_RISE_S = 1.5;
+const TOUCH_FALL_S = 3.5;
+let TOUCH_MASK = 0;
+// Palette-driven baseline tint (existing slow drift). The final tintR/G/B
+// is a mix of this and the touch overlay, recomputed each frame.
+let paletteTintR = COLOR_PALETTE[0][0];
+let paletteTintG = COLOR_PALETTE[0][1];
+let paletteTintB = COLOR_PALETTE[0][2];
 
 // === silhouette helpers (mirrored from main; produce normalized polylines) ===
 function _circle(cx, cy, r, n) {
@@ -3282,11 +3314,38 @@ function frame(now) {
   smoothMid += (b.mid - smoothMid) * 0.20;
   smoothTreble += (b.treble - smoothTreble) * 0.30;
 
+  // Palette baseline lerp — unchanged behavior when no electrodes are touched.
   const tintTarget = COLOR_PALETTE[colorIndex];
   const tintLerp = Math.min(1, COLOR_LERP * dt);
-  tintR += (tintTarget[0] - tintR) * tintLerp;
-  tintG += (tintTarget[1] - tintG) * tintLerp;
-  tintB += (tintTarget[2] - tintB) * tintLerp;
+  paletteTintR += (tintTarget[0] - paletteTintR) * tintLerp;
+  paletteTintG += (tintTarget[1] - paletteTintG) * tintLerp;
+  paletteTintB += (tintTarget[2] - paletteTintB) * tintLerp;
+
+  // MPR121 touch envelopes: rise while bit set, decay when cleared.
+  // Weighted-average their colors, then mix with the palette baseline by
+  // the total envelope weight (capped at 1).
+  let _tR = 0, _tG = 0, _tB = 0, _tW = 0;
+  for (let i = 0; i < 12; i++) {
+    const target = (TOUCH_MASK >> i) & 1;
+    const tau = target ? TOUCH_RISE_S : TOUCH_FALL_S;
+    TOUCH_ENV[i] += (target - TOUCH_ENV[i]) * (1 - Math.exp(-dt / tau));
+    const e = TOUCH_ENV[i];
+    if (e > 0.001) {
+      const c = TOUCH_COLORS[i];
+      _tR += c[0] * e; _tG += c[1] * e; _tB += c[2] * e; _tW += e;
+    }
+  }
+  if (_tW > 0) {
+    const s = Math.min(1, _tW);
+    const mR = _tR / _tW, mG = _tG / _tW, mB = _tB / _tW;
+    tintR = paletteTintR + (mR - paletteTintR) * s;
+    tintG = paletteTintG + (mG - paletteTintG) * s;
+    tintB = paletteTintB + (mB - paletteTintB) * s;
+  } else {
+    tintR = paletteTintR;
+    tintG = paletteTintG;
+    tintB = paletteTintB;
+  }
 
   const bassRise = Math.max(0, b.bassFast - prevBass);
   prevBass = b.bassFast;
@@ -3994,6 +4053,7 @@ host.onmessage = function (e) {
     curTreble = msg.treble;
     curLevel = msg.level;
     curBassFast = msg.bassFast;
+    if (typeof msg.touch_mask === 'number') TOUCH_MASK = msg.touch_mask | 0;
   } else if (msg.type === 'params') {
     applyParams(msg.values);
   } else if (msg.type === 'param') {
@@ -6207,6 +6267,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         treble: b.treble,
         level: b.level,
         bassFast: b.bassFast,
+        touch_mask: (window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.touch_mask) | 0,
       });
     }
     updateDebug();
