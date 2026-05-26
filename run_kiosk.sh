@@ -4,9 +4,9 @@
 #
 # Usage: ./run_kiosk.sh [extra args for python -m ambient_kiosk]
 #
-# Default sidecar args: --no-pir --no-breath --no-touch  (distance-only,
-# per PI_KIOSK_BRINGUP.md phase 4). Pass your own to override, e.g.:
-#   ./run_kiosk.sh                       # distance only
+# Default sidecar args: --no-pir --no-breath  (distance + touch enabled).
+# Pass your own to override, e.g.:
+#   ./run_kiosk.sh                       # distance + touch
 #   ./run_kiosk.sh --mock                # synthetic data, no hardware
 #   ./run_kiosk.sh                       # (all sensors) — when other phases come online
 #
@@ -20,8 +20,15 @@ cd "$ROOT"
 if [ "$#" -gt 0 ]; then
   SIDECAR_ARGS=("$@")
 else
-  SIDECAR_ARGS=("--no-pir" "--no-breath" "--no-touch")
+  SIDECAR_ARGS=("--no-pir" "--no-breath")
 fi
+
+# URL the browser should open. distanceToBitmap=on wires the VL53L1X
+# distance reading to scale the bitmap (resolution drops as someone
+# approaches). The toggle's dev-panel control is unreachable in lite
+# mode, so the URL param is the kiosk-launch mechanism.
+PORT_FOR_URL="${PORT:-8080}"
+KIOSK_URL="http://localhost:${PORT_FOR_URL}/?distanceToBitmap=on"
 
 # Prefer the project venv; fall back to whatever python is on PATH (the
 # Pi README's `pip install -e .` flow can target system Python).
@@ -44,6 +51,8 @@ cleanup() {
   wait 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT
+
+echo "[run] open: $KIOSK_URL"
 
 (cd "$ROOT/server" && exec node src/index.js 2>&1) | prefix "node" &
 PIDS+=($!)

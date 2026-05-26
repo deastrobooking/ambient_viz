@@ -5519,6 +5519,17 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       }
     } catch (_) {}
   })();
+  // URL override for distanceToBitmap, e.g. ?distanceToBitmap=on.
+  // Wins over localStorage. Useful for the kiosk launch URL where the
+  // dev panel is hidden by ?lite=1 and the dropdown is unreachable.
+  {
+    const m = location.search.match(/[?&]distanceToBitmap=(on|off)\b/);
+    if (m && (m[1] === 'on' || m[1] === 'off')) {
+      manual.distanceToBitmap = m[1];
+      if (paramCtrls.distanceToBitmap) paramCtrls.distanceToBitmap.apply(m[1]);
+      PARAMS.distanceToBitmap.setLive(m[1]);
+    }
+  }
   renderKeys();
   const devEls = {
     tint: document.getElementById('dev-tint'),
