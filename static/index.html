@@ -5241,8 +5241,10 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     // every other DOM overlay) — so a kiosk run can show state without
     // remote-debugging the browser.
     if (_distbmDbgEl) {
+      const rawDist = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_cm;
       _distbmDbgEl.textContent =
         'toggle=' + manual.distanceToBitmap +
+        ' raw=' + (typeof rawDist === 'number' ? rawDist.toFixed(1) : '-') +
         ' d=' + (typeof _smoothedDistance === 'number' ? _smoothedDistance.toFixed(1) : '-') +
         ' ceil=' + (resolvedBitmap !== null ? resolvedBitmap : '-') +
         ' eff=' + (_dbgEffective !== null ? _dbgEffective : '-') +
