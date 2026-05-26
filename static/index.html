@@ -5114,8 +5114,19 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   const DISTANCE_BITMAP_NEAR_CM = 25;
   const DISTANCE_BITMAP_FAR_CM = 100;
   const DISTANCE_BITMAP_MIN = 64;
-  const DISTANCE_BITMAP_QUANTIZE = 10;
+  const DISTANCE_BITMAP_QUANTIZE = 20;
   let _lastEffectiveBitmap = null;
+
+  // Browser-side EMA on the SSE distance value. Python publishes at 50 Hz
+  // with its own α=0.25 EMA (~80 ms time constant), which is too responsive
+  // for bitmap: every quantized step is a full GPU realloc + slice reset,
+  // so micro-jitter reads as a glitchy wipe. Smoothing here adds a ~0.6 s
+  // tau so small wobble stays inside one quantization bucket. Used by both
+  // the twist and bitmap paths; the twist mapping doesn't strictly need it
+  // but the resulting motion feels more in-keeping with the aesthetic.
+  const DISTANCE_SMOOTH_TAU_S = 0.6;
+  let _smoothedDistance = null;
+  let _lastDistanceSmoothT = 0;
 
   // Resolve every parameter's live value for the current playback time.
   // Lane-driven if keys exist; falls back to manual otherwise. Always called
@@ -5134,7 +5145,23 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     // When no SSE distance is published (sensor offline / not yet wired),
     // gain stays 1 so the visualizer behaves as if the sensor weren't there.
     let twistGain = 1;
-    const d = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_cm;
+    // dt-based EMA so the smoothing tau is wall-clock-correct even if
+    // applyAutomation runs at varying frame rates or skips a tick.
+    const dRaw = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_cm;
+    if (typeof dRaw === 'number') {
+      const now = performance.now() / 1000;
+      const dt = (_lastDistanceSmoothT > 0)
+        ? Math.max(0, Math.min(0.5, now - _lastDistanceSmoothT))
+        : 0;
+      _lastDistanceSmoothT = now;
+      if (_smoothedDistance === null || dt === 0) {
+        _smoothedDistance = dRaw;
+      } else {
+        const a = 1 - Math.exp(-dt / DISTANCE_SMOOTH_TAU_S);
+        _smoothedDistance = a * dRaw + (1 - a) * _smoothedDistance;
+      }
+    }
+    const d = _smoothedDistance;
     if (typeof d === 'number') {
       if (d <= DISTANCE_TWIST_NEAR_CM) {
         twistGain = 1;
