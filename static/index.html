@@ -5082,6 +5082,13 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     return k0.v + (k1.v - k0.v) * f;
   }
 
+  // Distance→maxTwistDeg scaling thresholds. At/below NEAR_CM, the
+  // authored ceiling (slider/lane value) is used as-is. At/above FAR_CM,
+  // maxTwistDeg goes to zero. In between, a quadratic ease-in per
+  // hardware-handoff.md §VL53L1X: gain = 1 - ((d - NEAR) / (FAR - NEAR))².
+  const DISTANCE_TWIST_NEAR_CM = 25;
+  const DISTANCE_TWIST_FAR_CM = 100;
+
   // Resolve every parameter's live value for the current playback time.
   // Lane-driven if keys exist; falls back to manual otherwise. Always called
   // when audio is loaded, so a value is written every frame — that's how
@@ -5093,15 +5100,35 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   function applyAutomation(t) {
     let dirty = false;
     for (const k in _automationBatch) delete _automationBatch[k];
+    // VL53L1X distance gain: 1.0 close (≤25cm), 0.0 far (≥100cm), quadratic
+    // ease-in between. Multiplies the authored maxTwistDeg before posting
+    // to the worker — slider/lane authoring still sees the ceiling value.
+    // When no SSE distance is published (sensor offline / not yet wired),
+    // gain stays 1 so the visualizer behaves as if the sensor weren't there.
+    let twistGain = 1;
+    const d = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_cm;
+    if (typeof d === 'number') {
+      if (d <= DISTANCE_TWIST_NEAR_CM) {
+        twistGain = 1;
+      } else if (d >= DISTANCE_TWIST_FAR_CM) {
+        twistGain = 0;
+      } else {
+        const x = (d - DISTANCE_TWIST_NEAR_CM) /
+                  (DISTANCE_TWIST_FAR_CM - DISTANCE_TWIST_NEAR_CM);
+        twistGain = 1 - x * x;
+      }
+    }
     for (const name of PARAM_NAMES) {
       const lane = lanes[name];
       const v = (lane.length > 0)
         ? evalLane(PARAMS[name].type, lane, t)
         : manual[name];
       if (v === undefined) continue;
-      _automationBatch[name] = v;
-      dirty = true;
       if (paramCtrls[name]) paramCtrls[name].apply(v);
+      _automationBatch[name] = (name === 'maxTwistDeg' && typeof v === 'number')
+        ? v * twistGain
+        : v;
+      dirty = true;
     }
     if (dirty && renderWorker) {
       renderWorker.postMessage({ type: 'params', values: _automationBatch });
