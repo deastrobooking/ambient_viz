@@ -162,18 +162,42 @@ appear; that's also fine.)
 
 ## Phase 4 — Distance sensor alone (VL53L1X)
 
-Start the Node bridge in one terminal:
+**Standalone hardware check first** — bypass the kiosk stack to confirm
+the sensor reads accurately before involving the SSE pipeline:
+
+```sh
+cd ~/ambient_viz/python && source .venv/bin/activate
+python test_vl53l1x.py
+```
+
+Prints live readings + rolling 1 s mean/stddev. Hold a target steady
+at known distances (tape measure) and confirm the mean tracks within
+~2 cm at 30 cm, ~5 cm at 100 cm. If this script reports accurate
+values but the SSE feed (later) reads differently, the divergence is
+in the sidecar smoothing — see `SENSOR_MAPPING.md`.
+
+**Two-process launch** — Node bridge in one terminal, sidecar in
+another:
 
 ```sh
 cd ~/ambient_viz/server && node src/index.js
 ```
 
-Start the sidecar with only the distance driver enabled:
-
 ```sh
 cd ~/ambient_viz/python && source .venv/bin/activate
 python -m ambient_kiosk --no-pir --no-breath --no-touch
 ```
+
+Or use the convenience launcher from the repo root:
+
+```sh
+./run_kiosk.sh
+```
+
+`run_kiosk.sh` starts both, interleaves their logs with `[node]` /
+`[py  ]` prefixes, propagates Ctrl-C, and echoes the recommended
+browser URL (with `?distanceToBitmap=on`) at startup. Default sidecar
+args have `--no-pir --no-breath`; pass overrides as positional args.
 
 You should see in the sidecar log:
 
@@ -477,7 +501,7 @@ For Chromium kiosk autostart, add to `~/.config/autostart/kiosk.desktop`:
 [Desktop Entry]
 Type=Application
 Name=ambient_viz kiosk
-Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required http://localhost:8080/?lite=1&bitmap=360
+Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required http://localhost:8080/?lite=1&bitmap=360&distanceToBitmap=on
 X-GNOME-Autostart-enabled=true
 ```
 
@@ -489,6 +513,10 @@ per-frame WebGL texture uploads (dither + twist passes); rendering at
 fps. Aesthetic cost: chunky dither / CRT-y look, which fits the
 visualizer's vibe. Try `bitmap=480` if you want a sharper look at the
 cost of fps, or drop both flags entirely if your Pi handles native res.
+`?distanceToBitmap=on` wires the VL53L1X reading to scale the bitmap
+ceiling down to 64 px as someone approaches — see `SENSOR_MAPPING.md`
+for the full mapping. Append `&debug=1` to surface a diagnostic
+overlay that survives lite mode.
 
 ---
 

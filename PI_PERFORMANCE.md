@@ -227,14 +227,20 @@ Set `flashTrigger` very high (e.g. `0.5`) so it effectively never fires.
 | Flag | Effect |
 |---|---|
 | `?lite=1` | Hides all DOM overlays (UI, timeline, editor, drop hints) so the compositor merges only the canvas. Caps bitmap to 1280×720. Bumps `LATTICE_SPACING` 24 → 36 |
-| `?bitmap=N` | Caps render bitmap height to N px. Width scales with viewport aspect. Browser upscales to fill display. **Highest-leverage knob on Pi 4** — GPU bandwidth scales with bitmap² |
+| `?bitmap=N` | Caps render bitmap height to N px. Width scales with viewport aspect. Browser upscales to fill display. **Highest-leverage knob on Pi 4** — GPU bandwidth scales with bitmap². Also exposed as the `bitmapHeight` PARAMS slider so it can be tuned at runtime; the URL sets the initial ceiling |
+| `?distanceToBitmap=on` | Wires the VL53L1X reading to scale `bitmapHeight` from the authored ceiling down to a 64 px floor as someone approaches. Off by default; URL param wins over localStorage. See `SENSOR_MAPPING.md` |
+| `?debug=1` | Shows a small top-right diagnostic overlay (toggle / raw distance / smoothed distance / effective bitmap / twistGain). Works in lite mode. See `SENSOR_MAPPING.md` |
 | `?profile=1` | Enables per-section worker render timing. Logs to console once/sec and shows in dev panel. Cost: ~14 `performance.now()` calls/frame |
 | `?nogl=1` | Skips dither + twist WebGL passes. Diagnostic for engines that can't get a WebGL context on `OffscreenCanvas` (e.g. cog/WPEWebKit). Visual cost: no dither, no twist |
 | `?nooffscreen=1` | Forces main-thread renderer (worker path is the default). For engines where `transferControlToOffscreen` fails silently |
 
-**Pi 4 kiosk recommended:** `?lite=1&bitmap=360`. Gets to acceptable fps
-by reducing WebGL texture upload bandwidth ~4×. Chunky dither aesthetic
-is on-brand.
+**Pi 4 kiosk recommended:** `?lite=1&bitmap=360&distanceToBitmap=on`.
+The `bitmap=360` baseline gets to acceptable fps by reducing WebGL
+texture upload bandwidth ~4×. Chunky dither aesthetic is on-brand.
+`distanceToBitmap=on` drops the bitmap further when someone is close
+to the sensor — perf cost during approach is offset by the smaller
+bitmap making the GPU faster, so the visual response feels snappy
+even though resolution drops.
 
 To go further: lower `bitmap` (`240`?), disable mesh3d (slider:
 `mesh3dCount → 0`), reduce `FLYOUT_COUNT` (constant in

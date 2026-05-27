@@ -27,6 +27,11 @@ Venetian Snares.
 - `PI_KIOSK_BRINGUP.md` — phased runbook for taking a bare Pi 4 to all
   four sensors streaming into the visualizer, with a verification step
   between each phase.
+- `SENSOR_MAPPING.md` — how live sensor readings drive visualizer
+  parameters (distance → twist amplitude, distance → bitmap
+  resolution, etc.). Covers smoothing semantics, URL flags
+  (`?distanceToBitmap=on`, `?debug=1`), tuning knobs, and the
+  diagnostic overlay.
 
 ## Two ways to run
 
@@ -44,6 +49,11 @@ input or drag-drop; mic input is supported but doesn't play audio out
    HR202+TLC555     CircuitPython
    MPR121
 ```
+
+Convenience launcher: `./run_kiosk.sh` starts both the Node bridge
+and the Python sidecar with interleaved `[node]`/`[py  ]` prefixed
+logs. Hardware bringup is documented in `PI_KIOSK_BRINGUP.md`; the
+sensor-to-visualizer wiring in `SENSOR_MAPPING.md`.
 
 CPU budget on a Pi 4: visualizer takes 2–3 cores under load; Node bridge
 < 0.1% of one core; Python sidecar 1–3%; `pigpiod` 1–3%. The kiosk

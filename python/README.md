@@ -65,10 +65,19 @@ All values land on the SSE bus and become available in the browser as
   setup/teardown shown in the handoff doc's example — at the worst-case
   ~10 kHz edge rate that becomes a meaningful CPU hit. The implementation
   comment explains this.
-- **VL53L1X invalid reads**: `None` from the sensor (no target in cone)
-  decays the smoothed value toward `VL53_FAR_CM` (100 cm) rather than
-  freezing the last valid value. Idle visualizer state is "nobody here,"
-  not "phantom person at 38 cm."
+- **VL53L1X invalid reads**: `None` from the sensor is treated as a
+  dropout, not as "target at FAR." The smoothed value is **held**
+  during brief dropouts (which happen constantly on real targets) and
+  **snaps** to `VL53_FAR_CM` after `NO_TARGET_TIMEOUT_S = 0.6` seconds
+  of continuous silence. This avoids the upward bias the original
+  decay-toward-FAR design introduced into the published `distance_cm`
+  feed. Idle visualizer state is "nobody here," and is reached within
+  ~0.6 s of departure (not 2-3 s as in earlier versions).
+- **VL53L1X bringup**: `python test_vl53l1x.py` is a standalone
+  sanity-check script (talks straight to the sensor library, no
+  sidecar / Node / browser). Prints live readings + rolling 1 s
+  mean/stddev. Use it during Phase 4 of `PI_KIOSK_BRINGUP.md` to
+  validate the sensor before involving the SSE pipeline.
 - **MPR121 baseline auto-cal**: first ~30 s after init, touch behavior
   may be inconsistent while the MPR121 calibrates to its environment.
   The handoff doc flags this.
