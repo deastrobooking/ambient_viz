@@ -10,7 +10,7 @@ dsp = { path = "../dsp" }
 # while master has moved to 0.6.0 — mixing them produces a `links = "embassy-time"`
 # conflict at resolve time. Bump this SHA together with the embassy patch
 # revs in the workspace Cargo.toml.
-daisy-embassy = { git = "https://github.com/daisy-embassy/daisy-embassy", rev = "0a217111c0d47e3ad542bb729343f52dfddee415", features = ["seed"] }
+daisy-embassy = { git = "https://github.com/daisy-embassy/daisy-embassy", rev = "0a217111c0d47e3ad542bb729343f52dfddee415", features = ["seed_1_2"] }
 
 embassy-executor = { version = "0.7.0", features = [
     "arch-cortex-m",

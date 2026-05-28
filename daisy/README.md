@@ -2,11 +2,11 @@
 
 Cargo workspace for the ambient visualizer's audio coprocessor:
 
-| Crate | Type | What it is |
-|---|---|---|
-| `crates/dsp` | `no_std` library | Audio + MIDI core. Sampler, mixer, voice allocation. Same code on both targets. |
-| `crates/firmware` | embedded binary (thumbv7em) | Daisy Seed firmware. Embassy + SAI + USB UAC + UART-MIDI + `dsp`. |
-| `crates/host` | std binary (macOS) | Local dev host. CoreAudio + CoreMIDI + `dsp`. Lets you iterate on the audio logic without reflashing. |
+| Crate             | Type                        | What it is                                                                                            |
+| ----------------- | --------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `crates/dsp`      | `no_std` library            | Audio + MIDI core. Sampler, mixer, voice allocation. Same code on both targets.                       |
+| `crates/firmware` | embedded binary (thumbv7em) | Daisy Seed firmware. Embassy + SAI + USB UAC + UART-MIDI + `dsp`.                                     |
+| `crates/host`     | std binary (macOS)          | Local dev host. CoreAudio + CoreMIDI + `dsp`. Lets you iterate on the audio logic without reflashing. |
 
 End goal: physical MIDI controller (TRS 3.5mm → UART) drives a sampler/mixer
 on the Daisy. Output goes both to the Daisy codec (→ PA) and to the Pi over
@@ -51,12 +51,12 @@ cargo install cargo-binutils
 
 ## Hardware target
 
-This workspace assumes the **original Daisy Seed** (Rev 6, AK4556 codec,
-64 MB SDRAM, SD card adapter wired to SDMMC1). For Seed 1.1 / 1.2 / Patch SM,
+This workspace assumes the **original Daisy Seed** (Rev 7, PCM3060 codec,
+64 MB SDRAM, SD card adapter wired to SPI). For Seed 1.1 / 1.2 / Patch SM,
 change the `daisy-embassy` feature flag in `crates/firmware/Cargo.toml`:
 
 ```toml
-features = ["seed_1_1"]   # or seed_1_2, patch_sm
+features = ["seed_1_2"]   # or seed_1_1, patch_sm
 ```
 
 ## Architecture
@@ -83,6 +83,7 @@ features = ["seed_1_1"]   # or seed_1_2, patch_sm
 ```
 
 Why this works:
+
 - `dsp` is `no_std` so it compiles unchanged into both targets.
 - All I/O (audio, MIDI, USB) lives in the host-specific crate. The `dsp`
   crate never directly touches a peripheral or a `std` type.
@@ -94,7 +95,7 @@ Why this works:
 ## Sample storage
 
 The 18 MB MP3 doesn't fit in QSPI flash (8 MB) and its decoded form
-doesn't fit in SDRAM (64 MB). SD card via SDMMC1 is the destination.
+doesn't fit in SDRAM (64 MB). SD card via SPI is the destination.
 Likely path: bake the file as i16 PCM mono onto the SD card (~50 MB at
 22 kHz mono, no decode CPU at runtime), stream into a ring buffer from
 a low-priority embassy task. On the Mac, host reads the same WAV from disk.
@@ -134,4 +135,7 @@ daisy/
 5. **Daisy UART-MIDI** — 31.25 kbaud USART RX, decode → `Engine::handle_midi`.
 6. **Daisy USB UAC source** — Pi captures audio over USB.
 7. **SD card sample storage** — `embedded-sdmmc` + ring buffer.
+
+```
+
 ```
