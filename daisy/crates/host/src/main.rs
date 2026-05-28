@@ -46,8 +46,8 @@ fn main() -> Result<()> {
 
     if let Some(path) = audio_path.as_deref() {
         let path = Path::new(path);
-        let (pcm, src_sr) = decode_to_stereo_f32(path)
-            .with_context(|| format!("decoding {}", path.display()))?;
+        let (pcm, src_sr) =
+            decode_to_stereo_f32(path).with_context(|| format!("decoding {}", path.display()))?;
         let frames = pcm.len() / 2;
         let leaked: &'static [f32] = Box::leak(pcm.into_boxed_slice());
         println!(
@@ -64,6 +64,36 @@ fn main() -> Result<()> {
         eprintln!(
             "no audio path provided — output will be silent.\n  usage: cargo run -p host -- <file>"
         );
+    }
+
+    // Make the kick obviously audible — DaisySP's defaults (50 Hz, accent 0.1)
+    // are below most laptop-speaker rolloff and get masked by full-range
+    // music samples.
+    {
+        let mut eng = engine.lock().unwrap();
+        let kick = eng.kick_mut();
+        kick.set_freq(60.0); // up from 50 Hz default → punches through laptop speakers
+        kick.set_accent(0.9); // up from 0.1 → louder, beefier
+        kick.set_decay(0.4); // up from 0.3 → longer ring
+        kick.set_tone(0.15); // up from 0.1 → more click on top
+        kick.set_self_fm_amount(0.5); // stronger pitch dive (the "vrrm")
+        kick.set_attack_fm_amount(0.3); // cleaner pitch sweep
+    }
+
+    // Auto-trigger the analog bass drum every 500 ms (~120 BPM) so it's
+    // audible without wiring up MIDI yet. Spawn a thread that just locks
+    // the engine briefly to fire the trigger.
+    {
+        let kick_engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let mut n: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                kick_engine.lock().unwrap().trigger_kick();
+                n += 1;
+                println!("kick #{n}");
+            }
+        });
     }
 
     let config: cpal::StreamConfig = supported.config();
@@ -191,8 +221,9 @@ where
             scratch.resize(frames * 2, 0.0);
             engine.lock().unwrap().process(&[], &mut scratch);
 
-            for (cpal_frame, dsp_frame) in
-                output.chunks_exact_mut(channels).zip(scratch.chunks_exact(2))
+            for (cpal_frame, dsp_frame) in output
+                .chunks_exact_mut(channels)
+                .zip(scratch.chunks_exact(2))
             {
                 let l = dsp_frame[0];
                 let r = dsp_frame[1];

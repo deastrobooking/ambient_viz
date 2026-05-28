@@ -12,12 +12,27 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use infinitedsp_core::FrameProcessor;
+use infinitedsp_core::core::audio_param::AudioParam;
+use infinitedsp_core::effects::dynamics::distortion::{Distortion, DistortionType};
 use infinitedsp_core::effects::time::reverb::Reverb;
+
+pub mod analog_bass_drum;
+pub mod svf;
+
+pub use analog_bass_drum::AnalogBassDrum;
+pub use svf::Svf;
 
 pub struct Engine {
     #[allow(dead_code)] // will be used once we add synth voices alongside the sampler
     sample_rate: f32,
     sampler: Sampler,
+    kick: AnalogBassDrum,
+    /// Soft-clip saturation on the kick path — the "warmth + glue" that
+    /// turns a raw 808-model output into a techno-kick character. Configured
+    /// as fully wet (it's the drum's voice, not a wet/dry effect).
+    kick_dist: Distortion,
+    /// Mono scratch buffer for kick samples between synthesis and distortion.
+    kick_buf: Vec<f32>,
     reverb: Reverb,
     /// Holds the dry sampler output across the reverb call so we can mix wet+dry.
     dry_scratch: Vec<f32>,
@@ -31,13 +46,26 @@ impl Engine {
     pub fn new(sample_rate: f32) -> Self {
         let mut reverb = Reverb::new();
         reverb.set_sample_rate(sample_rate);
+
+        // Drive 2.0 ≈ tanh saturation that kicks in on peaks; subtle warmth,
+        // not "obviously distorted". Bump drive on `kick_dist_mut()` for grit.
+        let mut kick_dist = Distortion::new(
+            AudioParam::linear(2.0),
+            AudioParam::linear(1.0),
+            DistortionType::SoftClip,
+        );
+        kick_dist.set_sample_rate(sample_rate);
+
         Self {
             sample_rate,
             sampler: Sampler::new(),
+            kick: AnalogBassDrum::new(sample_rate),
+            kick_dist,
+            kick_buf: Vec::new(),
             reverb,
             dry_scratch: Vec::new(),
             sample_index: 0,
-            reverb_wet: 0.30,
+            reverb_wet: 0.,
         }
     }
 
@@ -46,8 +74,7 @@ impl Engine {
     /// outlive the engine (typically `Box::leak` on host, `static` on embedded).
     pub fn load_sample(&mut self, buf: &'static [f32], src_sample_rate: f32) {
         debug_assert_eq!(buf.len() % 2, 0, "sample buffer must be interleaved stereo");
-        self.sampler
-            .load(buf, src_sample_rate / self.sample_rate);
+        self.sampler.load(buf, src_sample_rate / self.sample_rate);
     }
 
     pub fn play(&mut self, looping: bool) {
@@ -62,6 +89,21 @@ impl Engine {
         self.reverb_wet = wet.clamp(0.0, 1.0);
     }
 
+    /// Strike the analog bass drum on the next process() call.
+    pub fn trigger_kick(&mut self) {
+        self.kick.trig();
+    }
+
+    /// Mutable access to the kick drum for tweaking freq/decay/tone/etc.
+    pub fn kick_mut(&mut self) -> &mut AnalogBassDrum {
+        &mut self.kick
+    }
+
+    /// Mutable access to the kick-bus distortion (drive, mix, type).
+    pub fn kick_dist_mut(&mut self) -> &mut Distortion {
+        &mut self.kick_dist
+    }
+
     /// Render one block. `_input` is reserved for future passthrough/sidechain;
     /// `output` (interleaved stereo) is fully overwritten.
     pub fn process(&mut self, _input: &[f32], output: &mut [f32]) {
@@ -71,7 +113,21 @@ impl Engine {
         }
         self.sampler.mix_into(output);
 
-        // 2. Stash the dry signal so we can blend wet+dry after the reverb runs.
+        // 2. Render kick into a mono scratch buffer, then soft-clip it before
+        //    mixing into the stereo output (mono → both channels).
+        let n_frames = output.len() / 2;
+        self.kick_buf.resize(n_frames, 0.0);
+        for k in self.kick_buf.iter_mut() {
+            *k = self.kick.process(false);
+        }
+        self.kick_dist
+            .process(&mut self.kick_buf, self.sample_index);
+        for (out_frame, &k) in output.chunks_exact_mut(2).zip(self.kick_buf.iter()) {
+            out_frame[0] += k;
+            out_frame[1] += k;
+        }
+
+        // 3. Stash the dry signal so we can blend wet+dry after the reverb runs.
         self.dry_scratch.resize(output.len(), 0.0);
         self.dry_scratch.copy_from_slice(output);
 

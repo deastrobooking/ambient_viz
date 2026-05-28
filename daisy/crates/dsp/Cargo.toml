@@ -9,3 +9,7 @@ description = "Audio + MIDI core for ambient-viz-daisy. no_std, runs on both Dai
 # modulation, oscillators, etc.). Requires alloc — firmware crate provides a
 # global allocator via embedded-alloc.
 infinitedsp-core = "1.1"
+
+# Math primitives (sinf/cosf/powf/fabsf) — sin/cos/powf aren't in core for no_std.
+# Used by our DaisySP ports (SVF, analog bass drum).
+libm = "0.2"
