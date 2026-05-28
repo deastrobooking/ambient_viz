@@ -1,0 +1,14 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dsp = { path = "../dsp" }
+
+cpal = "0.15"
+anyhow = "1.0"
+
+# `mp3` feature enables both the MP3 demuxer and the MPEG audio decoder.
+# Add "wav"/"flac"/"ogg" here later if we want to load those formats too.
+symphonia = { version = "0.5", features = ["mp3"] }

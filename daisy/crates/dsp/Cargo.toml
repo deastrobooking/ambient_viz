@@ -1,0 +1,11 @@
+[package]
+name = "dsp"
+version = "0.1.0"
+edition = "2024"
+description = "Audio + MIDI core for ambient-viz-daisy. no_std, runs on both Daisy and Mac."
+
+[dependencies]
+# DaisySP-equivalent no_std DSP library (reverbs, filters, delays, distortion,
+# modulation, oscillators, etc.). Requires alloc — firmware crate provides a
+# global allocator via embedded-alloc.
+infinitedsp-core = "1.1"

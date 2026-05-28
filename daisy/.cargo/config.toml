@@ -1,0 +1,24 @@
+# Linker flags + runner for the Daisy target.
+# These only activate when something is built for thumbv7em-none-eabihf
+# (i.e. the firmware crate), so they're safe to leave at workspace scope —
+# host builds for the Mac triple and ignores this block entirely.
+[target.thumbv7em-none-eabihf]
+runner = 'probe-rs run --chip STM32H750IBKx'
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+# Affects defmt-rtt only (defmt is firmware-only); host ignores this var.
+[env]
+DEFMT_LOG = "debug"
+
+# Workspace-scoped aliases so firmware commands work from the root.
+# `cargo run -p host` for Mac dev — no alias needed; native target is default.
+[alias]
+firmware = "build -p firmware --target thumbv7em-none-eabihf --release"
+flash    = "run -p firmware --target thumbv7em-none-eabihf --release"
+# `cargo bin` produces target/firmware.bin for DFU flashing.
+# Requires `cargo install cargo-binutils` once.
+bin = "objcopy -p firmware --target thumbv7em-none-eabihf --release -- -O binary target/firmware.bin"

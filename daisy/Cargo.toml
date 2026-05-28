@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/dsp", "crates/firmware", "crates/host"]
+# `cargo build` from the workspace root only builds the Mac-buildable crates.
+# Firmware is built explicitly via `cargo firmware` / `cargo flash` / `cargo bin`
+# (aliases in .cargo/config.toml) which pass `--target thumbv7em-none-eabihf`.
+default-members = ["crates/dsp", "crates/host"]
+
+# daisy-embassy is pinned to a git rev that depends on unreleased embassy
+# changes. The patch below must match daisy-embassy's own patch.crates-io block.
+# Bump these together with the daisy-embassy rev in crates/firmware/Cargo.toml.
+[patch.crates-io]
+embassy-stm32   = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
+embassy-time    = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
+embassy-sync    = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
+embassy-usb     = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false
+
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+opt-level = 3
+overflow-checks = true

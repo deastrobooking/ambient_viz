@@ -1,0 +1,57 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dsp = { path = "../dsp" }
+
+# Pinned to a git rev because crates.io 0.2.3 depends on embassy-stm32 ^0.5.0
+# while master has moved to 0.6.0 — mixing them produces a `links = "embassy-time"`
+# conflict at resolve time. Bump this SHA together with the embassy patch
+# revs in the workspace Cargo.toml.
+daisy-embassy = { git = "https://github.com/daisy-embassy/daisy-embassy", rev = "0a217111c0d47e3ad542bb729343f52dfddee415", features = ["seed"] }
+
+embassy-executor = { version = "0.7.0", features = [
+    "arch-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+    "task-arena-size-32768",
+] }
+embassy-time = { version = "0.5.0", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+    "tick-hz-32_768",
+    "generic-queue-8",
+] }
+embassy-stm32 = { version = "0.6.0", features = [
+    "defmt",
+    "stm32h750ib",
+    "time-driver-tim5",
+    "exti",
+    "memory-x",
+    "unstable-pac",
+    "chrono",
+] }
+embassy-futures = "0.1.2"
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+
+cortex-m = { version = "0.7.7", features = [
+    "inline-asm",
+    "critical-section-single-core",
+] }
+cortex-m-rt = { version = "0.7.0", features = ["device"] }
+critical-section = "1.2.0"
+
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+static_cell = "2.1.1"
+
+# Global allocator. dsp pulls in infinitedsp which requires `alloc`, so the
+# firmware crate must provide one. LlffHeap is the simpler of embedded-alloc's
+# two heap implementations — fine for our allocation pattern (a few buffers
+# at startup + reverb internal state, no per-frame allocation).
+embedded-alloc = "0.6"
