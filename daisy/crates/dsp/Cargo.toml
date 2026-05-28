@@ -13,3 +13,12 @@ infinitedsp-core = "1.1"
 # Math primitives (sinf/cosf/powf/fabsf) — sin/cos/powf aren't in core for no_std.
 # Used by our DaisySP ports (SVF, analog bass drum).
 libm = "0.2"
+
+# no_std JSON parser. Used by `dsp::timeline` so the same code parses the
+# ambient-viz timeline sidecars on both Mac host and Daisy firmware.
+# Default features include `heapless` for fixed-size collection support.
+serde-json-core = "0.6"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+# Must match serde-json-core 0.6.0's transitive dep — it pins heapless 0.8
+# (the master branch tracks 0.9 but isn't released yet).
+heapless = "0.8"

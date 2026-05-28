@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dsp::Param;
+use midir::{Ignore, MidiInput};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -44,22 +46,31 @@ fn main() -> Result<()> {
 
     let engine = Arc::new(Mutex::new(dsp::Engine::new(engine_sample_rate)));
 
-    if let Some(path) = audio_path.as_deref() {
-        let path = Path::new(path);
+    // `loop_seconds` is the loaded sample's duration; the BPM thread uses
+    // it to map wall-clock time back to a position in the loop. `mp3_path`
+    // is kept so we can probe for a sidecar `<basename>.timeline.json`.
+    let mut loop_seconds: Option<f32> = None;
+    let mut mp3_path: Option<std::path::PathBuf> = None;
+
+    if let Some(path_str) = audio_path.as_deref() {
+        let path = Path::new(path_str);
         let (pcm, src_sr) =
             decode_to_stereo_f32(path).with_context(|| format!("decoding {}", path.display()))?;
         let frames = pcm.len() / 2;
+        let dur = frames as f32 / src_sr;
         let leaked: &'static [f32] = Box::leak(pcm.into_boxed_slice());
         println!(
             "loaded sample: {} frames ({:.1}s at {} Hz, {:.1} MB)",
             frames,
-            frames as f32 / src_sr,
+            dur,
             src_sr as u32,
             (leaked.len() * 4) as f32 / 1024.0 / 1024.0,
         );
         let mut eng = engine.lock().unwrap();
         eng.load_sample(leaked, src_sr);
         eng.play(true);
+        loop_seconds = Some(dur);
+        mp3_path = Some(path.to_path_buf());
     } else {
         eprintln!(
             "no audio path provided — output will be silent.\n  usage: cargo run -p host -- <file>"
@@ -72,42 +83,172 @@ fn main() -> Result<()> {
     {
         let mut eng = engine.lock().unwrap();
         let kick = eng.kick_mut();
-        kick.set_freq(60.0); // up from 50 Hz default → punches through laptop speakers
-        kick.set_accent(0.9); // up from 0.1 → louder, beefier
+        kick.set_freq(50.0); // up from 50 Hz default → punches through laptop speakers
+        kick.set_accent(0.57); // up from 0.1 → louder, beefier
         kick.set_decay(0.4); // up from 0.3 → longer ring
-        kick.set_tone(0.15); // up from 0.1 → more click on top
-        kick.set_self_fm_amount(0.5); // stronger pitch dive (the "vrrm")
-        kick.set_attack_fm_amount(0.3); // cleaner pitch sweep
+        kick.set_tone(0.4); // up from 0.1 → more click on top
+        kick.set_self_fm_amount(0.35); // stronger pitch dive (the "vrrm")
+        kick.set_attack_fm_amount(0.); // cleaner pitch sweep
+        eng.apply_param(Param::KickDistDrive, 6.0);
     }
 
-    // Auto-trigger the analog bass drum every 500 ms (~120 BPM) so it's
-    // audible without wiring up MIDI yet. Spawn a thread that just locks
-    // the engine briefly to fire the trigger.
+    // Default MIDI CC bindings. CCs 71-76 are the GM "Sound Controllers"
+    // and a common starting point for hardware drum-machine knobs. Your
+    // controller may send different CCs — incoming MIDI is printed below
+    // so you can discover what each knob emits and edit this block.
+    //
+    // Trigger: MIDI note 36 (C1, GM kick) fires the kick on note-on.
     {
-        let kick_engine = Arc::clone(&engine);
-        std::thread::spawn(move || {
-            let mut n: u32 = 0;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                kick_engine.lock().unwrap().trigger_kick();
-                n += 1;
-                println!("kick #{n}");
-            }
-        });
+        use dsp::Param;
+        let mut eng = engine.lock().unwrap();
+        let m = eng.midi_map_mut();
+        m.bind_cc(12, Param::KickAccent, 0.0, 1.0);
+        m.bind_cc(13, Param::KickDecay, 0.0, 1.0);
+        m.bind_cc(15, Param::KickAttackFm, 0.0, 1.0);
+        m.bind_cc(16, Param::KickFreq, 30.0, 150.0);
+        m.bind_cc(18, Param::KickTone, 0.0, 1.0);
+        m.bind_cc(19, Param::KickSelfFm, 0.0, 1.0);
+        m.bind_cc(21, Param::ReverbWet, 0.0, 1.0); // CC 91 = "Effects 1" (reverb send)
+        m.bind_cc(22, Param::KickDistDrive, 1.0, 6.0); // CC 93 = "Effects 3"
     }
+
+    // Connect to a MIDI input. midir owns the callback thread; the connection
+    // must stay alive (we bind it to a named local so it lives till main exits).
+    let _midi_conn = connect_midi(Arc::clone(&engine))?;
 
     let config: cpal::StreamConfig = supported.config();
+    let stream_engine = Arc::clone(&engine);
     let stream = match format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, engine, channels)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, engine, channels)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, engine, channels)?,
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, stream_engine, channels)?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, stream_engine, channels)?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, stream_engine, channels)?,
         other => anyhow::bail!("unsupported sample format {other:?}"),
     };
 
     stream.play()?;
     println!("playing — Ctrl+C to stop");
+
+    // If there's a sidecar `<basename>.timeline.json` next to the MP3,
+    // load the BPM lane and print the interpolated tempo every second.
+    if let (Some(dur), Some(path)) = (loop_seconds, mp3_path.as_ref()) {
+        let timeline_path = path.with_extension("timeline.json");
+        match std::fs::read(&timeline_path) {
+            Ok(bytes) => match dsp::timeline::parse_bpm(&bytes) {
+                Some(keypoints) if !keypoints.is_empty() => {
+                    println!(
+                        "loaded {} BPM keypoints from {}",
+                        keypoints.len(),
+                        timeline_path.display(),
+                    );
+                    // Lock the kick sequencer to the song's tempo curve.
+                    // Default pattern is all-on (kick on every beat).
+                    {
+                        let mut eng = engine.lock().unwrap();
+                        eng.sequencer_mut().set_tempo(keypoints.clone(), dur);
+                    }
+                    let count_engine = Arc::clone(&engine);
+                    std::thread::spawn(move || {
+                        // Wall clock from this moment as the playback ref.
+                        // Stream is already running, so drift vs. true audio
+                        // position is sub-frame.
+                        let start = std::time::Instant::now();
+                        let (mut last_k, mut last_c, mut last_o) = (0u64, 0u64, 0u64);
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            let elapsed = start.elapsed().as_secs_f32();
+                            let t = if dur > 0.0 { elapsed % dur } else { elapsed };
+                            let bpm = dsp::timeline::bpm_at(&keypoints, t);
+                            let (k, c, o) = {
+                                let eng = count_engine.lock().unwrap();
+                                let s = eng.sequencer();
+                                (s.kick_count(), s.closed_hat_count(), s.open_hat_count())
+                            };
+                            let (dk, dc, do_) = (k - last_k, c - last_c, o - last_o);
+                            last_k = k;
+                            last_c = c;
+                            last_o = o;
+                            println!(
+                                "  tempo: {bpm:.2} BPM  (t={t:.1}s)  +K{dk} +CH{dc} +OH{do_}",
+                            );
+                        }
+                    });
+                }
+                _ => println!("timeline {} has no bpm lane", timeline_path.display()),
+            },
+            Err(_) => println!("(no timeline at {} — tempo display off)", timeline_path.display()),
+        }
+    }
+
     std::thread::park();
     Ok(())
+}
+
+
+/// Connect to a MIDI input port and forward decoded messages to the engine.
+/// Returns the connection handle, which must be kept alive for input to flow.
+/// Port is selected by the `MIDI_PORT` env var (index into `midi_in.ports()`),
+/// defaulting to 0. Returns `Ok(None)` if no MIDI ports exist.
+fn connect_midi(engine: Arc<Mutex<dsp::Engine>>) -> Result<Option<midir::MidiInputConnection<()>>> {
+    let mut midi_in = MidiInput::new("ambient-viz-daisy")?;
+    midi_in.ignore(Ignore::None);
+
+    let ports = midi_in.ports();
+    if ports.is_empty() {
+        eprintln!("no MIDI input ports found — kick won't trigger until you connect a device");
+        return Ok(None);
+    }
+
+    println!("MIDI ports:");
+    for (i, p) in ports.iter().enumerate() {
+        println!("  [{i}] {}", midi_in.port_name(p).unwrap_or_default());
+    }
+    let idx = std::env::var("MIDI_PORT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(ports.len() - 1);
+    let port = &ports[idx];
+    println!(
+        "→ connecting to [{idx}] {}",
+        midi_in.port_name(port).unwrap_or_default(),
+    );
+
+    let conn = midi_in
+        .connect(
+            port,
+            "midi-in",
+            move |_timestamp, bytes, _| {
+                if let Some(msg) = dsp::midi::decode(bytes) {
+                    // For ControlChange we also resolve through the map so the
+                    // log shows exactly what param/value the engine will apply.
+                    match msg {
+                        dsp::MidiMessage::ControlChange { channel, cc, value } => {
+                            let mapped =
+                                engine.lock().unwrap().midi_map().map_cc(cc, value);
+                            match mapped {
+                                Some((param, mapped_value)) => println!(
+                                    "  midi ch{channel} CC#{cc} = {value} → {param:?} = {mapped_value:.3}"
+                                ),
+                                None => println!("  midi ch{channel} CC#{cc} = {value}"),
+                            }
+                        }
+                        dsp::MidiMessage::NoteOn { note, velocity, .. } => {
+                            println!("  midi note-on {note} vel {velocity}");
+                        }
+                        dsp::MidiMessage::NoteOff { note, .. } => {
+                            println!("  midi note-off {note}");
+                        }
+                        dsp::MidiMessage::PitchBend { value, .. } => {
+                            println!("  midi pitch-bend {value}");
+                        }
+                    }
+                    engine.lock().unwrap().handle_midi(msg);
+                }
+            },
+            (),
+        )
+        .map_err(|e| anyhow::anyhow!("midir connect failed: {e}"))?;
+    Ok(Some(conn))
 }
 
 /// Decode an audio file to interleaved-stereo f32. Returns (samples, source_sample_rate).

@@ -9,6 +9,14 @@ dsp = { path = "../dsp" }
 cpal = "0.15"
 anyhow = "1.0"
 
+# CoreMIDI input via the same crate that targets ALSA/WinMM elsewhere.
+# Daisy MIDI will come from UART, not midir — but the decoder + map in `dsp`
+# is shared, so the engine handle_midi() call site stays identical.
+midir = "0.10"
+
+# Timeline JSON parsing is shared with firmware via `dsp::timeline`
+# (serde-json-core). No host-specific JSON dep needed.
+
 # `mp3` feature enables both the MP3 demuxer and the MPEG audio decoder.
 # Add "wav"/"flac"/"ogg" here later if we want to load those formats too.
 symphonia = { version = "0.5", features = ["mp3"] }
