@@ -55,3 +55,11 @@ static_cell = "2.1.1"
 # two heap implementations — fine for our allocation pattern (a few buffers
 # at startup + reverb internal state, no per-frame allocation).
 embedded-alloc = "0.6"
+
+# SD card stack. SPI mode (SDMMC peripheral isn't usable with the
+# 6-pin WWZMDiB modules; see daisy/BREAKOUT.md). embedded-sdmmc + the
+# embedded-hal-bus ExclusiveDevice adapter wraps a blocking SpiBus +
+# CS pin into the SpiDevice that SdCard::new expects.
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
+embedded-sdmmc = { version = "0.9", default-features = false, features = ["defmt-log"] }

@@ -328,22 +328,49 @@ board-mounted socketing.
 
 These are uncommitted edits in the working tree as of writing this section.
 
-### Blocked on physical bring-up — implement during hardware integration
+### SD card construction path — compile-checked (3.)
 
-Firmware is currently at roadmap step 1 of 7 (`main.rs` is a 500 ms blinky).
-The remaining items below require building features that don't yet exist
-and cannot be meaningfully tested before the breakout is built. Implement
-them when the hardware is in hand:
+`crates/firmware/src/sd.rs` builds the full SD card stack — `embedded-sdmmc`
+v0.9 + `embedded-hal-bus` v0.3 `ExclusiveDevice` wrapping an
+`embassy_stm32::spi::Spi<'a, Blocking, Master>` on SPI1 with a GPIO CS.
+`main.rs` calls `sd::build_sd_card(p.SPI1, board.pins.d8, d10, d9, d7)`
+during boot, proving:
 
-3. **SD card support (roadmap step 7).** Add `embedded-sdmmc` dependency,
-   configure `embassy-stm32` SPI1 on D7/D8/D9/D10 (CS/SCK/MISO/MOSI) per
-   the BOM pin table above, write a ring-buffered sample reader. Pair with
-   the sampler work in `dsp`.
-4. **UART MIDI input + activity LED (roadmap steps 5 + this section).**
-   Configure USART1 RX on PB7 (Daisy pad D14), spawn a reader task that
+- Crate versions are mutually compatible (no resolver conflicts).
+- The `Peri<'_, T>` wrapping that embassy-stm32 0.6 uses lines up with what
+  `daisy_embassy::pins::SeedPinN` exposes after `new_daisy_board!`.
+- `p.SPI1` and `p.USART1` survive the partial move from `new_daisy_board!`
+  and remain available for our own peripheral setup (`new_daisy_board!`
+  doesn't claim them).
+- `SdCard::new(SpiDevice, Delay)` accepts the constructed device chain.
+
+The card is NOT initialised — `num_bytes()` / `VolumeManager` calls would
+block forever waiting for hardware that doesn't exist yet. Those go in
+during physical bring-up. What we've proven is that the *integration
+hypothesis is sound*: the dependency graph compiles, the type chain links,
+the pins map.
+
+Resulting artefact: `target/thumbv7em-none-eabihf/release/firmware` (~2 MB
+ELF with debuginfo) and `target/firmware.bin` (~35 KB) DFU-flashable.
+
+### Blocked on physical bring-up
+
+Firmware is at roadmap step 1 of 7 (`main.rs` is a 500 ms blinky plus the
+unused `_sdcard` binding). The remaining items below require building
+features that don't yet exist and cannot be meaningfully tested before the
+breakout is built:
+
+4. **UART MIDI input + activity LED (roadmap step 5).** Configure USART1
+   RX on PB7 (Daisy pad D14 / `board.pins.d14`), spawn a reader task that
    decodes incoming MIDI bytes → `dsp::Engine::handle_midi`. On each byte
    arrival, toggle the onboard user LED (PC7 / D31) for a brief flash so
    physical MIDI activity is visible without instrumentation.
+5. **Actually drive the SD card during boot.** Call `_sdcard.num_bytes()`
+   inside a fallible init routine, then construct a `VolumeManager` with
+   the `sd::ZeroTime` stub, open `VolumeIdx(0)`, open the root dir, and
+   stream sample bytes into a ring buffer per the README's sample-storage
+   plan. The construction surface is already in place — just needs the
+   actual block-device calls plumbed in once a card is present.
 
 ---
 
