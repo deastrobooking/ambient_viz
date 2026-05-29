@@ -10,6 +10,8 @@
 
 use alloc::vec::Vec;
 
+use libm::expf;
+
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::audio_param::AudioParam;
 use infinitedsp_core::effects::dynamics::compressor::Compressor;
@@ -36,9 +38,134 @@ const DEFAULT_BUMP_GAIN_DB: f32 = 3.0;
 /// Default hiss low-pass cutoff (Hz). Tape noise rolls off above the
 /// loss-filter knee; ~7 kHz approximates that without the full filter.
 const DEFAULT_HISS_LPF_HZ: f32 = 7000.0;
-/// Default hiss level, linear. ~-55 dB — present but quiet on a clean
-/// signal, more audible when the music is sparse (just like real tape).
-const DEFAULT_HISS_AMOUNT: f32 = 0.0018;
+/// Default hiss level, none.
+const DEFAULT_HISS_AMOUNT: f32 = 0.;
+
+// ---------------------------------------------------------------------------
+// "Failure" knob — one scalar lerps 9 sub-stage params from a pristine
+// (= TC-250 preset) state to an "eaten tape" state.
+// ---------------------------------------------------------------------------
+
+/// 50 ms exponential smoothing on the failure amount — fast enough to feel
+/// responsive on a knob, slow enough to absorb the loss-filter FIR rebuilds
+/// without an audible zipper.
+const FAILURE_SMOOTH_TC_SECS: f32 = 0.050;
+/// Re-push lerped params to the sub-stages only when the smoothed failure
+/// has moved more than this since the last application. Avoids needlessly
+/// re-dirtying the loss filter FIR every block at steady state.
+const FAILURE_APPLY_EPSILON: f32 = 0.001;
+
+/// Snapshot of the nine numeric values that the failure knob drives.
+/// Used for both the endpoints (`FAILURE_BASELINE`, `FAILURE_DESTROYED`)
+/// and the lerped per-block value applied to the sub-stages.
+#[derive(Clone, Copy)]
+struct FailureSnapshot {
+    wow_rate_hz: f32,
+    wow_depth_ms: f32,
+    flutter_depth_ms: f32,
+    chew_depth: f32,
+    chew_freq: f32,
+    speed_ips: f32,
+    spacing_um: f32,
+    hysteresis_drive: f32,
+    hiss_amount: f32,
+}
+
+/// The resting baseline (failure `0.0`) — **a touch of tape**, roughly halfway
+/// between a fully-clean signal and the full Sony TC-250 preset. The failure
+/// knob degrades from here toward [`FAILURE_DESTROYED`] (the eaten TC-250).
+///
+/// Each value is the midpoint of `clean` and the original TC-250 setting:
+///
+/// | param            | clean | TC-250 | baseline (½) |
+/// |------------------|-------|--------|--------------|
+/// | wow_rate_hz      | 0.5   | 0.5    | 0.5          |
+/// | wow_depth_ms     | 0.0   | 0.3    | 0.15         |
+/// | flutter_depth_ms | 0.0   | 0.05   | 0.025        |
+/// | chew_depth       | 0.0   | 0.1    | 0.05         |
+/// | chew_freq        | 0.1   | 0.1    | 0.1          |
+/// | speed_ips        | 15.0  | 7.5    | 11.25        |
+/// | spacing_um       | 1.0   | 3.0    | 2.0          |
+/// | hysteresis_drive | 0.0   | 0.40   | 0.20         |
+/// | hiss_amount      | 0.0   | 0.0    | 0.0          |
+///
+/// **Must match `preset_light_tape()` exactly** so `set_failure(0.0)` after
+/// `new()` is a true no-op (if either side drifts, fix both). Hysteresis
+/// width/sat and loss thickness/gap + chew variance are held constant — those
+/// are machine-character, not failure.
+const FAILURE_BASELINE: FailureSnapshot = FailureSnapshot {
+    wow_rate_hz: 0.5,
+    wow_depth_ms: 0.15,
+    flutter_depth_ms: 0.025,
+    chew_depth: 0.05,
+    chew_freq: 0.1,
+    speed_ips: 11.25,
+    spacing_um: 2.0,
+    hysteresis_drive: 0.20,
+    hiss_amount: 0.0, // hiss disabled — TC-250 S/N spec was too noisy by ear
+};
+
+/// "Tape is being eaten." Tuned by ear in concert — each value is at the
+/// edge of musical, the combined result is unambiguously broken.
+const FAILURE_DESTROYED: FailureSnapshot = FailureSnapshot {
+    wow_rate_hz: 3.0,
+    wow_depth_ms: 15.0,
+    flutter_depth_ms: 1.5,
+    chew_depth: 0.9,
+    chew_freq: 0.8,
+    speed_ips: 1.5,
+    spacing_um: 18.0,
+    hysteresis_drive: 0.95,
+    hiss_amount: 0.0, // hiss disabled across the whole failure range
+};
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Compute the snapshot for a given failure amount.
+///
+/// Linear curve for: wow rate, chew depth/freq, loss speed/spacing,
+/// hysteresis drive. **Quadratic** (`t * t`) curve for the *depth/level*
+/// params (wow depth, flutter depth, hiss) — those need to stay subtle
+/// across the bottom half of the knob and only get extreme near the top,
+/// otherwise the knob feels "nothing happens, then everything happens".
+fn failure_snapshot_at(t: f32) -> FailureSnapshot {
+    let t = t.clamp(0.0, 1.0);
+    let t_sq = t * t;
+    FailureSnapshot {
+        wow_rate_hz: lerp(
+            FAILURE_BASELINE.wow_rate_hz,
+            FAILURE_DESTROYED.wow_rate_hz,
+            t,
+        ),
+        wow_depth_ms: lerp(
+            FAILURE_BASELINE.wow_depth_ms,
+            FAILURE_DESTROYED.wow_depth_ms,
+            t_sq,
+        ),
+        flutter_depth_ms: lerp(
+            FAILURE_BASELINE.flutter_depth_ms,
+            FAILURE_DESTROYED.flutter_depth_ms,
+            t_sq,
+        ),
+        chew_depth: lerp(FAILURE_BASELINE.chew_depth, FAILURE_DESTROYED.chew_depth, t),
+        chew_freq: lerp(FAILURE_BASELINE.chew_freq, FAILURE_DESTROYED.chew_freq, t),
+        speed_ips: lerp(FAILURE_BASELINE.speed_ips, FAILURE_DESTROYED.speed_ips, t),
+        spacing_um: lerp(FAILURE_BASELINE.spacing_um, FAILURE_DESTROYED.spacing_um, t),
+        hysteresis_drive: lerp(
+            FAILURE_BASELINE.hysteresis_drive,
+            FAILURE_DESTROYED.hysteresis_drive,
+            t,
+        ),
+        hiss_amount: lerp(
+            FAILURE_BASELINE.hiss_amount,
+            FAILURE_DESTROYED.hiss_amount,
+            t_sq,
+        ),
+    }
+}
 
 pub struct TapeProcessor {
     enabled: bool,
@@ -81,6 +208,14 @@ pub struct TapeProcessor {
     l_buf: Vec<f32>,
     r_buf: Vec<f32>,
     hiss_buf: Vec<f32>,
+
+    // Failure-knob smoothing — see `set_failure`. Updated in `process()`.
+    sample_rate: f32,
+    target_failure: f32,
+    current_failure: f32,
+    /// Last value at which we pushed lerped params to the sub-stages — used
+    /// to avoid re-dirtying loss-filter FIRs at steady state.
+    last_applied_failure: f32,
 }
 
 impl TapeProcessor {
@@ -111,10 +246,7 @@ impl TapeProcessor {
         let make_comp = || {
             // Gentle bus compression: -6 dB threshold, 1.8:1 ratio, soft knee.
             // ~10 ms attack / 100 ms release matches "tape glue" feel.
-            let mut c = Compressor::new(
-                AudioParam::linear(-6.0),
-                AudioParam::linear(1.8),
-            );
+            let mut c = Compressor::new(AudioParam::linear(-6.0), AudioParam::linear(1.8));
             c.set_attack(AudioParam::linear(10.0));
             c.set_release(AudioParam::linear(100.0));
             c.set_knee(AudioParam::linear(6.0));
@@ -142,11 +274,16 @@ impl TapeProcessor {
             l_buf: Vec::new(),
             r_buf: Vec::new(),
             hiss_buf: Vec::new(),
+            sample_rate,
+            target_failure: 0.0,
+            current_failure: 0.0,
+            last_applied_failure: 0.0,
         };
-        // Start with the Sony TC-250 preset — the workspace's "house tape".
-        // Use [`preset_sony_tc_250`] explicitly or write a sibling preset to
-        // model a different machine.
-        tape.preset_sony_tc_250();
+        // Start with the light-tape baseline — "a touch of tape" (roughly
+        // halfway between clean and the full TC-250). This is the resting
+        // sound; the failure knob degrades it toward the eaten TC-250. Call
+        // [`preset_sony_tc_250`] for the full deck, or write a sibling preset.
+        tape.preset_light_tape();
         tape
     }
 
@@ -167,6 +304,11 @@ impl TapeProcessor {
     ///   common stock for this class of machine)
     /// - Head-to-tape spacing 3 μm (slight wear; pristine would be < 1 μm)
     /// - Hysteresis settings chosen for ~1 % THD at normal program level
+    ///
+    /// Note: the failure knob is calibrated to the lighter [`preset_light_tape`]
+    /// baseline ([`FAILURE_BASELINE`]), not to this full preset. Selecting the
+    /// full TC-250 and then moving the failure knob will pull the resting (0)
+    /// sound down to the light baseline. Use one or the other deliberately.
     pub fn preset_sony_tc_250(&mut self) {
         // Loss filter — physical playback losses (HF rolloff to ~15 kHz).
         self.set_speed_ips(7.5);
@@ -186,8 +328,9 @@ impl TapeProcessor {
         wf.set_wow_depth_ms(0.3);
         wf.set_flutter_depth_ms(0.05);
 
-        // Hiss — matches the 50 dB S/N spec (10^(-50/20) ≈ 0.32 % linear).
-        self.set_hiss_amount(0.0032);
+        // Hiss — disabled. The TC-250's 50 dB S/N (≈0.32 % linear) was too
+        // noisy by ear, so we keep every other tape stage but zero the hiss.
+        self.set_hiss_amount(0.0);
 
         // Chew — very slight. Models a well-loved but not abused machine:
         // mild attenuation events spaced ~3-4 seconds apart, ~75 ms long.
@@ -197,6 +340,116 @@ impl TapeProcessor {
         c.set_depth(0.1);
         c.set_freq(0.1);
         c.set_variance(0.5);
+
+        // Failure knob lives on top of the preset, so resetting the preset
+        // also resets the knob (otherwise the next `process()` would chase
+        // the old target and overwrite the freshly-applied preset values).
+        self.target_failure = 0.0;
+        self.current_failure = 0.0;
+        self.last_applied_failure = 0.0;
+    }
+
+    /// Configure the **light-tape baseline** — "a touch of tape", roughly
+    /// halfway between a fully-clean signal and the full [`preset_sony_tc_250`]
+    /// deck. This is the default applied by [`TapeProcessor::new`] and the
+    /// failure knob's `0.0` endpoint; turning the knob up degrades it toward
+    /// the eaten TC-250 ([`FAILURE_DESTROYED`]).
+    ///
+    /// Machine-character constants (head gap, thickness, hysteresis width/sat,
+    /// chew variance, head bump) are kept identical to the TC-250 — only the
+    /// failure-driven params are softened to the [`FAILURE_BASELINE`] midpoint,
+    /// which this method **must keep in sync with**.
+    pub fn preset_light_tape(&mut self) {
+        // Loss filter — faster effective speed + tighter head contact than the
+        // full deck → gentler HF rolloff. Thickness/gap are TC-250 character.
+        self.set_speed_ips(FAILURE_BASELINE.speed_ips); // 11.25 (clean 15 ↔ TC-250 7.5)
+        self.set_spacing_um(FAILURE_BASELINE.spacing_um); // 2.0 (clean 1 ↔ TC-250 3)
+        self.set_thickness_um(30.0);
+        self.set_gap_um(10.0);
+
+        // Hysteresis — half the TC-250 drive (less saturation), same loop shape.
+        self.set_hysteresis(FAILURE_BASELINE.hysteresis_drive, 0.50, 0.30);
+
+        // Wow + flutter — half-depth wobble: present but subtle.
+        let wf = self.wow_flutter_mut();
+        wf.set_wow_rate_hz(FAILURE_BASELINE.wow_rate_hz);
+        wf.set_wow_depth_ms(FAILURE_BASELINE.wow_depth_ms);
+        wf.set_flutter_depth_ms(FAILURE_BASELINE.flutter_depth_ms);
+
+        // Hiss — disabled (as on the TC-250 preset).
+        self.set_hiss_amount(FAILURE_BASELINE.hiss_amount);
+
+        // Chew — half-depth dropouts; same spacing/variance character.
+        let c = self.chew_mut();
+        c.set_depth(FAILURE_BASELINE.chew_depth);
+        c.set_freq(FAILURE_BASELINE.chew_freq);
+        c.set_variance(0.5);
+
+        // Reset the failure knob to the baseline (see preset_sony_tc_250).
+        self.target_failure = 0.0;
+        self.current_failure = 0.0;
+        self.last_applied_failure = 0.0;
+    }
+
+    /// Set the "tape failure" amount in `[0, 1]`. `0` = the light-tape
+    /// baseline ([`preset_light_tape`]), `1` = unmistakably-broken eaten
+    /// TC-250. The value is smoothed over ~50 ms inside `process()` so a knob
+    /// sweep doesn't click.
+    ///
+    /// Overrides the individual sub-stage setters whenever it advances:
+    /// if you call `set_hysteresis(...)` then `set_failure(0.5)`, the
+    /// hysteresis tweak is gone. Use individual setters *or* the knob,
+    /// not both.
+    pub fn set_failure(&mut self, amount: f32) {
+        self.target_failure = amount.clamp(0.0, 1.0);
+    }
+
+    /// Current smoothed failure value (not the target). Useful for UI
+    /// feedback that should follow the audible state rather than the
+    /// commanded value.
+    pub fn failure(&self) -> f32 {
+        self.current_failure
+    }
+
+    /// Last commanded failure target.
+    pub fn failure_target(&self) -> f32 {
+        self.target_failure
+    }
+
+    /// Advance the failure smoother by `n_frames` audio samples and, if the
+    /// value has moved beyond [`FAILURE_APPLY_EPSILON`] since the last
+    /// application, push lerped params to every sub-stage. Called from
+    /// `process()`.
+    fn step_failure(&mut self, n_frames: usize) {
+        // Exponential smoothing: per-block coefficient for the configured
+        // time constant. Block sizes vary (cpal ~256-1024, embassy SAI
+        // ~32-128) but this expression is correct at any block size.
+        let coef = 1.0 - expf(-(n_frames as f32) / (FAILURE_SMOOTH_TC_SECS * self.sample_rate));
+        self.current_failure += coef * (self.target_failure - self.current_failure);
+
+        if (self.current_failure - self.last_applied_failure).abs() <= FAILURE_APPLY_EPSILON {
+            return;
+        }
+        let snap = failure_snapshot_at(self.current_failure);
+
+        self.wow_flutter.set_wow_rate_hz(snap.wow_rate_hz);
+        self.wow_flutter.set_wow_depth_ms(snap.wow_depth_ms);
+        self.wow_flutter.set_flutter_depth_ms(snap.flutter_depth_ms);
+
+        self.chew.set_depth(snap.chew_depth);
+        self.chew.set_freq(snap.chew_freq);
+
+        self.loss_l.set_speed_ips(snap.speed_ips);
+        self.loss_r.set_speed_ips(snap.speed_ips);
+        self.loss_l.set_spacing_um(snap.spacing_um);
+        self.loss_r.set_spacing_um(snap.spacing_um);
+
+        // Hysteresis width / sat are TC-250 character — only drive lerps.
+        self.hysteresis_l.cook(snap.hysteresis_drive, 0.50, 0.30);
+        self.hysteresis_r.cook(snap.hysteresis_drive, 0.50, 0.30);
+
+        self.hiss_amount = snap.hiss_amount;
+        self.last_applied_failure = self.current_failure;
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -236,7 +489,14 @@ impl TapeProcessor {
         self.comp_enabled
     }
     /// Set bus compressor params on both channels in lockstep.
-    pub fn set_compressor(&mut self, threshold_db: f32, ratio: f32, attack_ms: f32, release_ms: f32, makeup_db: f32) {
+    pub fn set_compressor(
+        &mut self,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_db: f32,
+    ) {
         for c in [&mut self.comp_l, &mut self.comp_r] {
             c.set_threshold(AudioParam::linear(threshold_db));
             c.set_ratio(AudioParam::linear(ratio));
@@ -272,6 +532,11 @@ impl TapeProcessor {
         }
 
         let n_frames = output.len() / 2;
+
+        // Smooth the failure knob and push lerped params into every sub-stage
+        // before any of them touch audio this block. No-op when steady.
+        self.step_failure(n_frames);
+
         self.l_buf.resize(n_frames, 0.0);
         self.r_buf.resize(n_frames, 0.0);
         self.hiss_buf.resize(n_frames, 0.0);
@@ -295,7 +560,9 @@ impl TapeProcessor {
         // lines per channel. Runs first so downstream stages see the wobbled
         // signal (matches real tape signal flow).
         for i in 0..n_frames {
-            let (l, r) = self.wow_flutter.process_sample(self.l_buf[i], self.r_buf[i]);
+            let (l, r) = self
+                .wow_flutter
+                .process_sample(self.l_buf[i], self.r_buf[i]);
             self.l_buf[i] = l;
             self.r_buf[i] = r;
         }

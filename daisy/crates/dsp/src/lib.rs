@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 //! Audio + MIDI core. Runs identically on Daisy firmware and macOS host.
 //!
@@ -14,9 +14,13 @@ use alloc::vec::Vec;
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::audio_param::AudioParam;
 use infinitedsp_core::effects::dynamics::distortion::{Distortion, DistortionType};
+use infinitedsp_core::effects::time::ping_pong_delay::PingPongDelay;
 use infinitedsp_core::effects::time::reverb::Reverb;
 
 pub mod analog_bass_drum;
+pub mod bloom;
+pub mod chord;
+pub mod fm_stab;
 pub mod hihat;
 pub mod midi;
 pub mod midi_map;
@@ -26,6 +30,7 @@ pub mod tape;
 pub mod timeline;
 
 pub use analog_bass_drum::AnalogBassDrum;
+pub use fm_stab::{FmPatch, FmStab, Shaper};
 pub use hihat::HiHat;
 pub use midi::MidiMessage;
 pub use midi_map::{MidiMap, Param};
@@ -50,6 +55,21 @@ pub struct Engine {
     hihat_buf: Vec<f32>,
     /// Master gain on the hi-hat bus (the raw HiHat output is bright/hot).
     hihat_gain: f32,
+    /// Polyphonic FM "stab" synth — DX7-flavoured chord hits driven by the
+    /// sequencer's stab lane (and by live MIDI note-on of non-kick notes).
+    stabs: fm_stab::FmStab,
+    /// Mono scratch buffer for the summed stab output.
+    stab_buf: Vec<f32>,
+    /// Stereo send buffer feeding the stab ping-pong delay. The dry stab is
+    /// panned hard left into this buffer so the cross-fed echoes bounce L↔R
+    /// (the classic Cybotron / Detroit-dub stab delay).
+    stab_send: Vec<f32>,
+    /// Ping-pong delay on the stab bus. Runs wet-only (`mix = 1.0`); its
+    /// output is the bouncing echoes alone, which we fold back into the master
+    /// *before* the reverb so each repeat trails off into the room.
+    stab_delay: PingPongDelay,
+    /// How much of the delay's wet echoes to fold into the master (0..1).
+    stab_delay_wet: f32,
     /// Gain multiplier applied to the kick's output. Set per-trigger from
     /// MIDI velocity (0..1), so soft pad hits play a quieter kick.
     kick_velocity: f32,
@@ -59,6 +79,10 @@ pub struct Engine {
     midi_map: MidiMap,
     sequencer: sequencer::Sequencer,
     reverb: Reverb,
+    /// Resonant "bloom" bank — rings the pre-tape master into a fixed D Lydian
+    /// chord, scaled by a "proximity" amount. Stands in for the exhibit's ToF
+    /// "approach pulls clarity + tone out of the rain" gesture.
+    bloom: bloom::BloomBank,
     tape: tape::TapeProcessor,
     /// Holds the dry sampler output across the reverb call so we can mix wet+dry.
     dry_scratch: Vec<f32>,
@@ -66,6 +90,10 @@ pub struct Engine {
     sample_index: u64,
     /// 0.0 = fully dry, 1.0 = fully wet.
     reverb_wet: f32,
+    /// When `false`, the step sequencer is not advanced and fires no kick /
+    /// hat / stab triggers — the sampler, reverb, tape and bloom still run.
+    /// Lets a host audition the track + processing without the drum pattern.
+    sequencer_enabled: bool,
 }
 
 impl Engine {
@@ -81,6 +109,23 @@ impl Engine {
             DistortionType::SoftClip,
         );
         kick_dist.set_sample_rate(sample_rate);
+
+        // Cybotron-style ping-pong on the stab bus: ~dotted-8th echoes
+        // (0.375 s) that bounce L↔R with enough feedback for a few audible
+        // repeats. `mix = 1.0` so the processed buffer carries *only* the wet
+        // echoes — we add them on top of the dry stab in the master.
+        //
+        // NOTE: the delay line allocates 2 × max_delay_s × sample_rate f32 from
+        // the global allocator. On the Daisy that's far larger than the current
+        // firmware heap — like the reverb, these buffers belong in SDRAM once
+        // the firmware audio path is wired. On the host it's free.
+        let mut stab_delay = PingPongDelay::new(
+            1.0,                          // max delay buffer, seconds
+            AudioParam::seconds(0.375),   // dotted-8th-ish at techno tempo
+            AudioParam::linear(0.45),     // feedback → a few repeats
+            AudioParam::linear(1.0),      // mix = wet-only output
+        );
+        stab_delay.set_sample_rate(sample_rate);
 
         Self {
             sample_rate,
@@ -110,15 +155,31 @@ impl Engine {
             },
             hihat_buf: Vec::new(),
             hihat_gain: 0.5,
+            stabs: {
+                // Default to the abrasive industrial patch — inharmonic FM,
+                // operator feedback, hard-clipped. Swap with `stabs_mut()
+                // .load_patch(FmPatch::default())` for the clean DX stab.
+                let mut s = fm_stab::FmStab::new(sample_rate);
+                s.load_patch(fm_stab::FmPatch::industrial());
+                s
+            },
+            stab_buf: Vec::new(),
+            stab_send: Vec::new(),
+            stab_delay,
+            stab_delay_wet: 0.5,
             kick_velocity: 1.0,
             kick_trigger_note: 60,
             midi_map: MidiMap::new(),
             sequencer: sequencer::Sequencer::new(sample_rate),
             reverb,
+            bloom: bloom::BloomBank::new(sample_rate),
             tape: tape::TapeProcessor::new(sample_rate),
             dry_scratch: Vec::new(),
             sample_index: 0,
-            reverb_wet: 0.,
+            // A wash of room by default — the cold, spacious Cybotron air. Dial
+            // with `set_reverb_wet` / the ReverbWet CC.
+            reverb_wet: 0.18,
+            sequencer_enabled: true,
         }
     }
 
@@ -168,6 +229,29 @@ impl Engine {
         &mut self.kick_dist
     }
 
+    /// Mutable access to the FM stab synth (patch, gain, manual triggering).
+    pub fn stabs_mut(&mut self) -> &mut fm_stab::FmStab {
+        &mut self.stabs
+    }
+
+    /// Mutable access to the stab ping-pong delay (delay time / feedback / mix).
+    pub fn stab_delay_mut(&mut self) -> &mut PingPongDelay {
+        &mut self.stab_delay
+    }
+
+    /// How much of the stab delay's wet echoes is folded into the master (0..1).
+    pub fn set_stab_delay_wet(&mut self, wet: f32) {
+        self.stab_delay_wet = wet.clamp(0.0, 1.0);
+    }
+    pub fn stab_delay_wet(&self) -> f32 {
+        self.stab_delay_wet
+    }
+
+    /// Mutable access to the reverb (room size, damping).
+    pub fn reverb_mut(&mut self) -> &mut Reverb {
+        &mut self.reverb
+    }
+
     /// Configure MIDI CC bindings. Call from the host at startup.
     pub fn midi_map_mut(&mut self) -> &mut MidiMap {
         &mut self.midi_map
@@ -193,6 +277,26 @@ impl Engine {
         &mut self.tape
     }
 
+    /// Set the resonant-bloom "proximity" amount (0 = far/silent, 1 = near/full
+    /// bloom). The bank rings the pre-tape master into a fixed D Lydian chord.
+    pub fn set_bloom_amount(&mut self, amount: f32) {
+        self.bloom.set_amount(amount);
+    }
+    pub fn bloom_amount(&self) -> f32 {
+        self.bloom.amount()
+    }
+
+    /// Enable/disable the step sequencer. When disabled, no kick/hat/stab
+    /// triggers fire and the sequencer clock is frozen; the sampler, reverb,
+    /// tape and bloom keep running so the track + processing can be auditioned
+    /// without the drum pattern.
+    pub fn set_sequencer_enabled(&mut self, enabled: bool) {
+        self.sequencer_enabled = enabled;
+    }
+    pub fn sequencer_enabled(&self) -> bool {
+        self.sequencer_enabled
+    }
+
     /// Master gain on the hi-hat bus (default 0.6).
     pub fn set_hihat_gain(&mut self, g: f32) {
         self.hihat_gain = g.max(0.0);
@@ -210,8 +314,9 @@ impl Engine {
         &mut self.hihat_open
     }
 
-    /// Dispatch an inbound MIDI message. Note-on of MIDI note 36 (GM kick)
-    /// fires the kick. CC messages are routed through the [`MidiMap`].
+    /// Dispatch an inbound MIDI message. Note-on of the kick trigger note
+    /// fires the kick; any other note-on plays an FM stab voice. CC messages
+    /// are routed through the [`MidiMap`].
     pub fn handle_midi(&mut self, msg: MidiMessage) {
         match msg {
             MidiMessage::ControlChange { cc, value, .. } => {
@@ -222,6 +327,9 @@ impl Engine {
             MidiMessage::NoteOn { note, velocity, .. } if velocity > 0 => {
                 if note == self.kick_trigger_note {
                     self.trigger_kick(velocity as f32 / 127.0);
+                } else {
+                    // Playable FM stab — auditions the synth from a controller.
+                    self.stabs.note_on(note, velocity as f32 / 127.0);
                 }
             }
             _ => {}
@@ -238,6 +346,20 @@ impl Engine {
             Param::KickSelfFm => self.kick.set_self_fm_amount(value),
             Param::KickDistDrive => self.kick_dist.set_drive(AudioParam::linear(value)),
             Param::ReverbWet => self.reverb_wet = value.clamp(0.0, 1.0),
+            Param::StabGain => self.stabs.set_gain(value),
+            Param::StabIndex => self.stabs.set_index(value),
+            Param::StabDecay => self.stabs.set_decay(value),
+            Param::StabModRatio => self.stabs.set_mod_ratio(value),
+            Param::StabFeedback => self.stabs.set_feedback(value),
+            Param::StabDrive => self.stabs.set_drive(value),
+            Param::TapeFailure => self.tape.set_failure(value),
+            Param::StabDelayWet => self.stab_delay_wet = value.clamp(0.0, 1.0),
+            Param::StabDelayFeedback => self
+                .stab_delay
+                .set_feedback(AudioParam::linear(value.clamp(0.0, 0.95))),
+            Param::StabDelayTime => self
+                .stab_delay
+                .set_delay_time(AudioParam::seconds(value.max(0.0))),
         }
     }
 
@@ -250,16 +372,26 @@ impl Engine {
         }
         self.sampler.mix_into(output);
 
-        // 2. Render kick and hi-hats per sample driven by the sequencer.
+        // 2. Render kick, hi-hats and stabs per sample driven by the sequencer.
         //    StepEvent carries the kick velocity (None = no kick this sample,
-        //    Some(v) = trigger at velocity v) and the closed/open hat flags.
-        //    Kick goes through its own distortion stage; hi-hats render
-        //    directly into a mono scratch and mix in unprocessed.
+        //    Some(v) = trigger at velocity v), the closed/open hat flags, and
+        //    an optional stab chord. Kick goes through its own distortion
+        //    stage; hats and stabs render into mono scratch and mix in. The
+        //    stab is also panned into `stab_send` (hard left) to feed the
+        //    ping-pong delay.
         let n_frames = output.len() / 2;
         self.kick_buf.resize(n_frames, 0.0);
         self.hihat_buf.resize(n_frames, 0.0);
+        self.stab_buf.resize(n_frames, 0.0);
+        self.stab_send.resize(output.len(), 0.0);
         for i in 0..n_frames {
-            let evt = self.sequencer.advance();
+            // When disabled, freeze the sequencer clock and fire nothing; the
+            // voices still tick (with no trigger) so any ringing tail decays.
+            let evt = if self.sequencer_enabled {
+                self.sequencer.advance()
+            } else {
+                sequencer::StepEvent::default()
+            };
             let kick_trig = if let Some(v) = evt.kick_velocity {
                 self.kick_velocity = v;
                 true
@@ -269,6 +401,16 @@ impl Engine {
             self.kick_buf[i] = self.kick.process(kick_trig);
             self.hihat_buf[i] =
                 self.hihat_closed.process(evt.closed_hat) + self.hihat_open.process(evt.open_hat);
+
+            if let Some(hit) = evt.stab {
+                self.stabs.play_chord(hit.chord.notes(), hit.velocity);
+            }
+            let st = self.stabs.tick();
+            self.stab_buf[i] = st;
+            // Feed the delay send on the left only; the cross-feedback makes
+            // the echoes ping-pong across the stereo field.
+            self.stab_send[2 * i] = st;
+            self.stab_send[2 * i + 1] = 0.0;
         }
         self.kick_dist
             .process(&mut self.kick_buf, self.sample_index);
@@ -276,15 +418,25 @@ impl Engine {
         // *and* slightly less driven character relative to the dry path.
         let vel = self.kick_velocity;
         let hh_gain = self.hihat_gain;
-        for ((out_frame, &k), &h) in output
+        for (((out_frame, &k), &h), &st) in output
             .chunks_exact_mut(2)
             .zip(self.kick_buf.iter())
             .zip(self.hihat_buf.iter())
+            .zip(self.stab_buf.iter())
         {
             let kick_mix = k * vel;
             let hat_mix = h * hh_gain;
-            out_frame[0] += kick_mix + hat_mix;
-            out_frame[1] += kick_mix + hat_mix;
+            out_frame[0] += kick_mix + hat_mix + st;
+            out_frame[1] += kick_mix + hat_mix + st;
+        }
+
+        // 2b. Ping-pong delay on the stab send (wet-only) — fold the bouncing
+        //     echoes into the master *before* the reverb so each repeat trails
+        //     off into the room. Cybotron in a box.
+        self.stab_delay.process(&mut self.stab_send, self.sample_index);
+        let delay_wet = self.stab_delay_wet;
+        for (out, &w) in output.iter_mut().zip(self.stab_send.iter()) {
+            *out += w * delay_wet;
         }
 
         // 3. Stash the dry signal so we can blend wet+dry after the reverb runs.
@@ -299,6 +451,20 @@ impl Engine {
         let wet_gain = self.reverb_wet;
         for (out, &dry) in output.iter_mut().zip(self.dry_scratch.iter()) {
             *out = dry * dry_gain + *out * wet_gain;
+        }
+
+        // 5b. Resonant "bloom" bank — taps the pre-tape master, rings the
+        //     program material (rain / pads / street noise) into a fixed
+        //     D Lydian chord scaled by the "proximity" amount, and folds it
+        //     back here so the bloom shares the same tape character as the
+        //     rest of the mix. Skipped entirely when the amount is zero.
+        if self.bloom.amount() > 0.0 {
+            for frame in output.chunks_exact_mut(2) {
+                let mono = 0.5 * (frame[0] + frame[1]);
+                let b = self.bloom.tick(mono);
+                frame[0] += b;
+                frame[1] += b;
+            }
         }
 
         // 6. Tape emulation — final stage on the master bus. Currently

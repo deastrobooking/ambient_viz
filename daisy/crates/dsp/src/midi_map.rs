@@ -16,6 +16,27 @@ pub enum Param {
     KickSelfFm,
     KickDistDrive,
     ReverbWet,
+    /// FM stab bus gain.
+    StabGain,
+    /// FM stab modulation index (brightness / harmonic richness).
+    StabIndex,
+    /// FM stab amp-envelope decay time, seconds (stab length).
+    StabDecay,
+    /// FM stab modulator:carrier frequency ratio.
+    StabModRatio,
+    /// FM stab operator self-feedback — the main grit/abrasion control.
+    StabFeedback,
+    /// FM stab pre-shaper drive (slams the waveshaper for more distortion).
+    StabDrive,
+    /// Tape "failure" amount (0 = pristine TC-250, 1 = eaten/falling apart).
+    /// Drives 9 sub-stage params in concert through `TapeProcessor::set_failure`.
+    TapeFailure,
+    /// Stab ping-pong delay: wet amount folded into the master (0..1).
+    StabDelayWet,
+    /// Stab ping-pong delay: feedback / number of repeats (0..0.95).
+    StabDelayFeedback,
+    /// Stab ping-pong delay: delay time, seconds.
+    StabDelayTime,
 }
 
 #[derive(Debug, Clone, Copy)]

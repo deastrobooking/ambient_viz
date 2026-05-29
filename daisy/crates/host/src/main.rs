@@ -24,7 +24,11 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 fn main() -> Result<()> {
-    let audio_path = env::args().nth(1);
+    // First non-flag argument is the audio path; `--no-seq` runs the engine
+    // with the step sequencer disabled (track + processing, no drum pattern).
+    let args: Vec<String> = env::args().skip(1).collect();
+    let no_seq = args.iter().any(|a| a == "--no-seq");
+    let audio_path = args.into_iter().find(|a| !a.starts_with("--"));
 
     let host = cpal::default_host();
     let device = host
@@ -73,7 +77,7 @@ fn main() -> Result<()> {
         mp3_path = Some(path.to_path_buf());
     } else {
         eprintln!(
-            "no audio path provided — output will be silent.\n  usage: cargo run -p host -- <file>"
+            "no audio path provided — output will be silent.\n  usage: cargo run -p host -- <file> [--no-seq]"
         );
     }
 
@@ -90,6 +94,11 @@ fn main() -> Result<()> {
         kick.set_self_fm_amount(0.35); // stronger pitch dive (the "vrrm")
         kick.set_attack_fm_amount(0.); // cleaner pitch sweep
         eng.apply_param(Param::KickDistDrive, 6.0);
+    }
+
+    if no_seq {
+        engine.lock().unwrap().set_sequencer_enabled(false);
+        println!("--no-seq: step sequencer disabled (no kick/hat/stab triggers)");
     }
 
     // Default MIDI CC bindings. CCs 71-76 are the GM "Sound Controllers"
@@ -110,6 +119,7 @@ fn main() -> Result<()> {
         m.bind_cc(19, Param::KickSelfFm, 0.0, 1.0);
         m.bind_cc(21, Param::ReverbWet, 0.0, 1.0); // CC 91 = "Effects 1" (reverb send)
         m.bind_cc(22, Param::KickDistDrive, 1.0, 6.0); // CC 93 = "Effects 3"
+        m.bind_cc(23, Param::TapeFailure, 0.0, 1.0); // 0 = pristine TC-250, 1 = eaten tape
     }
 
     // Connect to a MIDI input. midir owns the callback thread; the connection
@@ -128,6 +138,55 @@ fn main() -> Result<()> {
     stream.play()?;
     println!("playing — Ctrl+C to stop");
 
+    // No MIDI knob handy, so drive the resonant-bloom "proximity" with an
+    // internal LFO standing in for the ToF distance sensor: one smooth
+    // far → near → far sweep every 8 bars at 112 BPM (= 17.143 s). A raised
+    // cosine starts at 0 (far/silent), peaks at 1 (full D-Lydian bloom) at the
+    // half-period, and returns to 0. This is host-only test scaffolding — the
+    // real exhibit drives `set_bloom_amount` from the kiosk distance sensor.
+    {
+        use std::f32::consts::PI;
+        let bloom_engine = Arc::clone(&engine);
+        let period_s = 8.0 * 4.0 * 60.0 / 112.0; // 8 bars · 4 beats · (60/BPM)
+        println!("bloom LFO: far→near→far every {period_s:.3}s (8 bars @ 112 BPM)");
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let dt = std::time::Duration::from_millis(10); // 100 Hz control rate
+            loop {
+                std::thread::sleep(dt);
+                let t = start.elapsed().as_secs_f32();
+                let phase = (t / period_s) * 2.0 * PI;
+                let amount = 0.5 - 0.5 * phase.cos(); // 0 → 1 → 0 over the period
+                bloom_engine.lock().unwrap().set_bloom_amount(amount);
+            }
+        });
+    }
+
+    if false {
+        // TEST: hold pristine for 10 s, then ramp tape failure 0 → 1 over the
+        // next 10 s, and hold at full destruction. Demonstrates the lerp + the
+        // 50 ms smoothing inside `set_failure` (per-step jumps are absorbed).
+        {
+            let failure_engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                println!("== tape failure ramp begins (0 → 1 over 10 s) ==");
+                let steps = 100u32;
+                let dt = std::time::Duration::from_millis(100); // 10 Hz update
+                for i in 1..=steps {
+                    std::thread::sleep(dt);
+                    let amount = i as f32 / steps as f32;
+                    failure_engine
+                        .lock()
+                        .unwrap()
+                        .tape_mut()
+                        .set_failure(amount);
+                }
+                println!("== tape failure pinned at 1.0 — listen for the chaos ==");
+            });
+        }
+    }
+
     // If there's a sidecar `<basename>.timeline.json` next to the MP3,
     // load the BPM lane and print the interpolated tempo every second.
     if let (Some(dur), Some(path)) = (loop_seconds, mp3_path.as_ref()) {
@@ -145,6 +204,33 @@ fn main() -> Result<()> {
                     {
                         let mut eng = engine.lock().unwrap();
                         eng.sequencer_mut().set_tempo(keypoints.clone(), dur);
+                    }
+
+                    // Sibling `.pat` drum-grid file. If present, override the
+                    // built-in default pattern with whatever's in the file.
+                    // Parse errors are logged but non-fatal (defaults stay).
+                    let pat_path = path.with_extension("pat");
+                    match std::fs::read_to_string(&pat_path) {
+                        Ok(text) => {
+                            let mut eng = engine.lock().unwrap();
+                            match eng.sequencer_mut().load_grid(&text) {
+                                Ok(grid) => println!(
+                                    "loaded pattern '{}' ({} steps) from {}",
+                                    grid.name.as_str(),
+                                    grid.steps,
+                                    pat_path.display(),
+                                ),
+                                Err(e) => eprintln!(
+                                    "pattern parse error in {}: {:?} — using built-in defaults",
+                                    pat_path.display(),
+                                    e,
+                                ),
+                            }
+                        }
+                        Err(_) => println!(
+                            "(no pattern at {} — using built-in defaults)",
+                            pat_path.display(),
+                        ),
                     }
                     let count_engine = Arc::clone(&engine);
                     std::thread::spawn(move || {
@@ -167,22 +253,22 @@ fn main() -> Result<()> {
                             last_k = k;
                             last_c = c;
                             last_o = o;
-                            println!(
-                                "  tempo: {bpm:.2} BPM  (t={t:.1}s)  +K{dk} +CH{dc} +OH{do_}",
-                            );
+                            println!("  tempo: {bpm:.2} BPM  (t={t:.1}s)  +K{dk} +CH{dc} +OH{do_}",);
                         }
                     });
                 }
                 _ => println!("timeline {} has no bpm lane", timeline_path.display()),
             },
-            Err(_) => println!("(no timeline at {} — tempo display off)", timeline_path.display()),
+            Err(_) => println!(
+                "(no timeline at {} — tempo display off)",
+                timeline_path.display()
+            ),
         }
     }
 
     std::thread::park();
     Ok(())
 }
-
 
 /// Connect to a MIDI input port and forward decoded messages to the engine.
 /// Returns the connection handle, which must be kept alive for input to flow.
