@@ -2,6 +2,20 @@
 
 Target platform: **Raspberry Pi** (any model with 40-pin GPIO header and I2C). All sensors operate at **3.3V** logic; no level shifting required.
 
+> **Physical build (2026): two soldered perfboards, not a breadboard.**
+> Breadboard spring contacts drift intermittent over an exhibit's run; soldered
+> joints don't. The system is split into:
+> - **Board A — Daisy audio breakout** (`daisy/BREAKOUT.md`): stereo line out,
+>   MIDI in, SD card. Taps Pi **5V + GND**.
+> - **Board B — kiosk sensor board** (this doc): I²C sensors + TLC555 breath
+>   oscillator + AM312. Taps Pi **3V3 + GND + I²C + GPIOs**.
+>
+> Each board has its own small Pi-entry male header; F-F Dupont jumpers run
+> from the Pi GPIO to those headers. **Strain-relieve the jumper bundle**
+> (zip-tie/adhesive-mount it within a few cm of the Pi header, and a dab of
+> hot glue over the seated Dupont housings) — the female Dupont on the Pi pin
+> is the one remaining loosen-prone contact once the boards are soldered.
+
 ## Purpose
 
 An interactive kiosk that responds to:
@@ -30,7 +44,10 @@ The ADS1115 is on the bus but no analog sensors are currently attached. It is av
 | Decoupling cap | 0.1µF ceramic | 2-3 | Pin 8 of 555, sensor Vcc rails |
 | Bypass cap | 10nF ceramic (or 0.1µF acceptable) | 1 | Pin 5 of 555 |
 | I2C pull-ups | 4.7kΩ resistor | 2 | One on SDA, one on SCL, to 3.3V |
-| Misc | Breadboard, jumpers, etc. | — | — |
+| Board | Pad-per-hole perfboard | 1 | Sensor board (Board B). Soldered, not breadboard — see Physical Build note |
+| Sockets/headers | 2.54mm female header strips + DIP-8 socket | — | Socket the sensor modules + TLC555 |
+| Cat5/Cat5e cable | ~2.5 m | 1 | Remote VL53L1X run — see "Remote VL53L1X over Cat5" |
+| Misc | F-F Dupont jumpers, hookup wire | — | Pi GPIO → board entry header |
 
 ---
 
@@ -161,6 +178,56 @@ while True:
 4. **Non-linear mapping** from distance to visual parameter feels better than linear:
    `intensity = 1 - ((distance - 25) / 75)²` for the active zone, clamped to [0, 1].
 5. **Multiple people:** sensor naturally returns the closest object in its narrow cone, which is the desired behavior. No additional logic needed.
+
+#### Remote VL53L1X over Cat5 (2 m run)
+
+The VL53L1X must sit at the kiosk face (aimed at chest height) while Board B
+lives elsewhere — ~2 m away. Run it over one **Cat5/Cat5e** cable on twisted
+pairs, not loose hookup wire.
+
+**Why 2 m is fine.** I²C's real limit is bus capacitance (400 pF spec). 2 m of
+Cat5 pair ≈ 100 pF, + ~40 pF devices/strays ≈ **~140 pF — comfortably under**.
+With the Pi's internal ~1.8 kΩ pull-ups in parallel with the bus 4.7 kΩ
+(≈ 1.3 kΩ effective, see Known Gotchas), edge rise time is ~150 ns — well
+inside the 1000 ns budget at 100 kHz. So **keep the 4.7 kΩ pull-ups and
+100 kHz; no change for 2 m.** Twisting handles the only real risk over the
+run: noise pickup. Do **not** drop pull-ups to a lower value as if for a bare
+long wire — the Pi internal pulls already make the effective value strong.
+
+**Pair assignment** — each fast signal twisted with its own ground return;
+**SDA and SCL in separate pairs** (never the same pair, or SCL crosstalks
+into SDA):
+
+| Cat5 pair | Conductor A | Conductor B |
+|---|---|---|
+| 1 | SDA | GND |
+| 2 | SCL | GND |
+| 3 | 3V3 | GND |
+| 4 | spare (2nd 3V3+GND, or XSHUT+GND if you add sensors later) | |
+
+**Ground = both ends, one net.** Every GND conductor bonds to Board B's GND
+bus at the Pi end **and** to the VL53L1X's single GND pin at the sensor end.
+They are not separate grounds — it's one ground net spread across three
+conductors so each twisted pair has a local return, which is what makes the
+twist reject noise. A ground left floating at the sensor end is dead copper
+and defeats the pairing.
+
+**Cable shield** (only if you actually have FTP/STP — most Cat5 is unshielded
+UTP): ground the foil/drain at the **Pi end only**. That one-end rule applies
+to the *shield*, not to the twisted-pair grounds. Don't conflate them.
+
+**At the sensor end:** 0.1 µF **and** 10 µF from 3V3→GND right at the VL53L1X
+breakout — the VCSEL current pulses need a local reservoir 2 m of thin wire
+can't supply. Tie XSHUT high to local 3V3 (single sensor, address 0x29).
+
+**Validate:** `i2cdetect -y 1` must show 0x29 on every scan. Any flicker →
+drop to 50 kHz (`dtparam=i2c_arm_baudrate=50000`) before suspecting anything
+else.
+
+**Adding more distance sensors:** the wiring is trivial (tap SDA/SCL/3V3/GND);
+the blocker is the **0x29 address collision** — every VL53L1X boots at 0x29.
+Solve with XSHUT sequencing (1 GPIO per sensor, bring up + readdress one at a
+time) or a TCA9548A I²C mux. Splitting wires does not fix this.
 
 ---
 
@@ -306,16 +373,64 @@ The backend code should initialize the ADS1115 but not require any channels to b
 
 ---
 
-## Wiring Checklist for Breadboarding
+## Wiring Checklist (perfboard build — Board B)
 
-1. **Power and ground rails.** Run 3.3V and GND rails along the breadboard. Star-ground all sensor GND pins back to the Pi GND, not daisy-chained.
-2. **I2C pull-ups.** Two 4.7kΩ resistors: one from SDA rail to 3.3V rail, one from SCL rail to 3.3V rail. Install once, near where the I2C bus enters the breadboard.
-3. **Decoupling.** 0.1µF ceramic from Vcc to GND at each sensor breakout (most have one onboard; adding one doesn't hurt). One on the TLC555 pin 8 is mandatory.
-4. **TLC555 circuit.** Build per the schematic above. Verify with a multimeter or scope (if available) that pin 3 is oscillating before connecting to the Pi GPIO. With the HR202 in normal room air, expect ~1-2 kHz at pin 3.
-5. **Keep I2C wires short.** Under 30 cm if possible. If the kiosk requires longer runs, twist SDA with a GND wire and SCL with a GND wire — significantly improves noise rejection.
+1. **Power and ground buses.** Run bare tinned-wire **3.3V** and **GND** buses across the board (solder to each pad they cross that needs them). On perfboard a continuous soldered GND bus is low-impedance enough to satisfy the star-ground intent — you don't need individual returns to one point the way a breadboard's resistive jumper chains demand. Feed the buses from the Pi-entry header.
+2. **I2C pull-ups.** Two 4.7kΩ resistors: one SDA→3.3V, one SCL→3.3V. Install once, near where the I2C bus enters the board. (Effective value is ~1.3kΩ with the Pi's internal pulls in parallel — fine.)
+3. **Decoupling.** 0.1µF ceramic from Vcc to GND at each sensor module (most have one onboard; adding one doesn't hurt). One on the TLC555 pin 8 is mandatory.
+4. **TLC555 circuit.** Build per the schematic above (socket the DIP-8). Verify with a multimeter or scope that pin 3 is oscillating before connecting to the Pi GPIO. With the HR202 in normal room air, expect ~1-2 kHz at pin 3.
+5. **I²C wire length.** On-board runs: keep short, no special handling. The **remote VL53L1X at 2 m goes over Cat5 twisted pairs** — see "Remote VL53L1X over Cat5" above for the pair assignment and grounding. Don't run 2 m of loose hookup wire.
 6. **AM312 placement.** Mount where motion crosses laterally, not toward the sensor. For a kiosk this typically means perpendicular to the approach path.
-7. **VL53L1X placement.** Aim at adult chest height, horizontally, with nothing stationary in the 15° cone within 1 m.
+7. **VL53L1X placement.** Aim at adult chest height, horizontally, with nothing stationary in the 15° cone within 1 m. (Mounted remotely on the Cat5 run.)
 8. **HR202 placement.** Exposed, on a short standoff, oriented toward where the user's face will be. Protect from physical contact but keep airflow unrestricted.
+
+### Board B perfboard layout
+
+The I²C sensor *modules* (MPR121, ADS1115) and the AM312 mount on female-header
+sockets or short flying leads where the kiosk needs them aimed. The only
+hand-built circuit on the board is the TLC555 oscillator, the I²C pull-ups,
+the bus distribution, and the connectors.
+
+```
+   ↑ top edge — Pi-entry header (F-F jumpers from Pi GPIO) ↑
+  ┌──────────────────────────────────────────────────────────┐
+  │ [Pi entry 7p: 3V3 GND SDA SCL G4 G17 G27]                 │
+  │  3V3 bus ═══════════════════════════════════════════      │
+  │  SDA bus ───────────────────────────────────────────      │
+  │  SCL bus ───────────────────────────────────────────      │
+  │ [4.7k SDA→3V3] [4.7k SCL→3V3]                             │
+  │                                                            │
+  │  ┌─ TLC555 ─┐  R1 10k   ┌ MPR121   ┐   ┌ ADS1115  ┐       │
+  │  │  DIP-8   │  C1 4.7nF  │  socket  │   │  socket  │       │
+  │  │  socket  │  (C0G)     │ +IRQ→G27 │   │          │       │
+  │  └──────────┘  pin5 10nF └──────────┘   └──────────┘       │
+  │   HR202 on leads →   ▤0.1µF                                │
+  │  [AM312 3p: VCC OUT→G4 GND]   [Cat5 landing → VL53L1X]     │
+  │  GND bus ═══════════════════════════════════════════      │
+  └──────────────────────────────────────────────────────────┘
+```
+
+**Pi-entry header (7-pin)** — F-F jumpers from these Pi physical pins:
+
+| Board pin | Pi physical pin | Signal |
+|---|---|---|
+| 1 | 1 | 3V3 → 3V3 bus |
+| 2 | 6 | GND → GND bus |
+| 3 | 3 | SDA → SDA bus |
+| 4 | 5 | SCL → SCL bus |
+| 5 | 7 | GPIO4 ← AM312 OUT |
+| 6 | 11 | GPIO17 ← TLC555 pin 3 |
+| 7 | 13 | GPIO27 ← MPR121 IRQ |
+
+**Buses → loads:** 3V3 bus to every module VCC/VDD/VIN + both pull-up tops +
+TLC555 pin 8. GND bus to every module GND + TLC555 pin 1 + pull-down legs +
+the Cat5 GND conductors. SDA/SCL buses to MPR121, ADS1115, and the Cat5
+landing for the remote VL53L1X. Per-module pinouts are in the per-sensor
+tables above — wire by silkscreen label.
+
+**Cat5 landing:** a small header where the 2 m cable terminates — taps SDA,
+SCL, 3V3, GND off the buses onto the twisted pairs (pairing per the Cat5
+section). All GND conductors to the GND bus.
 
 **Sanity check sequence after wiring:**
 

@@ -242,8 +242,9 @@ available without hacking the card slot. Use SPI mode instead — plenty fast
 for sample streaming (12–25 MHz SPI ≈ 1–3 MB/s sustained, comfortable for
 an ambient sampler).
 
-**Firmware change required:** swap `SdmmcHandler` for an SPI-driven FAT
-stack (`embedded-sdmmc` over `embassy-stm32` SPI). Not yet implemented.
+**Firmware:** the SPI-driven stack (`embedded-sdmmc` over `embassy-stm32`
+SPI) is built and compile-checked in `crates/firmware/src/sd.rs` (committed,
+452f7af). Construction only — the card isn't driven yet; see §7.
 
 ### 4.4 Debug — STLINK or DFU
 
@@ -275,8 +276,9 @@ external indicator on the breakout. Firmware implementation pending.
 
 | Qty | Part | Notes / Amazon |
 |---|---|---|
-| 1 | 6N138 optocoupler, DIP-8 | Vishay or equivalent |
-| 2 | 3.5mm TRS panel-mount jack | Audio out + MIDI in |
+| 1 | 6N138 optocoupler, DIP-8 | Vishay or equivalent. Socket it (DIP-8 socket) for swap |
+| 1 | **Stereo** 3.5mm TRS jack, **PCB through-hole** | Audio out (L=tip, R=ring). e.g. CUI SJ1-3535N / PJ-322 style. NOT SMD, NOT solder-lug chassis type |
+| 1 | 3.5mm TRS jack, **PCB through-hole** | MIDI in (Type A). A stereo TRS part is fine — only T/R/S used |
 | 1 | 1N4148 diode (DO-35) | MIDI reverse-polarity protection |
 | 1 | 220Ω 1/4W 5% carbon film | MIDI LED current limit |
 | 1 | 2.2kΩ 1/4W 5% carbon film | 6N138 output pull-up |
@@ -311,24 +313,32 @@ board-mounted socketing.
 | Decoupling cap | Cheap ceramic, any dielectric, ≥6.3V | Shunts MHz noise; dielectric quality irrelevant for decoupling |
 | 1N4148 | DO-35 | 100 V Vrrm, 300 mA continuous If, 2 A surge vs. ~5 mA fault current |
 | 6N138 | DIP-8 | MIDI 1.0 reference opto; 25 mA If max vs 5.45 mA used; 7 V Vcc max vs 5 V used |
-| Audio jack | 1× stereo 3.5mm TRS | Single cable to PA via TRS→2×TS adapter; saves panel space |
-| MIDI jack | 1× 3.5mm TRS, Type A wiring | Modern MIDI standard |
+| Audio jack | 1× stereo 3.5mm TRS, PCB through-hole | Single cable to PA via TRS→2×TS adapter; saves panel space |
+| MIDI jack | 1× 3.5mm TRS, PCB through-hole, Type A wiring | Modern MIDI standard |
+
+**Through-hole check (all parts solder onto perfboard):** 6N138 (DIP-8),
+1N4148 (DO-35 axial), resistors (axial), 100 nF (radial), header strips,
+and the jacks are all leaded/through-hole. The only watch-out is the jacks —
+buy **PCB through-hole** TRS jacks, not SMD and not the chassis/solder-lug
+type (lugs want flying-lead wiring, awkward on a bare perfboard). Some PCB
+TRS jacks use a 2.0 mm pin pitch that doesn't land cleanly on the 2.54 mm
+grid — mount those at the board edge and splay/ream as needed, or pick a
+2.54 mm-friendly part. The Daisy Seed and SD module are not soldered directly
+— they seat in the female-header sockets you solder down.
 
 ---
 
 ## 7. Firmware work
 
-### Already applied (uncommitted in working tree)
+### Committed
 
 1. **`daisy/crates/firmware/Cargo.toml`** — `daisy-embassy` feature is now
-   `"seed_1_2"` (was `"seed"`, the Rev 4 / AK4556 profile).
+   `"seed_1_2"` (was `"seed"`, the Rev 4 / AK4556 profile). Commit 1abce6b.
 2. **`daisy/README.md`** — hardware target now reads
    "Rev 7, PCM3060 codec, ... SD card adapter wired to SPI"
-   (was the incorrect "Rev 6, AK4556" + "SDMMC1").
+   (was the incorrect "Rev 6, AK4556" + "SDMMC1"). Commit 1abce6b.
 
-These are uncommitted edits in the working tree as of writing this section.
-
-### SD card construction path — compile-checked (3.)
+### SD card construction path — compile-checked (3.) — committed 452f7af
 
 `crates/firmware/src/sd.rs` builds the full SD card stack — `embedded-sdmmc`
 v0.9 + `embedded-hal-bus` v0.3 `ExclusiveDevice` wrapping an
@@ -384,3 +394,147 @@ breakout is built:
 - [Daisy Seed Rev 7 schematic](https://daisy.nyc3.cdn.digitaloceanspaces.com/products/seed/ES_Daisy_Seed_Rev7.pdf) — confirms PCM3060 output stage (4.7 µF + 100 Ω + 47 kΩ AGND pulldown per channel) is already on-module
 - **Raspberry Pi 4 Model B datasheet RP-008341-DS** Rel 1.1, Mar 2024 — confirms 5V GPIO pins are tied directly to the USB-C VIN rail; max GPIO 5V current not formally published by the Foundation
 - **ST UM2910** — STLINK-V3MINIE STDC14 pinout; pins 3–12 are MIPI-10 compatible but no MIPI-10 adapter ships in box
+
+---
+
+## 9. Perfboard layout (solder reference)
+
+Board: ~90 × 70 mm pad-per-hole perfboard (~35 × 27 holes at 0.1"). This is
+**Board A** of two — the kiosk sensor board is **Board B**, documented
+separately in `hardware-handoff.md`. The two share only the Pi: Board A taps
+Pi 5V + GND; Board B taps Pi 3V3 + GND + I²C + GPIOs.
+
+### 9.1 Placement map (top view, component side)
+
+Daisy mounted along the left, micro-USB facing the **top edge** so its cable
+to the Pi exits cleanly. The Daisy's "signal" pin row (pins 1–20) faces right,
+toward the MIDI/SD/audio circuitry. Its "power" row (pins 21–40) faces left.
+
+```
+              ↑ top edge — micro-USB + MIDI jack cable exit ↑
+  ┌──────────────────────────────────────────────────────────────┐
+  │  L     R   ← p1 / p40 corner (USB end)                        │
+  │  ║     ║                              [220Ω]   ┌────────────┐ │
+  │  ║     ║                                       │  MIDI TRS  │ │
+  │  ║     ║   L row = Daisy pins 21–40    ┌──────┐│   (in)     │ │
+  │  ║     ║         (power side)          │ 6N138│└────────────┘ │
+  │  ║     ║   R row = Daisy pins 1–20     │ DIP-8│  ▤1N4148      │
+  │  ║     ║         (signal side)         └──────┘  ▤100nF       │
+  │  ║     ║                                         ▤2.2kΩ       │
+  │  ║     ║       ┌── SD 1×6 socket ──┐                          │
+  │  ║     ║       └────────────────────┘          ┌────────────┐ │
+  │  ║     ║   ← p20 / p21 corner                  │ AUDIO TRS  │ │
+  │  (two 1×20 female headers, 0.6" / 6 holes apart)│  (stereo) │ │
+  │                                                 └────────────┘ │
+  │ ═══════════ GND bus (bare wire along one row) ═══════ [Pi 2p] │
+  └──────────────────────────────────────────────────────────────┘
+              ↓ bottom edge — Pi 5V/GND F-F jumpers land here ↓
+   ▤ = small axial/radial part   ║ = 1×20 female header row
+```
+
+### 9.2 Which Daisy pad is where (given this orientation)
+
+With micro-USB at the top edge, the **right** header row carries pins 1–20
+top→bottom (pin 1 at top). The pads we tap, top→bottom on that row:
+
+| Daisy pad | Name | Row position (right header) | Goes to |
+|---|---|---|---|
+| 8 | D7 | 8th from top | SD CS |
+| 9 | D8 | 9th | SD SCK |
+| 10 | D9 | 10th | SD MISO |
+| 11 | D10 | 11th | SD MOSI |
+| 15 | D14 | 15th | 6N138 pin 6 (MIDI RX) |
+| 18 | AUDIO OUT L | 18th | Audio jack TIP |
+| 19 | AUDIO OUT R | 19th | Audio jack RING |
+| 20 | AGND | 20th (bottom) | GND bus (see note) |
+
+Left header row carries pins 40→21 top→bottom (pin 40 at the USB corner):
+
+| Daisy pad | Name | Goes to |
+|---|---|---|
+| 40 | DGND | GND bus |
+| 38 | 3V3D | +3V3 net (3rd from top) |
+
+**AGND↔DGND tie (required):** the Seed datasheet (Fig 1.1) states AGND must
+be connected to DGND in every application. Tie Daisy pad 20 to the GND bus.
+This also gives a convenient GND point on the right side for the audio sleeve.
+
+### 9.3 Net list — solder these points together
+
+Work net by net. Endpoints are named by component pin (not grid coords) so
+they can't be misread.
+
+**GND** (run as a bus wire; everything below commons to it):
+- Daisy pad 40 (DGND)
+- Daisy pad 20 (AGND) ← the required AGND↔DGND tie
+- 6N138 pin 5
+- Audio TRS jack — SLEEVE
+- SD socket — GND pin
+- 100 nF cap — leg B
+- Pi-entry header — GND pin (F-F jumper ← Pi physical pin 6)
+- ⚠️ **MIDI jack SLEEVE is NOT on this net** — leave it isolated (opto isolation)
+
+**+3V3**:
+- Daisy pad 38 (3V3D)
+- SD socket — VCC pin
+- 2.2 kΩ — leg A
+
+**+5V**:
+- Pi-entry header — 5V pin (F-F jumper ← Pi physical pin 2)
+- 6N138 pin 8 (Vcc)
+- 100 nF cap — leg A
+
+**MIDI RX** (opto output → Daisy):
+- 6N138 pin 6 (Vo)
+- 2.2 kΩ — leg B
+- Daisy pad 15 (D14 / USART1_RX)
+
+**Opto LED anode side**:
+- MIDI TRS jack — TIP → 220 Ω → 6N138 pin 2
+- 1N4148 **cathode (banded end)** → 6N138 pin 2
+
+**Opto LED cathode side**:
+- MIDI TRS jack — RING → 6N138 pin 3
+- 1N4148 anode → 6N138 pin 3
+
+**Audio**:
+- Daisy pad 18 → Audio TRS jack — TIP
+- Daisy pad 19 → Audio TRS jack — RING
+
+**SD SPI** (point-to-point, Daisy pad ↔ SD socket pin):
+- Daisy pad 8 (D7) ↔ SD CS
+- Daisy pad 9 (D8) ↔ SD SCK
+- Daisy pad 10 (D9) ↔ SD MISO
+- Daisy pad 11 (D10) ↔ SD MOSI
+
+**No-connects:** 6N138 pins 1, 4, 7 (pin 7 = Vb, leave open).
+
+⚠️ **SD module pin order varies by batch.** Connect by the **silkscreen label**
+on your WWZMDiB module (VCC/GND/MISO/MOSI/SCK/CS), not by physical position —
+the 1×6 header order is not guaranteed.
+
+### 9.4 Build / solder order
+
+1. **Headers first.** Solder the two 1×20 female strips. Before soldering all
+   pins, seat the actual Daisy in both strips, tack one pin at each far corner,
+   confirm it sits flat and the 0.6" spacing is exact, then solder the rest.
+2. **DIP-8 socket** for the 6N138 (note the orientation notch → pin 1). Don't
+   insert the 6N138 yet.
+3. **1×6 SD socket.**
+4. **Both TRS jacks** at the edges.
+5. **Pi-entry 2-pin male header** at the bottom edge.
+6. **GND bus** (bare tinned wire along one row), then the short +3V3 and +5V
+   bus stubs.
+7. **Passives:** 220 Ω, 2.2 kΩ, then 1N4148 (**band toward 6N138 pin 2**),
+   then 100 nF.
+8. **Signal jumpers** per the net list.
+
+### 9.5 Pre-power checks (before inserting Daisy or 6N138)
+
+1. Continuity-check every net above. Confirm **+5V, +3V3, and GND are mutually
+   isolated** (no continuity between any pair).
+2. Confirm **MIDI jack sleeve has NO continuity to GND**.
+3. Apply only the Pi 5V/GND jumpers (Daisy + 6N138 still out). Measure **5.0 V
+   at the 6N138 pin-8 socket hole** vs GND, and 0 V anywhere it shouldn't be.
+4. Power down, insert the 6N138 (notch correct) and the Daisy. The Daisy is
+   powered/flashed over its own USB — the Pi 5V tap feeds only the 6N138.
