@@ -12,6 +12,7 @@ held steady) before plugging into the full kiosk pipeline. Ctrl-C to exit.
 """
 
 import collections
+import logging
 import statistics
 import sys
 import time
@@ -25,6 +26,11 @@ except ImportError as e:
     print("activate the kiosk venv first: cd python && source .venv/bin/activate", file=sys.stderr)
     sys.exit(1)
 
+# Reuse the live kiosk driver's ambient auto-select. Run from python/ so the
+# package is importable: `cd python && python test_vl53l1x.py`.
+from ambient_kiosk import config
+from ambient_kiosk.sensors.distance import DistanceDriver
+
 
 def main() -> int:
     i2c = busio.I2C(board.SCL, board.SDA)
@@ -35,27 +41,35 @@ def main() -> int:
         print("check `i2cdetect -y 1` first — 0x29 must be visible", file=sys.stderr)
         return 1
 
-    sensor.distance_mode = 1   # 1 = short (<1.5 m, best accuracy + ambient light immunity)
-    sensor.timing_budget = 20
+    # Auto-select short vs long mode from ambient IR by reusing the kiosk
+    # driver's own calibration, so the test lands on the same mode the live
+    # pipeline would pick at boot. Start in short mode for the ambient sample
+    # (mirrors DistanceDriver._init_sensor), range, then calibrate.
+    sensor.distance_mode = 1   # short: ambient-safe starting point
+    sensor.timing_budget = config.VL53_TIMING_BUDGET_MS
     sensor.start_ranging()
 
-    print("VL53L1X ready: short mode, 20 ms timing budget")
+    # Surface the driver's calibration logging (ambient median + chosen mode).
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    # Bringup tool: deliberately drive the driver's internals with our own
+    # sensor handle rather than spinning up its thread/ingest.
+    driver = DistanceDriver(ingest=None)
+    driver._sensor = sensor
+    print(f"sampling ambient IR for {config.VL53_AMBIENT_CAL_S:g}s to auto-select mode...")
+    mode = driver._calibrate_distance_mode(1)
+    mode_name = "long" if mode == 2 else "short"
+
+    print(f"VL53L1X ready: {mode_name} mode, {config.VL53_TIMING_BUDGET_MS} ms timing budget")
     print("hold target steady to read noise floor; wave to track motion")
     print("ambient = scene IR load (ST ULD units). Compare projector ON vs OFF,")
     print("on the real wall, to tune VL53_AMBIENT_LONG_MAX in config.py.")
     print("ctrl-c to exit\n")
     print(f"{'raw':>10}   {'mean(1s)':>10}   {'sd':>6}   {'amb':>6}   {'n':>3}")
 
-    def read_ambient():
-        # ST ULD VL53L1_RESULT__AMBIENT_COUNT_RATE_MCPS_SD0; not exposed by
-        # the Adafruit API, so read it raw (word * 8). Mirrors the kiosk
-        # driver's _read_ambient_rate so the printed number matches what
-        # auto-mode-select sees at boot.
-        try:
-            raw = sensor._read_register(0x0090, 2)
-            return ((raw[0] << 8) | raw[1]) * 8
-        except Exception:
-            return None
+    # Reuse the driver's ambient read so the printed number is exactly what
+    # auto-mode-select used above — no duplicated register logic to drift.
+    read_ambient = driver._read_ambient_rate
 
     window = collections.deque(maxlen=50)  # ~1 s at 50 Hz
     last_print = 0.0
