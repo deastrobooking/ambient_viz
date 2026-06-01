@@ -35,23 +35,19 @@ async fn main(_spawner: Spawner) {
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
 
-    // SD card stack — built but not driven yet. Constructing the SdCard
-    // proves the dep graph + pin assignments + bus-adapter chain all
-    // type-check before the physical breakout exists. Actual num_bytes()
-    // or VolumeManager calls would block waiting for hardware, so they're
-    // deferred to bring-up. See crates/firmware/src/sd.rs.
-    let _sdcard = sd::build_sd_card(
-        p.SPI1,
-        board.pins.d8,  // PG11 / SCK
-        board.pins.d10, // PB5  / MOSI
-        board.pins.d9,  // PB4  / MISO
-        board.pins.d7,  // PG10 / CS (software-driven GPIO)
-    );
-
-    // Construct the shared dsp engine — same code path as the Mac host uses.
-    // Sample rate is hard-coded for now; will be wired to the SAI config in
-    // the next phase (audio passthrough).
-    let _engine = dsp::Engine::new(48_000.0);
+    // NOTE: the SD stack and dsp engine are intentionally NOT constructed at
+    // boot yet — both run before the loop and panic on real hardware, which is
+    // why an earlier build flashed fine but never blinked:
+    //   - sd::build_sd_card() inits SPI1, whose kernel clock the Default::default()
+    //     RCC config doesn't set up — needs daisy_embassy::default_rcc().
+    //   - dsp::Engine::new() allocates reverb/delay buffers that exceed the 64 KB
+    //     SRAM heap — needs to move to SDRAM (see BREAKOUT.md + memory note).
+    // They still compile-check (`mod sd;` + the dsp dep). Re-enable during the
+    // audio/SD bring-up phase, after the RCC + SDRAM work:
+    //
+    //   let _sdcard = sd::build_sd_card(
+    //       p.SPI1, board.pins.d8, board.pins.d10, board.pins.d9, board.pins.d7);
+    //   let _engine = dsp::Engine::new(48_000.0);
 
     loop {
         led.on();
