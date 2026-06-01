@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod debug;
 mod sd;
 
 use core::mem::MaybeUninit;
@@ -17,7 +18,10 @@ use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use heapless::spsc::Queue;
 use static_cell::StaticCell;
 
-use {defmt_rtt as _, panic_probe as _};
+// defmt-rtt stays the defmt global logger (info! -> RTT, unread without a
+// probe). The panic handler now lives in `debug` (prints panics over the
+// debug UART), so panic-probe is gone.
+use defmt_rtt as _;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -48,6 +52,16 @@ async fn main(_spawner: Spawner) {
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
+
+    // Debug UART: plain-text logs on USART3 TX (D2 / PC10), read on the Shikra
+    // at 115200. Separate peripheral from USART1/MIDI so baud rates can't clash.
+    let mut dbg_cfg = embassy_stm32::usart::Config::default();
+    dbg_cfg.baudrate = 115_200;
+    let dbg_tx =
+        embassy_stm32::usart::UartTx::new_blocking(p.USART3, board.pins.d2, dbg_cfg).unwrap();
+    debug::init(dbg_tx);
+    dbg_uart!("=== ambient-viz-daisy boot: SD stream (2a) ===");
+
     let interface = board
         .audio_peripherals
         .prepare_interface(Default::default())
@@ -63,6 +77,7 @@ async fn main(_spawner: Spawner) {
 
     if sdcard.num_bytes().is_err() {
         info!("SD: no card / init failed");
+        dbg_uart!("SD: no card / init failed (blink 1)");
         blink_code(&mut led, 1).await;
     }
 
@@ -71,6 +86,7 @@ async fn main(_spawner: Spawner) {
         Ok(v) => v,
         Err(_) => {
             info!("SD: FAT volume mount failed");
+            dbg_uart!("SD: FAT volume mount failed (blink 2)");
             blink_code(&mut led, 2).await
         }
     };
@@ -78,6 +94,7 @@ async fn main(_spawner: Spawner) {
         Ok(r) => r,
         Err(_) => {
             info!("SD: open root dir failed");
+            dbg_uart!("SD: open root dir failed (blink 2)");
             blink_code(&mut led, 2).await
         }
     };
@@ -85,10 +102,12 @@ async fn main(_spawner: Spawner) {
         Ok(f) => f,
         Err(_) => {
             info!("SD: AMBIENT.RAW open failed");
+            dbg_uart!("SD: AMBIENT.RAW open failed (blink 3)");
             blink_code(&mut led, 3).await
         }
     };
     info!("SD: streaming AMBIENT.RAW ({} bytes)", file.length());
+    dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
 
     let q = RING.init(Queue::new());
     let (mut producer, mut consumer) = q.split();

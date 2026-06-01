@@ -46,7 +46,8 @@ critical-section = "1.2.0"
 
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
-panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+# Panic handler lives in src/debug.rs (prints panics over the debug UART), so
+# panic-probe is intentionally absent — there must be exactly one #[panic_handler].
 
 static_cell = "2.1.1"
 
