@@ -3,6 +3,8 @@
 
 mod debug;
 mod sd;
+#[allow(dead_code)] // wired into the USB device in the next step
+mod uac_source;
 
 use core::mem::MaybeUninit;
 

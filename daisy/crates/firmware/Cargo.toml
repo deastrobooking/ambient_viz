@@ -36,6 +36,7 @@ embassy-stm32 = { version = "0.6.0", features = [
 ] }
 embassy-futures = "0.1.2"
 embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-usb = { version = "0.6.0", features = ["defmt"] }
 
 cortex-m = { version = "0.7.7", features = [
     "inline-asm",
