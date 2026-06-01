@@ -29,30 +29,43 @@ async fn main(_spawner: Spawner) {
         HEAP.init(ptr as usize, HEAP_SIZE);
     }
 
-    let p = embassy_stm32::init(Default::default());
+    // Daisy clock tree (480 MHz core + peripheral kernel clocks). Needed so
+    // SPI1 has a kernel clock — Default::default() leaves it unset and the SD
+    // SPI init panics (that's why an earlier build flashed but never blinked).
+    let p = embassy_stm32::init(daisy_embassy::default_rcc());
     info!("ambient-viz-daisy firmware: hello");
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
 
-    // NOTE: the SD stack and dsp engine are intentionally NOT constructed at
-    // boot yet — both run before the loop and panic on real hardware, which is
-    // why an earlier build flashed fine but never blinked:
-    //   - sd::build_sd_card() inits SPI1, whose kernel clock the Default::default()
-    //     RCC config doesn't set up — needs daisy_embassy::default_rcc().
-    //   - dsp::Engine::new() allocates reverb/delay buffers that exceed the 64 KB
-    //     SRAM heap — needs to move to SDRAM (see BREAKOUT.md + memory note).
-    // They still compile-check (`mod sd;` + the dsp dep). Re-enable during the
-    // audio/SD bring-up phase, after the RCC + SDRAM work:
-    //
-    //   let _sdcard = sd::build_sd_card(
-    //       p.SPI1, board.pins.d8, board.pins.d10, board.pins.d9, board.pins.d7);
+    // Bring up the SD card on SPI1 (see crates/firmware/src/sd.rs).
+    let sdcard = sd::build_sd_card(
+        p.SPI1,
+        board.pins.d8,  // PG11 / SCK
+        board.pins.d10, // PB5  / MOSI
+        board.pins.d9,  // PB4  / MISO
+        board.pins.d7,  // PG10 / CS
+    );
+
+    // num_bytes() triggers card initialisation: Ok = card present + responding,
+    // Err = no card / init failed. No debug probe is attached, so report the
+    // result on the user LED — 1 Hz = SD OK, 4 Hz = no card / failure.
+    let sd_ok = sdcard.num_bytes().is_ok();
+    if sd_ok {
+        info!("SD: card initialised");
+    } else {
+        info!("SD: no card / init failed");
+    }
+    let half_period_ms: u64 = if sd_ok { 500 } else { 125 };
+
+    // dsp::Engine::new() still deferred — its reverb/delay buffers overflow the
+    // 64 KB SRAM heap (needs SDRAM; see BREAKOUT.md + memory note):
     //   let _engine = dsp::Engine::new(48_000.0);
 
     loop {
         led.on();
-        Timer::after_millis(500).await;
+        Timer::after_millis(half_period_ms).await;
         led.off();
-        Timer::after_millis(500).await;
+        Timer::after_millis(half_period_ms).await;
     }
 }
