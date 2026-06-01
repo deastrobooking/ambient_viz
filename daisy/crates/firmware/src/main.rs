@@ -5,115 +5,102 @@ mod sd;
 
 use core::mem::MaybeUninit;
 
-use daisy_embassy::new_daisy_board;
-use defmt::info;
+use daisy_embassy::audio::HALF_DMA_BUFFER_LENGTH;
+use daisy_embassy::{hal, new_daisy_board};
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
-use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 
 use {defmt_rtt as _, panic_probe as _};
 
+// Global allocator kept for the dsp dependency even though the engine isn't
+// constructed yet (its reverb/delay buffers overflow this 64 KB SRAM heap —
+// needs SDRAM; deferred to the audio-DSP phase).
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-/// 64 KB heap in SRAM. Holds the dsp reverb's internal buffers + the dry
-/// scratch buffer. Sized generously; bump if other dsp modules are added.
 const HEAP_SIZE: usize = 64 * 1024;
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
 
+// Audio-path bring-up (streaming step 1 of 2): emit a fixed test tone on the
+// stereo line out to validate SAI + PCM3060 + the jack + the monitor chain,
+// independent of SD. Step 2 replaces the tone with samples streamed from
+// AMBIENT.RAW via a ring buffer (mod sd; still compile-checks the read path).
+
+/// ~440 Hz at the 48 kHz codec rate: 48000 / 440 ≈ 109 samples per period.
+const PERIOD: u32 = 109;
+/// Output level, [0,1]. Keep the line out civilised.
+const AMPLITUDE: f32 = 0.2;
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // Initialise the global allocator before anything that might allocate.
     unsafe {
         let ptr = (&raw mut HEAP_MEM) as *mut u8;
         HEAP.init(ptr as usize, HEAP_SIZE);
     }
 
-    // Daisy clock tree (480 MHz core + peripheral kernel clocks). Needed so
-    // SPI1 has a kernel clock — Default::default() leaves it unset and the SD
-    // SPI init panics (that's why an earlier build flashed but never blinked).
-    let p = embassy_stm32::init(daisy_embassy::default_rcc());
-    info!("ambient-viz-daisy firmware: hello");
+    let p = hal::init(daisy_embassy::default_rcc());
+    info!("ambient-viz-daisy firmware: audio tone test");
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
 
-    // Bring up the SD card on SPI1 (see crates/firmware/src/sd.rs).
-    let sdcard = sd::build_sd_card(
-        p.SPI1,
-        board.pins.d8,  // PG11 / SCK
-        board.pins.d10, // PB5  / MOSI
-        board.pins.d9,  // PB4  / MISO
-        board.pins.d7,  // PG10 / CS
-    );
+    let interface = board
+        .audio_peripherals
+        .prepare_interface(Default::default())
+        .await;
 
-    // Walk the SD bring-up stages and record how far we got. No debug probe is
-    // attached, so the result is reported as an LED blink code below:
-    //   0 = success: FAT32 mounted, AMBIENT.RAW opened + read
-    //   1 = no card / SPI init failed
-    //   2 = card OK but FAT32 volume / root dir mount failed
-    //   3 = volume OK but AMBIENT.RAW not found / unreadable
-    let status: u8 = if sdcard.num_bytes().is_err() {
-        info!("SD: no card / init failed");
-        1
-    } else {
-        // VolumeManager takes ownership of the card; num_bytes()'s borrow is
-        // already released by here.
-        let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
-        match volume_mgr.open_volume(VolumeIdx(0)) {
-            Err(_) => {
-                info!("SD: FAT volume mount failed");
-                2
-            }
-            Ok(volume) => match volume.open_root_dir() {
-                Err(_) => {
-                    info!("SD: open root dir failed");
-                    2
-                }
-                Ok(root) => match root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
-                    Err(_) => {
-                        info!("SD: AMBIENT.RAW not found / open failed");
-                        3
-                    }
-                    Ok(file) => {
-                        let mut buf = [0u8; 512];
-                        match file.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                info!("SD: AMBIENT.RAW opened, read {} bytes", n);
-                                0
-                            }
-                            _ => {
-                                info!("SD: AMBIENT.RAW read returned no data");
-                                3
-                            }
-                        }
-                    }
-                },
-            },
-        }
-    };
+    let mut buf = [0u32; HALF_DMA_BUFFER_LENGTH];
+    let mut pos: u32 = 0;
 
-    // dsp::Engine::new() still deferred — its reverb/delay buffers overflow the
-    // 64 KB SRAM heap (needs SDRAM; see BREAKOUT.md + memory note):
-    //   let _engine = dsp::Engine::new(48_000.0);
-
-    // Blink code: steady 1 Hz on success (status 0), else `status` quick
-    // flashes followed by a pause, repeating.
-    loop {
-        if status == 0 {
+    // 1 Hz heartbeat — distinguishes "running but silent" (audio-path problem)
+    // from "dark" (panic/crash).
+    let led_fut = async {
+        loop {
             led.on();
             Timer::after_millis(500).await;
             led.off();
             Timer::after_millis(500).await;
-        } else {
-            for _ in 0..status {
-                led.on();
-                Timer::after_millis(150).await;
-                led.off();
-                Timer::after_millis(150).await;
-            }
-            Timer::after_millis(1000).await;
         }
+    };
+
+    // Fill every output block with the test tone (same sample on L and R).
+    let audio_fut = async {
+        let mut interface = unwrap!(interface.start_interface().await);
+        unwrap!(
+            interface
+                .start_callback(|_input, output| {
+                    for frame in buf.chunks_mut(2) {
+                        let s = f32_to_u24(make_triangle(pos % PERIOD, PERIOD) * AMPLITUDE);
+                        frame[0] = s; // L
+                        frame[1] = s; // R
+                        pos = pos.wrapping_add(1);
+                    }
+                    output.copy_from_slice(&buf);
+                })
+                .await
+        );
+    };
+
+    join(led_fut, audio_fut).await;
+}
+
+/// Triangle wave in [-1.0, 1.0] for `pos` in [0, period].
+fn make_triangle(pos: u32, period: u32) -> f32 {
+    if pos <= period / 2 {
+        pos as f32 * 4.0 / period as f32 - 1.0
+    } else {
+        let pos = pos - period / 2;
+        pos as f32 * -4.0 / period as f32 + 1.0
     }
+}
+
+/// f32 [-1.0, 1.0] -> 24-bit signed sample (stored in the low bits of a u32),
+/// the format the daisy-embassy SAI callback expects.
+#[inline(always)]
+fn f32_to_u24(x: f32) -> u32 {
+    let x = (x * 8_388_607.0).clamp(-8_388_608.0, 8_388_607.0);
+    (x as i32) as u32
 }
