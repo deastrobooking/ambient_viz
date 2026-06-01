@@ -45,11 +45,13 @@ pub fn build_sd_card<'a>(
     miso: SeedPin9<'a>,
     cs: SeedPin7<'a>,
 ) -> SdCard<SdSpi<'a>, Delay> {
-    // SD spec requires initialising at ≤400 kHz before stepping up. We set
-    // a conservative start frequency here; once the card is online the
-    // driver will switch to a higher rate on its own if we reconfigure.
+    // SD init technically wants ≤400 kHz, but modern SDHC cards reliably
+    // initialise at a few MHz — and we need the throughput: 48k stereo i16 is
+    // ~192 KB/s, far above 400 kHz SPI's ~50 KB/s. 8 MHz (~1 MB/s) gives
+    // headroom and keeps a 512-byte block read (~0.5 ms) inside the 0.67 ms
+    // audio refill deadline. If a card refuses to init at this speed, lower it.
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(400_000);
+    spi_config.frequency = Hertz(8_000_000);
 
     let spi = Spi::new_blocking(spi1, sck, mosi, miso, spi_config);
 

@@ -63,3 +63,6 @@ embedded-alloc = "0.6"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
 embedded-sdmmc = { version = "0.9", default-features = false, features = ["defmt-log"] }
+
+# Lock-free SPSC ring buffer between the SD reader and the audio callback.
+heapless = "0.8"
