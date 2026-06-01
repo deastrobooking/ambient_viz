@@ -6,21 +6,23 @@ mod sd;
 
 use core::mem::MaybeUninit;
 
+use daisy_embassy::audio::AudioPeripherals;
 use daisy_embassy::led::UserLed;
 use daisy_embassy::{hal, new_daisy_board};
-use defmt::{info, unwrap};
-use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use defmt::info;
+use embassy_executor::{InterruptExecutor, Spawner};
+use embassy_futures::join::join;
 use embassy_futures::yield_now;
+use embassy_stm32::interrupt;
+use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
-use heapless::spsc::Queue;
+use heapless::spsc::{Consumer, Queue};
 use static_cell::StaticCell;
 
 // defmt-rtt stays the defmt global logger (info! -> RTT, unread without a
-// probe). The panic handler now lives in `debug` (prints panics over the
-// debug UART), so panic-probe is gone.
+// probe). Panic handler + readable logs are in `debug` (UART on D2).
 use defmt_rtt as _;
 
 #[global_allocator]
@@ -31,14 +33,19 @@ static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
 
-// Streaming step 2a (cooperative) with full LED diagnostics:
-//   1 flash + pause   = no card / SPI init failed
-//   2 flashes + pause = FAT volume / root dir mount failed
-//   3 flashes + pause = AMBIENT.RAW open failed
-//   steady 1 Hz blink = reached the streaming loop (SD setup OK) — audio is
-//                       the success signal from here; silence + heartbeat means
-//                       a format / ring / audio-path problem, not SD setup
-//   dark              = panicked somewhere unexpected (e.g. audio start error)
+// 2b: audio runs on a high-priority interrupt executor so blocking SD reads
+// (and, later, DSP/MIDI) on the thread executor can never starve the SAI
+// refill. UART4's vector is unused by the app and just drives this executor —
+// any otherwise-free interrupt vector works.
+static AUDIO_EXEC: InterruptExecutor = InterruptExecutor::new();
+
+#[interrupt]
+unsafe fn UART4() {
+    unsafe { AUDIO_EXEC.on_interrupt() }
+}
+
+// LED (thread executor): 1 flash = no card, 2 = FAT mount, 3 = AMBIENT.RAW
+// open failed; steady 1 Hz = streaming. Panics print over the debug UART.
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -48,24 +55,23 @@ async fn main(_spawner: Spawner) {
     }
 
     let p = hal::init(daisy_embassy::default_rcc());
-    info!("ambient-viz-daisy firmware: SD stream (2a, diagnostics)");
+    info!("ambient-viz-daisy firmware: SD stream (2b, interrupt executor)");
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
 
-    // Debug UART: plain-text logs on USART3 TX (D2 / PC10), read on the Shikra
-    // at 115200. Separate peripheral from USART1/MIDI so baud rates can't clash.
+    // Debug UART on USART3 TX (D2 / PC10), 115200, read on the Shikra.
     let mut dbg_cfg = embassy_stm32::usart::Config::default();
     dbg_cfg.baudrate = 115_200;
     let dbg_tx =
         embassy_stm32::usart::UartTx::new_blocking(p.USART3, board.pins.d2, dbg_cfg).unwrap();
     debug::init(dbg_tx);
-    dbg_uart!("=== ambient-viz-daisy boot: SD stream (2a) ===");
+    dbg_uart!("=== ambient-viz-daisy boot: SD stream (2b) ===");
 
-    let interface = board
-        .audio_peripherals
-        .prepare_interface(Default::default())
-        .await;
+    // Hand the audio peripherals to the interrupt-executor task (below). Doing
+    // all SAI setup inside the task keeps the non-Send Interface from crossing
+    // the executor boundary — only the Send AudioPeripherals + Consumer do.
+    let audio_peripherals = board.audio_peripherals;
 
     let sdcard = sd::build_sd_card(
         p.SPI1,
@@ -76,16 +82,13 @@ async fn main(_spawner: Spawner) {
     );
 
     if sdcard.num_bytes().is_err() {
-        info!("SD: no card / init failed");
         dbg_uart!("SD: no card / init failed (blink 1)");
         blink_code(&mut led, 1).await;
     }
-
     let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
     let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
         Ok(v) => v,
         Err(_) => {
-            info!("SD: FAT volume mount failed");
             dbg_uart!("SD: FAT volume mount failed (blink 2)");
             blink_code(&mut led, 2).await
         }
@@ -93,7 +96,6 @@ async fn main(_spawner: Spawner) {
     let root = match volume.open_root_dir() {
         Ok(r) => r,
         Err(_) => {
-            info!("SD: open root dir failed");
             dbg_uart!("SD: open root dir failed (blink 2)");
             blink_code(&mut led, 2).await
         }
@@ -101,18 +103,23 @@ async fn main(_spawner: Spawner) {
     let file = match root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
         Ok(f) => f,
         Err(_) => {
-            info!("SD: AMBIENT.RAW open failed");
             dbg_uart!("SD: AMBIENT.RAW open failed (blink 3)");
             blink_code(&mut led, 3).await
         }
     };
-    info!("SD: streaming AMBIENT.RAW ({} bytes)", file.length());
     dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
 
     let q = RING.init(Queue::new());
-    let (mut producer, mut consumer) = q.split();
+    let (mut producer, consumer) = q.split();
 
-    // Heartbeat: shows we reached streaming (vs a panic = dark LED).
+    // Spawn the audio consumer on the high-priority interrupt executor.
+    interrupt::UART4.set_priority(Priority::P6);
+    let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
+    audio_spawner.must_spawn(audio_task(audio_peripherals, consumer));
+    dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
+
+    // Producer + heartbeat on the thread executor. Blocking SD reads here can
+    // no longer glitch the audio — the interrupt executor preempts them.
     let heartbeat = async {
         loop {
             led.on();
@@ -121,9 +128,6 @@ async fn main(_spawner: Spawner) {
             Timer::after_millis(500).await;
         }
     };
-
-    // Producer: read AMBIENT.RAW one block at a time into the ring, looping at
-    // EOF; yield between blocks and when full so the audio callback runs.
     let reader = async {
         let mut block = [0u8; 512];
         loop {
@@ -147,31 +151,40 @@ async fn main(_spawner: Spawner) {
             yield_now().await;
         }
     };
+    join(heartbeat, reader).await;
+}
 
-    // Consumer: drain L,R pairs into each output frame; silence on underrun.
-    // start_callback only returns on a SAI error (e.g. an overrun when a
-    // blocking SD read on this same executor stalls past the refill deadline).
-    // Don't panic on that — restart the callback so the stream continues with
-    // a glitch at the seam instead of dying. (Step 2b removes the overruns by
-    // moving this onto a high-priority interrupt executor.)
-    let audio = async {
-        let mut interface = unwrap!(interface.start_interface().await.ok());
-        loop {
-            let _ = interface
-                .start_callback(|_input, output| {
-                    for frame in output.chunks_mut(2) {
-                        let l = consumer.dequeue().unwrap_or(0);
-                        let r = consumer.dequeue().unwrap_or(0);
-                        frame[0] = i16_to_u24(l);
-                        frame[1] = i16_to_u24(r);
-                    }
-                })
-                .await;
-            yield_now().await;
+/// Audio output, on the interrupt executor. Drains L,R pairs from the ring into
+/// each SAI block; silence on underrun. With audio here, SD read duration on
+/// the thread executor is irrelevant to refill timing.
+#[embassy_executor::task]
+async fn audio_task(
+    audio: AudioPeripherals<'static>,
+    mut consumer: Consumer<'static, i16, RING_LEN>,
+) {
+    let interface = audio.prepare_interface(Default::default()).await;
+    let mut interface = match interface.start_interface().await {
+        Ok(i) => i,
+        Err(_) => {
+            dbg_uart!("audio: start_interface FAILED");
+            return;
         }
     };
-
-    join3(heartbeat, reader, audio).await;
+    dbg_uart!("audio: interface started");
+    loop {
+        // start_callback returns only on a SAI error; on its own executor that
+        // shouldn't happen now. Restart rather than panic if it ever does.
+        let _ = interface
+            .start_callback(|_input, output| {
+                for frame in output.chunks_mut(2) {
+                    let l = consumer.dequeue().unwrap_or(0);
+                    let r = consumer.dequeue().unwrap_or(0);
+                    frame[0] = i16_to_u24(l);
+                    frame[1] = i16_to_u24(r);
+                }
+            })
+            .await;
+    }
 }
 
 /// Repeating LED code: `code` quick flashes then a pause. Never returns.
