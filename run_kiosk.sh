@@ -10,12 +10,21 @@
 #   ./run_kiosk.sh --mock                # synthetic data, no hardware
 #   ./run_kiosk.sh                       # (all sensors) — when other phases come online
 #
-# Env vars forwarded to the Node server: MOCK, PORT, INGEST_TOKEN.
+# Env vars forwarded to the Node server: MOCK, PORT, INGEST_TOKEN, DAISY,
+# DAISY_SERIAL. DAISY defaults to 1 here — the kiosk reads the Daisy's USB-CDC
+# song position (/dev/ttyACM0) as the visualizer's timing clock. Set DAISY=0 to
+# disable, or DAISY_SERIAL to override the port.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+
+# Read the Daisy's USB-CDC song position as the visualizer's timing clock
+# (PLAN_USB_COMPOSITE Phase D). On by default for the kiosk; DAISY=0 disables,
+# DAISY_SERIAL overrides the port (defaults to /dev/ttyACM0 on the Pi). Forwarded
+# to the Node server below. Requires `npm install` in server/ (serialport dep).
+export DAISY="${DAISY:-1}"
 
 if [ "$#" -gt 0 ]; then
   SIDECAR_ARGS=("$@")
@@ -27,8 +36,11 @@ fi
 # distance reading to scale the bitmap (resolution drops as someone
 # approaches). The toggle's dev-panel control is unreachable in lite
 # mode, so the URL param is the kiosk-launch mechanism.
+# clock=daisy makes the visualizer follow the Daisy's song position (freezing
+# the automation lanes until the first POS arrives) rather than any local audio
+# clock — the Daisy is the timing master in the kiosk.
 PORT_FOR_URL="${PORT:-8080}"
-KIOSK_URL="http://localhost:${PORT_FOR_URL}/?distanceToBitmap=on"
+KIOSK_URL="http://localhost:${PORT_FOR_URL}/?distanceToBitmap=on&clock=daisy"
 
 # Prefer the project venv; fall back to whatever python is on PATH (the
 # Pi README's `pip install -e .` flow can target system Python).

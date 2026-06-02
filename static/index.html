@@ -4123,6 +4123,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   window.AMBIENT_INPUTS = state;
   Object.defineProperty(state, '__meta', { value: meta, enumerable: false });
 
+  // Song position from the Daisy (CDC -> `song_position` topic, ~20 Hz). Capture
+  // the local receive time so the frame loop can interpolate between updates and
+  // hard-snap on a backward jump (loop wrap / reconnect rebases the basis).
+  const song = { have: false, pos: 0, wall: 0 };
+  window.AMBIENT_SONG = song;
+
   if (typeof EventSource === 'undefined') return;
   if (location.protocol === 'file:') return;
 
@@ -4135,6 +4141,11 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       const { name, value, ts } = JSON.parse(ev.data);
       state[name] = value;
       meta.lastEventAt = ts || Date.now();
+      if (name === 'song_position' && typeof value === 'number' && isFinite(value)) {
+        song.pos = value;
+        song.wall = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        song.have = true;
+      }
     } catch { /* ignore bad frame */ }
   });
   es.addEventListener('ready', () => { meta.connected = true; meta.error = null; });
@@ -6433,6 +6444,27 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // the main thread). All visualizer rendering happens in the worker.
   let mainFpsAccumStart = performance.now();
   let mainFpsAccumCount = 0;
+
+  // Clock source for the automation lanes. Prefer the Daisy's song position
+  // (`song_position` SSE topic): interpolate between its ~50 ms updates at
+  // playback rate 1.0, hold the last value if updates stall (Daisy unplugged /
+  // paused) instead of extrapolating off the end, and rely on per-frame rebasing
+  // so a backward jump (loop wrap / reconnect) hard-snaps. `?clock=daisy` forces
+  // it and freezes the lanes until the first POS (exhibit mode, avoids a startup
+  // jump); `?clock=local` forces the local audio element; default `auto` uses the
+  // Daisy when present and falls back to local audio otherwise (dev).
+  const SONG_CLOCK_MODE = (new URLSearchParams(location.search).get('clock') || 'auto').toLowerCase();
+  const SONG_STALE_MS = 2000;
+  function songClock() {
+    const s = window.AMBIENT_SONG;
+    if (SONG_CLOCK_MODE !== 'local' && s && s.have) {
+      const age = performance.now() - s.wall;
+      return age <= SONG_STALE_MS ? s.pos + age / 1000 : s.pos;
+    }
+    if (SONG_CLOCK_MODE === 'daisy') return null; // freeze lanes until first POS
+    return (currentEl && isFinite(currentEl.currentTime)) ? currentEl.currentTime : null;
+  }
+
   function frame() {
     const now = performance.now();
     mainFpsAccumCount++;
@@ -6440,8 +6472,9 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       mainFpsAccumStart = now;
       mainFpsAccumCount = 0;
     }
-    if (currentEl && isFinite(currentEl.currentTime)) {
-      applyAutomation(currentEl.currentTime);
+    const songT = songClock();
+    if (songT != null && isFinite(songT)) {
+      applyAutomation(songT);
     }
     const b = bands();
     if (renderWorker) {

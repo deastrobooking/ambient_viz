@@ -27,6 +27,14 @@ if (MOCK) {
   console.log('mock source: enabled');
 }
 
+// Daisy song-position tail (PLAN_USB_COMPOSITE Phase D). Enable with DAISY=1
+// (defaults to /dev/ttyACM0) or by setting DAISY_SERIAL to the port path.
+const DAISY = process.env.DAISY === '1' || process.env.DAISY === 'true' || !!process.env.DAISY_SERIAL;
+if (DAISY) {
+  require('./inputs/daisy-position')({ publish });
+  console.log('daisy-position source: enabled');
+}
+
 const sseClients = new Set();
 inputBus.on('change', (entry) => {
   const payload = `event: change\ndata: ${JSON.stringify(entry)}\n\n`;
