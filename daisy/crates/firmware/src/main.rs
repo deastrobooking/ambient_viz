@@ -5,6 +5,8 @@ extern crate alloc;
 
 mod debug;
 mod sd;
+#[cfg(feature = "debug-uart")]
+mod temp;
 #[allow(dead_code)] // some control-handler accessors unused until composite CDC
 mod uac_source;
 mod usb_audio;
@@ -108,12 +110,17 @@ async fn main(spawner: Spawner) {
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
 
-    // Debug UART on USART3 TX (D2 / PC10), 115200, read on the Shikra.
-    let mut dbg_cfg = embassy_stm32::usart::Config::default();
-    dbg_cfg.baudrate = 115_200;
-    let dbg_tx =
-        embassy_stm32::usart::UartTx::new_blocking(p.USART3, board.pins.d2, dbg_cfg).unwrap();
-    debug::init(dbg_tx);
+    // Debug UART on USART3 TX (D2 / PC10), 115200, read on the Shikra. Only
+    // brought up for the `debug-uart` build; the production build leaves USART3
+    // and D2 unused and emits nothing.
+    #[cfg(feature = "debug-uart")]
+    {
+        let mut dbg_cfg = embassy_stm32::usart::Config::default();
+        dbg_cfg.baudrate = 115_200;
+        let dbg_tx =
+            embassy_stm32::usart::UartTx::new_blocking(p.USART3, board.pins.d2, dbg_cfg).unwrap();
+        debug::init(dbg_tx);
+    }
     dbg_uart!("=== ambient-viz-daisy boot ===");
 
     // Bring up external SDRAM and relocate the global heap into it — the DSP FX
@@ -295,6 +302,12 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(usb_cdc::position_emit_task(cdc_tx, loop_frames));
     spawner.must_spawn(usb_cdc::midi_in_task(cdc_rx));
     dbg_uart!("usb: UAC source + CDC position built + tasks spawned");
+
+    // Chip-temperature telemetry on the thread executor (lowest priority, below
+    // the P6 audio interrupt executor), so its ~20 µs ADC busy-wait every 5 s is
+    // preempted by the audio callback and never glitches the SAI. Debug-only.
+    #[cfg(feature = "debug-uart")]
+    spawner.must_spawn(temp::temp_task(p.ADC3));
 
     // Producer + heartbeat on the thread executor. Blocking SD reads here can
     // no longer glitch the audio — the interrupt executor preempts them.

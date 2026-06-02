@@ -3472,6 +3472,14 @@ function frame(now) {
       restoreFreeze();
     }
     freezeFrames -= dt;
+    if (freezeFrames <= 0) {
+      // Visual freeze just released — release the audio freeze (CC24 -> 0).
+      fetch('/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'freeze', value: 0 }),
+      }).catch(() => {});
+    }
     // Twist is now applied inside the merged dither pass downstream
     // (uTwist/uPinch uniforms). Previously had an explicit applyTwist
     // call here; removed to drop the second per-frame texImage2D.
@@ -3842,6 +3850,14 @@ function frame(now) {
       if (_lattUseGL) glCaptureFreeze();
       else captureFreeze();
       pendingFreeze = false;
+      // Couple the audio freeze to this visual freeze: browser -> bridge (/ingest
+      // 'freeze') -> Daisy CC24. The bridge dedupes, so re-triggers while already
+      // frozen are cheap. Audio trails by the round trip (accepted flam).
+      fetch('/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'freeze', value: 1 }),
+      }).catch(() => {});
     }
     if (pendingShuffle) {
       if (_lattUseGL) applyBlockShuffleGL(W, H);

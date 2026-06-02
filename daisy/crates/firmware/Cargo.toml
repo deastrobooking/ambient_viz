@@ -3,6 +3,15 @@ name = "firmware"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# `debug-uart` (on by default) compiles the plain-text USART3 diagnostics: the
+# boot log, the 1 Hz audio-health heartbeat, the ~5 s chip-temperature readout,
+# and the panic-message print. Every `dbg_uart!` is a no-op without it, the UART
+# is never initialised, and the panic handler just halts — so the production
+# build (`--no-default-features`) carries zero debug UART traffic or code.
+default = ["debug-uart"]
+debug-uart = []
+
 [dependencies]
 dsp = { path = "../dsp" }
 

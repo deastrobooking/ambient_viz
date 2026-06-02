@@ -33,6 +33,25 @@ workspace's `default-members` excludes `firmware`, so a bare `cargo build`
 from the root builds only the Mac-buildable crates and won't fail on
 firmware's thumb target.
 
+### Production build (no debug UART)
+
+The dev builds emit plain-text diagnostics over USART3 (D2): a boot log, a
+1 Hz audio-health heartbeat, a ~5 s STM32 die-temperature readout, and panic
+messages. These are all gated behind the `debug-uart` cargo feature (on by
+default). The shipping kiosk firmware strips them with `--no-default-features`
+— USART3 is never brought up, every `dbg_uart!` compiles to nothing, and the
+panic handler just halts:
+
+```bash
+# Production DFU image -> target/firmware-prod.bin (no UART debug traffic)
+cargo bin-prod
+# hold BOOT, tap RESET, release BOOT
+dfu-util -a 0 -s 0x08000000:leave -D target/firmware-prod.bin
+
+# Or flash directly with a probe:
+cargo flash-prod
+```
+
 ## Prerequisites
 
 ```bash

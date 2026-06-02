@@ -63,6 +63,13 @@ const BASE_ORDER: usize = 128;
 const MIN_FREQ_HZ: f32 = 20.0;
 const UM_TO_M: f32 = 1.0e-6;
 const IPS_TO_MPS: f32 = 0.0254;
+/// Throttle the FIR rebuild to at most once per this many `process` blocks. A
+/// sudden tape-failure change (e.g. a CC jump) makes `current_failure` smooth
+/// over ~130 ms, which would otherwise re-derive the FIR on nearly every block;
+/// the back-to-back ~0.4 ms rebuilds overrun the SAI. Spacing them keeps each
+/// isolated (absorbed by the FIFO); the coefs lag the smoothing by <= this many
+/// blocks (~5 ms — imperceptible).
+const REBUILD_EVERY: u32 = 8;
 
 pub struct LossFilter {
     fs: f32,
@@ -87,6 +94,7 @@ pub struct LossFilter {
     thickness_um: f32,
     gap_um: f32,
     dirty: bool,
+    blocks_since_rebuild: u32,
 }
 
 impl LossFilter {
@@ -113,6 +121,7 @@ impl LossFilter {
             thickness_um: 0.1,
             gap_um: 1.0,
             dirty: true,
+            blocks_since_rebuild: REBUILD_EVERY, // first runtime dirty rebuilds promptly
         };
         f.recompute_coefs();
         f
@@ -204,8 +213,13 @@ impl LossFilter {
 
     /// Convolve one mono buffer in place.
     pub fn process(&mut self, buf: &mut [f32]) {
-        if self.dirty {
-            self.recompute_coefs();
+        // Throttle rebuilds so a fast failure change can't re-derive the FIR on
+        // every block (back-to-back rebuilds overrun the SAI). Each rebuild stays
+        // isolated; coefs lag the smoothing by <= REBUILD_EVERY blocks.
+        self.blocks_since_rebuild = self.blocks_since_rebuild.saturating_add(1);
+        if self.dirty && self.blocks_since_rebuild >= REBUILD_EVERY {
+            self.recompute_coefs(); // clears dirty
+            self.blocks_since_rebuild = 0;
         }
 
         let order = self.order;
