@@ -432,6 +432,73 @@ tables above — wire by silkscreen label.
 SCL, 3V3, GND off the buses onto the twisted pairs (pairing per the Cat5
 section). All GND conductors to the GND bus.
 
+### Board B — minimal variant (MPR121 + VL53L1X only)
+
+For the **first board to build**, use only the two I²C devices: **MPR121**
+(touch) and **VL53L1X** (distance, remote over Cat5). This omits:
+
+- **TLC555 + HR202** (breath trigger) — the entire oscillator circuit, R1, C1,
+  the two timing caps, and GPIO17.
+- **ADS1115** (unused ADC) — and its bus tap.
+- **AM312** (PIR motion) — and GPIO4.
+
+Both remaining devices are I²C, so the board reduces to: bus distribution +
+the two pull-ups + one MPR121 socket + the Cat5 landing. It fits on a much
+smaller perfboard than the full version.
+
+```
+   ↑ top edge — Pi-entry header (5 F-F jumpers from Pi GPIO) ↑
+  ┌────────────────────────────────────────────────────────┐
+  │ [Pi entry 5p: 3V3  GND  SDA  SCL  G27]                  │
+  │  3V3 bus ══════════════════════════════════════         │
+  │  SDA bus ──────────────────────────────────────         │
+  │  SCL bus ──────────────────────────────────────         │
+  │ [4.7k SDA→3V3]  [4.7k SCL→3V3]                          │
+  │                                                          │
+  │   ┌─ MPR121 socket ─┐         [Cat5 landing → VL53L1X]  │
+  │   │ VCC GND SDA SCL  │          SDA  SCL  3V3  GND        │
+  │   │ IRQ→G27  ADDR→GND│                                   │
+  │   └──────────────────┘                                  │
+  │  GND bus ══════════════════════════════════════         │
+  └────────────────────────────────────────────────────────┘
+```
+
+**Pi-entry header (5-pin)** — F-F jumpers from these Pi physical pins:
+
+| Board pin | Pi physical pin | Signal |
+|---|---|---|
+| 1 | 1 | 3V3 → 3V3 bus |
+| 2 | 6 | GND → GND bus |
+| 3 | 3 | SDA → SDA bus |
+| 4 | 5 | SCL → SCL bus |
+| 5 | 13 | GPIO27 ← MPR121 IRQ |
+
+**Buses → loads:**
+- **3V3 bus** → MPR121 VCC, both pull-up tops, Cat5 3V3 conductor.
+- **GND bus** → MPR121 GND, MPR121 ADDR (sets address 0x5A), Cat5 GND conductors.
+- **SDA bus** → MPR121 SDA, Cat5 SDA.
+- **SCL bus** → MPR121 SCL, Cat5 SCL.
+- **GPIO27** ← MPR121 IRQ (direct, not a bus).
+
+**IRQ is optional** — if you'd rather poll the MPR121, drop GPIO27 and the
+Pi-entry header becomes 4 pins (3V3/GND/SDA/SCL). IRQ is still recommended.
+
+**The Cat5 remote VL53L1X wiring is unchanged** — see "Remote VL53L1X over
+Cat5" above. Keep the 0.1 µF + 10 µF at the sensor end.
+
+**Sanity check:** `i2cdetect -y 1` should now show exactly **0x29** (VL53L1X)
+and **0x5A** (MPR121) — not 0x48, and no GPIO-based sensors. The 4.7 kΩ
+pull-ups stay (still need them for the bus; the VL53L1X breakout's are weak).
+
+**Adding the rest later** is non-destructive — each omitted device just taps
+the existing buses: AM312 = 3 wires (VCC/OUT→a free GPIO/GND, no circuitry);
+ADS1115 = 4 wires onto the I²C bus (0x48); TLC555 breath = the oscillator
+circuit + GPIO17 per the full layout above.
+
+**Backend note:** with this variant the event vocabulary is just `distance_cm`
+and `touch_changed(channel, state)` — no `motion_started`/`motion_ended` or
+`breath_detected` until those sensors are added.
+
 **Sanity check sequence after wiring:**
 
 1. `sudo i2cdetect -y 1` — should show 0x29, 0x48, 0x5A reliably.

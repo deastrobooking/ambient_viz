@@ -3,8 +3,9 @@
 
 mod debug;
 mod sd;
-#[allow(dead_code)] // wired into the USB device in the next step
+#[allow(dead_code)] // some control-handler accessors unused until composite CDC
 mod uac_source;
+mod usb_audio;
 
 use core::mem::MaybeUninit;
 
@@ -20,7 +21,7 @@ use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
-use heapless::spsc::{Consumer, Queue};
+use heapless::spsc::{Consumer, Producer, Queue};
 use static_cell::StaticCell;
 
 // defmt-rtt stays the defmt global logger (info! -> RTT, unread without a
@@ -34,6 +35,13 @@ static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP
 
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
+
+// Second SPSC ring: the SAI callback tees the played samples here and the USB
+// stream task drains them into the iso-IN endpoint. Kept small so it stays
+// near-empty in steady state (low capture latency); overflow is dropped while
+// the host isn't capturing.
+const USB_RING_LEN: usize = 512;
+static USB_RING: StaticCell<Queue<i16, USB_RING_LEN>> = StaticCell::new();
 
 // 2b: audio runs on a high-priority interrupt executor so blocking SD reads
 // (and, later, DSP/MIDI) on the thread executor can never starve the SAI
@@ -50,7 +58,7 @@ unsafe fn UART4() {
 // open failed; steady 1 Hz = streaming. Panics print over the debug UART.
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     unsafe {
         let ptr = (&raw mut HEAP_MEM) as *mut u8;
         HEAP.init(ptr as usize, HEAP_SIZE);
@@ -113,12 +121,65 @@ async fn main(_spawner: Spawner) {
 
     let q = RING.init(Queue::new());
     let (mut producer, consumer) = q.split();
+    let usb_q = USB_RING.init(Queue::new());
+    let (usb_producer, usb_consumer) = usb_q.split();
 
     // Spawn the audio consumer on the high-priority interrupt executor.
     interrupt::UART4.set_priority(Priority::P6);
     let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
-    audio_spawner.must_spawn(audio_task(audio_peripherals, consumer));
+    audio_spawner.must_spawn(audio_task(audio_peripherals, consumer, usb_producer));
     dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
+
+    // --- USB: UAC1 audio source (capture) over OTG-FS -----------------------
+    // Stage 1: enumerate as a capture device + stream silence on the iso-IN EP.
+    static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static BOS_DESC: StaticCell<[u8; 32]> = StaticCell::new();
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    static EP_OUT: StaticCell<[u8; usb_audio::EP_OUT_BUF]> = StaticCell::new();
+    static UAC_HANDLER: StaticCell<uac_source::AudioSourceControlHandler> = StaticCell::new();
+
+    let mut usb_cfg = embassy_stm32::usb::Config::default();
+    usb_cfg.vbus_detection = false; // safe default; Daisy is bus-powered
+    let usb_driver = embassy_stm32::usb::Driver::new_fs(
+        board.usb_peripherals.usb_otg_fs,
+        usb_audio::Irqs,
+        board.usb_peripherals.pins.DP,
+        board.usb_peripherals.pins.DN,
+        EP_OUT.init([0u8; usb_audio::EP_OUT_BUF]),
+        usb_cfg,
+    );
+
+    let mut dev_cfg = embassy_usb::Config::new(0x1209, 0x0001); // pid.codes test VID
+    dev_cfg.manufacturer = Some("ambient-viz");
+    dev_cfg.product = Some("Daisy audio source");
+    dev_cfg.serial_number = Some("0001");
+    // IAD device class so the (future) composite UAC + CDC enumerates cleanly.
+    dev_cfg.device_class = 0xEF;
+    dev_cfg.device_sub_class = 0x02;
+    dev_cfg.device_protocol = 0x01;
+    dev_cfg.composite_with_iads = true;
+
+    let mut usb_builder = embassy_usb::Builder::new(
+        usb_driver,
+        dev_cfg,
+        CONFIG_DESC.init([0; 256]),
+        BOS_DESC.init([0; 32]),
+        &mut [],
+        CONTROL_BUF.init([0; 64]),
+    );
+
+    let (uac_audio_ep, _uac_feedback_ep, uac_handler) = uac_source::AudioSource::new(
+        &mut usb_builder,
+        &usb_audio::SAMPLE_RATES,
+        embassy_usb::class::uac1::SampleWidth::Width2Byte,
+        usb_audio::FEEDBACK_REFRESH_MS,
+    );
+    usb_builder.handler(UAC_HANDLER.init(uac_handler));
+
+    let usb_device = usb_builder.build();
+    spawner.must_spawn(usb_audio::usb_task(usb_device));
+    spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
+    dbg_uart!("usb: UAC source built + tasks spawned");
 
     // Producer + heartbeat on the thread executor. Blocking SD reads here can
     // no longer glitch the audio — the interrupt executor preempts them.
@@ -163,6 +224,7 @@ async fn main(_spawner: Spawner) {
 async fn audio_task(
     audio: AudioPeripherals<'static>,
     mut consumer: Consumer<'static, i16, RING_LEN>,
+    mut usb_producer: Producer<'static, i16, USB_RING_LEN>,
 ) {
     let interface = audio.prepare_interface(Default::default()).await;
     let mut interface = match interface.start_interface().await {
@@ -183,6 +245,10 @@ async fn audio_task(
                     let r = consumer.dequeue().unwrap_or(0);
                     frame[0] = i16_to_u24(l);
                     frame[1] = i16_to_u24(r);
+                    // Tee what we play to the USB capture ring. Drops on full,
+                    // which is exactly when the host isn't draining (not capturing).
+                    let _ = usb_producer.enqueue(l);
+                    let _ = usb_producer.enqueue(r);
                 }
             })
             .await;

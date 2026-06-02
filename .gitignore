@@ -10,3 +10,6 @@ node_modules/
 
 # Claude Code session / job state
 .claude/
+
+# raw audio
+AMBIENT.RAW

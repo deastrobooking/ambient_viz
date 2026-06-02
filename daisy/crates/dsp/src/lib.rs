@@ -22,7 +22,9 @@ pub mod bass;
 pub mod bloom;
 pub mod chord;
 pub mod fm_stab;
+pub mod freeze;
 pub mod hihat;
+pub mod limiter;
 pub mod midi;
 pub mod midi_map;
 pub mod sequencer;
@@ -92,6 +94,18 @@ pub struct Engine {
     /// "approach pulls clarity + tone out of the rain" gesture.
     bloom: bloom::BloomBank,
     tape: tape::TapeProcessor,
+    /// Master "freeze" — parallel-send grain hold; produces a looped grain of
+    /// the post-everything master, run through `glitch_tape` and summed *under*
+    /// the live master. Audio mirror of the visualizer's frame-freeze. Driven
+    /// by [`Engine::set_freeze`]; the exhibit transport for it is unconnected.
+    freeze: freeze::Freeze,
+    /// Stripped failure-tape (wow/flutter + chew) for the freeze ghost. Run
+    /// only while the freeze is active.
+    glitch_tape: freeze::GlitchTape,
+    /// Scratch for the freeze ghost send (stereo interleaved).
+    freeze_send: Vec<f32>,
+    /// Master peak limiter on the summed (master + ghost) output.
+    limiter: limiter::Limiter,
     /// Holds the dry sampler output across the reverb call so we can mix wet+dry.
     dry_scratch: Vec<f32>,
     /// Global sample index, fed to FrameProcessor::process for time-aware effects.
@@ -186,6 +200,10 @@ impl Engine {
             reverb,
             bloom: bloom::BloomBank::new(sample_rate),
             tape: tape::TapeProcessor::new(sample_rate),
+            freeze: freeze::Freeze::new(sample_rate),
+            glitch_tape: freeze::GlitchTape::new(sample_rate),
+            freeze_send: Vec::new(),
+            limiter: limiter::Limiter::new(sample_rate),
             dry_scratch: Vec::new(),
             sample_index: 0,
             // A wash of room by default — the cold, spacious Cybotron air. Dial
@@ -303,6 +321,15 @@ impl Engine {
         self.bloom.amount()
     }
 
+    /// Set the master freeze wet/dry amount (0 = passthrough, 1 = held grain).
+    /// Crossing above 0 latches the current grain and loops it.
+    pub fn set_freeze(&mut self, amount: f32) {
+        self.freeze.set_amount(amount);
+    }
+    pub fn freeze_amount(&self) -> f32 {
+        self.freeze.amount()
+    }
+
     /// Enable/disable the step sequencer. When disabled, no kick/hat/stab
     /// triggers fire and the sequencer clock is frozen; the sampler, reverb,
     /// tape and bloom keep running so the track + processing can be auditioned
@@ -381,6 +408,7 @@ impl Engine {
             Param::BassRes => self.bass.set_resonance(value),
             Param::BassEnvMod => self.bass.set_env_mod(value),
             Param::BassGain => self.bass.set_gain(value),
+            Param::Freeze => self.freeze.set_amount(value),
         }
     }
 
@@ -511,6 +539,25 @@ impl Engine {
         //    Phase 1 (head bump + hiss); wow/flutter, loss filter, and
         //    hysteresis chain in here as they land. See TAPE_SIMULATION.md.
         self.tape.process(output, self.sample_index);
+
+        // 7. Parallel freeze ghost. The live master above plays untouched; the
+        //    freeze holds a grain of it and (only while active) runs it through
+        //    the stripped failure-tape, summed *under* the master at a fixed
+        //    trim. The producer always runs (cheap: records the ring or reads
+        //    the loop); the glitch-tape + sum are gated on `active()`.
+        self.freeze_send.resize(output.len(), 0.0);
+        self.freeze.process(output, &mut self.freeze_send);
+        if self.freeze.active() {
+            self.glitch_tape.process(&mut self.freeze_send);
+            for (o, &g) in output.iter_mut().zip(self.freeze_send.iter()) {
+                *o += g * freeze::FREEZE_RETURN_GAIN;
+            }
+        }
+
+        // 8. Master limiter — runs always; transparent for the dry master,
+        //    brick-walls the summed (master + ghost) so the ghost can't clip or
+        //    push the level past the original. The sum (step 7) is before this.
+        self.limiter.process(output);
 
         self.sample_index += (output.len() / 2) as u64;
     }

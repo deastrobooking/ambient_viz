@@ -86,6 +86,12 @@ pub fn sample_rate_subscriber() -> SampleRateSub {
     SAMPLE_RATE_CHANNEL.subscriber().unwrap()
 }
 
+/// Extra stereo samples per frame the iso-IN endpoint can carry above the
+/// nominal rate. Async-IN headroom: when the SAI clock runs ahead of the host
+/// SOF clock, samples accumulate and we send a slightly larger packet to catch
+/// up. 8 samples is far more than real clock drift (<<0.1%) + SOF jitter needs.
+pub const MAX_EXTRA_SAMPLES: u16 = 8;
+
 fn calculate_max_packet_size(sample_rate_hz: u32, num_channels: u8, b_subframe_size: u8) -> u16 {
     let bytes_per_ms = (sample_rate_hz * num_channels as u32 * b_subframe_size as u32) / 1000;
     debug!(
@@ -229,9 +235,13 @@ impl<'d, D: Driver<'d>> AudioSource<'d, D> {
         ];
         b.descriptor(CS_INTERFACE, &format_type_i_body);
 
-        // Isochronous IN endpoint for audio data (device -> host).
-        let max_packet_size: u16 =
-            calculate_max_packet_size(*max_rate, MAX_AUDIO_CHANNEL_COUNT as u8, sample_width as u8);
+        // Isochronous IN endpoint for audio data (device -> host). Declare async
+        // headroom above the nominal bytes/frame (see MAX_EXTRA_SAMPLES).
+        let max_packet_size: u16 = calculate_max_packet_size(
+            *max_rate,
+            MAX_AUDIO_CHANNEL_COUNT as u8,
+            sample_width as u8,
+        ) + MAX_AUDIO_CHANNEL_COUNT as u16 * sample_width as u16 * MAX_EXTRA_SAMPLES;
         let audio_in_endpoint = b.alloc_endpoint_in(EndpointType::Isochronous, None, max_packet_size, 1);
         debug!(
             "uac: audio EP addr={:?} mps={} interval={}",
@@ -469,11 +479,27 @@ impl AudioSourceControlHandler {
 }
 
 impl Handler for AudioSourceControlHandler {
+    // These callbacks mirror the bus state machine; logged over the debug UART
+    // (defmt info! is RTT-only) so enumeration progress is visible on the Shikra.
+    fn enabled(&mut self, enabled: bool) {
+        crate::dbg_uart!("uac: enabled={}", enabled);
+    }
+
+    fn reset(&mut self) {
+        crate::dbg_uart!("uac: bus reset");
+    }
+
+    fn addressed(&mut self, addr: u8) {
+        crate::dbg_uart!("uac: addressed={}", addr);
+    }
+
     fn configured(&mut self, configured: bool) {
         info!("uac: configured={}", configured);
+        crate::dbg_uart!("uac: configured={}", configured);
     }
 
     fn set_alternate_setting(&mut self, iface: InterfaceNumber, alternate_setting: u8) {
+        crate::dbg_uart!("uac: iface {} alt -> {}", iface.0, alternate_setting);
         if iface == self.iface_stream_num {
             info!("uac: streaming alt-setting -> {}", alternate_setting);
         }

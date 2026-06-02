@@ -172,6 +172,62 @@ controller (`main.rs:113`). So the entire *dsp* side of this feature works now:
 turn a knob, hear the tape eat itself. Phase E adds only the transport — the
 audio behavior is already exercisable and unit-testable without hardware.
 
+#### Browser-authored freeze (reuses this transport)
+
+> **Status (audio engine done; transport unconnected).** The freeze DSP is
+> built and tested as a **parallel send** (chosen over replace-freeze so the
+> composition keeps playing under a degraded ghost). `crates/dsp/src/freeze.rs`:
+> `Freeze` records the post-everything master into a ring and, while active,
+> loops a ~0.3 s grain via seam-aligned two-head overlap-add (windows sum to
+> 1.0; read offset by the frozen `write` so the wrap is masked → click-free),
+> with a ~10 ms level fade. The grain runs through `GlitchTape` (stripped
+> failure-tape: wow/flutter + chew only, gated to run *only while frozen*) and
+> is summed *under* the live master at `FREEZE_RETURN_GAIN`; a linked-stereo
+> peak `Limiter` (`limiter.rs`) on the sum keeps level ~unchanged from the dry.
+> Driven by `Engine::set_freeze(0..1)` / `Param::Freeze` (in `apply_param`).
+> Tests: idle silence/master-untouched, constant-amplitude hold, blended seam,
+> limiter transparency + ceiling. The macOS host exercises it with a test thread
+> (freeze ~0.5 s every ~10 s). **Not yet wired:** the CC binding in
+> `install_kiosk_bindings`, the bridge freeze→CC writer, and the browser POST
+> (steps 2–3 below). Step 1's `Param::Freeze` exists but is unbound to a CC.
+
+A second inbound use over the same pipe — *no new protocol*. The visualizer's
+existing JS onset→freeze (the frame-freeze it already does, kept exactly as-is
+because it behaves the way we want) drives an **audio** freeze on the Daisy, so
+the held sound mirrors the held picture. Unlike distance — sensor data the
+*bridge* owns and maps — the freeze decision is **authored in the browser**, so
+it travels browser → bridge → Daisy:
+
+1. **dsp:** add `Param::Freeze` and an `Engine` action — a granular/stutter
+   *hold* of the master (a held grain of the current program), wet-scaled by the
+   CC value; `0` = passthrough. Bind a CC# to `Param::Freeze` inside
+   `install_kiosk_bindings` so host + firmware agree, and it's exercisable today
+   from a hardware knob (exactly like CC 23 → TapeFailure).
+2. **Browser → bridge:** where the JS freeze fires, `POST` the current freeze
+   intensity (`0..1`) to the bridge — a new ingest source alongside
+   `distance_cm`.
+3. **Bridge:** map freeze → a CC value and write `[0xB0, FREEZE_CC, value]` to
+   the *same fd* as the distance writer. Identical mechanism, no new transport,
+   no new parser — it lands through `decode → handle_midi → MidiMap →
+   apply_param` like everything else. On-change + throttled (complication #13).
+
+**Send a level, never an edge.** Freeze rides as a CC *value* (`0..127`), which
+is idempotent state: a dropped bulk-OUT frame leaves a stale value for one tick,
+not a Daisy stuck frozen forever. Repeat it while frozen and send `0` on
+release; do **not** use note-on/off edges over the lossy pipe. Same discipline
+as the `POS` level out, and it falls out of the existing CC path for free.
+
+**Sync — accept the flam (decided).** The video freeze is local and instant; the
+audio freeze trails by the round trip (UAC buffer → browser FFT → `POST` →
+bridge → serial → firmware → engine), and because the browser's trigger is
+derived from already-buffered UAC audio, the Daisy freezes slightly behind its
+own render clock. For the sustained, ambient freezes this piece uses, that
+leading-edge flam is acceptable and reads as a quick audiovisual "catch" — **ship
+it as-is.** *Future improvement, only if it grates:* delay the *visual* freeze in
+JS by ~one round trip to re-align the edges (a one-line nudge; we own the JS).
+Reimplementing the detector on the Daisy for sample-lock is explicitly **not**
+pursued — the JS detector already works the way we like.
+
 ## Complications
 
 1. **Endpoint count.** STM32H7 OTG_FS has 9 IN + 9 OUT endpoints (minus
@@ -239,6 +295,15 @@ audio behavior is already exercisable and unit-testable without hardware.
     gesture means different things in the two environments. Share one
     `dsp::install_kiosk_bindings(&mut MidiMap)` and call it from both;
     delete the inline `bind_cc` block in `host/src/main.rs`.
+15. **Freeze is browser-authored, so audio trails video** *(Phase E)*. The
+    freeze CC originates from the visualizer's JS detector and round-trips
+    back to the Daisy, so the audio freeze lags the (local, instant) visual
+    freeze — and the trigger is derived from already-buffered UAC audio, so
+    the Daisy freezes behind its own render clock. **Decided: accept the
+    flam** for the sustained ambient freezes this piece uses. If it ever
+    grates, delay the visual freeze in JS by ~one round trip (we own the
+    JS); do not move detection onto the Daisy. Send freeze as a CC *level*
+    (on-change, throttled), never a note-on/off edge.
 
 ## Out of scope
 
@@ -268,7 +333,8 @@ crates/
 │       └── (existing sd.rs)
 ├── dsp/src/
 │   ├── midi.rs               # add MidiByteParser (shared: CDC-in + TRS-UART)
-│   └── midi_map.rs (or lib.rs) # add install_kiosk_bindings(&mut MidiMap)
+│   ├── midi_map.rs           # add install_kiosk_bindings(); Param::Freeze
+│   └── lib.rs                # Engine freeze action (master grain-hold) + set_freeze
 └── host/src/
     └── main.rs               # replace inline bind_cc block with install_kiosk_bindings()
 ```
@@ -276,9 +342,11 @@ crates/
 Pi side (existing repo at `~/repos/ambient_viz`):
 - `server/sse-bridge.js` (or equivalent) — add a CDC tail transport (POS in)
   **and** a CC writer (Phase E): on `distance_cm`, map → CC and write a
-  `[0xB0, cc#, value]` frame to the same fd
+  `[0xB0, cc#, value]` frame to the same fd; also accept a `freeze` POST from
+  the browser and write its `[0xB0, FREEZE_CC, value]` frame on the same fd
 - `static/visualizer/index.html` (or wherever) — subscribe to
-  `song_position` topic, replace internal clock with `effective_pos`
+  `song_position` topic, replace internal clock with `effective_pos`; on the
+  existing JS freeze, POST freeze intensity (`0..1`) to the bridge
 - Python kiosk (`python/ambient_kiosk/`) — **unchanged**; it already
   publishes `distance_cm` through `/ingest`
 

@@ -45,6 +45,9 @@ pub enum Param {
     BassEnvMod,
     /// Rumble-bass output gain.
     BassGain,
+    /// Master freeze wet/dry (0 = passthrough, 1 = held grain). Mirrors the
+    /// visualizer's frame-freeze; the transport that drives it is unconnected.
+    Freeze,
 }
 
 #[derive(Debug, Clone, Copy)]

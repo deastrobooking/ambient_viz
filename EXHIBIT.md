@@ -129,6 +129,17 @@ agnostic and runs identically on host and firmware.
   single gesture for "distance / decay / dissolution."
 - **Stab ping-pong delay** — wet, feedback (repeats), time.
 - **Reverb** — wet/dry mix on the master.
+- **Master freeze** (`freeze.rs`) — **parallel-send** grain hold, the audio
+  mirror of the visualizer's frame-freeze. The live master keeps playing
+  untouched; a looped ~0.3 s grain of it (two-head overlap-add, seam-aligned →
+  click-free) is run through a stripped failure-tape (`GlitchTape`: wow/flutter
+  + chew, gated to run only while frozen) and summed *under* the master at a
+  fixed return trim, so a degraded wobbling ghost of a caught moment hovers over
+  the continuing composition. A master peak limiter (`limiter.rs`) on the sum
+  keeps the level ~unchanged from the dry master. Driven by `set_freeze(0..1)` /
+  `Param::Freeze`. Audio engine built + tested; the driving transport (browser
+  JS freeze → CDC, per `PLAN_USB_COMPOSITE.md` Phase E) is not yet connected —
+  on the host a test thread holds ~0.5 s every ~10 s.
 
 **Sequencing** (`sequencer.rs`, `chord.rs`)
 - Step sequencer from `.pat` grid files. Per-step velocity lanes for **kick**,

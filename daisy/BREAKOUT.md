@@ -35,17 +35,17 @@ and over the codec's stereo line out to a PA.
    ┌──────────────────────────────────────▼────▼────▼──────────┐
    │            Custom breakout board (perfboard)              │
    │                                                           │
-   │  +5V rail ── (6N138 Vcc only)                             │
-   │  GND rail ── (common across Daisy GND + Pi GND + 6N138)   │
-   │  +3V3 rail ── (from Daisy pad 38, feeds SD + opto pull-up)│
+   │  GND bus  ── board-wide: Daisy/Pi/6N138/SD/audio/cap      │
+   │  +5V link ── Pi pin 2 -> 6N138 Vcc only (point-to-point)  │
+   │  +3V3 stub ── Daisy pad 38 -> SD Vcc + pull-up            │
    │                                                           │
    │  ┌───────── Daisy Seed Rev 7 (socketed) ─────────┐        │
    │  │ pad 18 ──► audio TRS TIP                       │        │
    │  │ pad 19 ──► audio TRS RING                      │        │
    │  │ pad 40 ──► audio TRS SLEEVE                    │        │
    │  │ pad 14 ◄── MIDI input from 6N138 output         │       │
-   │  │ pad 38 ──► +3V3 rail                            │       │
-   │  │ pad 40 ──► GND rail                             │       │
+   │  │ pad 38 ──► +3V3 stub                            │       │
+   │  │ pad 40 ──► GND bus                              │       │
    │  │ pad D7  ──► SD CS                               │       │
    │  │ pad D8  ──► SD SCK                              │       │
    │  │ pad D9  ◄── SD MISO                              │      │
@@ -63,13 +63,18 @@ and over the codec's stereo line out to a PA.
    ── Daisy USB ─────────► UAC stereo to Pi visualizer
 ```
 
-### Power rails on the breakout
+### Power nets on the breakout
 
-| Rail | Source | Loads | Notes |
+Only **GND** is a board-spanning bus. **+5V** is a point-to-point link and
+**+3V3** is a short local stub — each has just a couple of endpoints, so
+neither needs a rail. (That's why the §9 placement map draws only the GND
+bus; the §9.3 net list carries all three.)
+
+| Net | Physical form | Source | Loads |
 |---|---|---|---|
-| **+5V** | Pi GPIO pin 2 or 4 (jumper wire) | 6N138 pin 8 (Vcc only) | ~5 mA draw; trivial vs Pi 5V budget |
-| **+3V3** | Daisy pad 38 (3V3D) | SD module Vcc, 6N138 output pull-up | <50 mA total |
-| **GND** | Daisy pad 40 + Pi GPIO pin 6 (jumper) | Everything | Single common ground; Pi-Daisy GND already tied via USB shield |
+| **GND** | board-spanning bus | Daisy pad 40 + Pi GPIO pin 6 (jumper) | everything — Daisy GND/AGND, 6N138 pin 5, audio sleeve, SD GND, 100nF |
+| **+5V** | point-to-point link | Pi GPIO pin 2 (jumper) | 6N138 pin 8 (Vcc) only; ~5 mA |
+| **+3V3** | short stub | Daisy pad 38 (3V3D) | SD module Vcc + 6N138 output pull-up; <50 mA |
 
 Pi GPIO 5V and USB-C input share the same rail downstream of the Pi's input
 protection, so the Daisy's bus-power and the breakout's 5V are siblings of
@@ -80,12 +85,12 @@ the same PSU. No ground loop risk because they all reference the same point.
 ## 2. Complete schematic
 
 ```
-                                                  +5V rail (from Pi GPIO pin 2)
+                                                  +5V link (from Pi GPIO pin 2)
                                                    │
                                                    │
                                                    ┣─[100nF]─ GND
                                                    │
-                                                   │                            +3V3 rail (Daisy pad 38)
+                                                   │                            +3V3 stub (Daisy pad 38)
                                                    │                             │
                                                    │                             │
                                               ┌────┴─────┐                       │
@@ -152,7 +157,7 @@ WWZMDiB microSD module (1×6 header) on Daisy SPI1:
 | 14 | D14 | PB7 | MIDI UART RX (USART1_RX) — 5V-tolerant |
 | 18 | — | — | AUDIO OUT L → TRS TIP |
 | 19 | — | — | AUDIO OUT R → TRS RING |
-| 38 | — | — | +3V3D rail source |
+| 38 | — | — | +3V3 stub source |
 | 40 | — | — | DGND |
 | 8 | D7 | PG10 | SD CS |
 | 9 | D8 | PG11 | SD SCK |
@@ -276,7 +281,8 @@ external indicator on the breakout. Firmware implementation pending.
 
 | Qty | Part | Notes / Amazon |
 |---|---|---|
-| 1 | 6N138 optocoupler, DIP-8 | Vishay or equivalent. Socket it (DIP-8 socket) for swap |
+| 1 | 6N138 optocoupler, DIP-8 | Vishay or equivalent |
+| 1 (pack) | DIP-8 IC socket | One per DIP-8 chip: 1 for the 6N138 (Board A); +1 for the TLC555 if building the full Board B. Solder the empty socket, snap the chip in after (no heat to the IC). Sold in cheap multipacks |
 | 1 | **Stereo** 3.5mm TRS jack, **PCB through-hole** | Audio out (L=tip, R=ring). e.g. CUI SJ1-3535N / PJ-322 style. NOT SMD, NOT solder-lug chassis type |
 | 1 | 3.5mm TRS jack, **PCB through-hole** | MIDI in (Type A). A stereo TRS part is fine — only T/R/S used |
 | 1 | 1N4148 diode (DO-35) | MIDI reverse-polarity protection |
@@ -430,6 +436,12 @@ toward the MIDI/SD/audio circuitry. Its "power" row (pins 21–40) faces left.
   └──────────────────────────────────────────────────────────────┘
               ↓ bottom edge — Pi 5V/GND F-F jumpers land here ↓
    ▤ = small axial/radial part   ║ = 1×20 female header row
+
+   Only GND is drawn as a bus (it spans the board). The other two nets are
+   short and not drawn above:
+     +5V link:  [Pi 2p] 5V pin ──► 6N138 pin 8        (one hop, not a bus)
+     +3V3 stub: Daisy pad 38 ──► SD Vcc + 2.2kΩ top   (short, not a bus)
+   See §9.3 for the full net list of all three.
 ```
 
 ### 9.2 Which Daisy pad is where (given this orientation)

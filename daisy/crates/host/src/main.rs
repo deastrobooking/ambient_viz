@@ -165,6 +165,24 @@ fn main() -> Result<()> {
         });
     }
 
+    // Master-freeze test: hold a grain for ~0.5 s once every ~10 s, then
+    // release. Host-only scaffolding — the real exhibit drives `set_freeze`
+    // from the visualizer's JS freeze over the (unconnected) CDC path.
+    {
+        let freeze_engine = Arc::clone(&engine);
+        println!("freeze test: holding ~0.5s every ~10s");
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(9500));
+                freeze_engine.lock().unwrap().set_freeze(1.0);
+                println!("  freeze ON");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                freeze_engine.lock().unwrap().set_freeze(0.0);
+                println!("  freeze OFF");
+            }
+        });
+    }
+
     if false {
         // TEST: hold pristine for 10 s, then ramp tape failure 0 → 1 over the
         // next 10 s, and hold at full destruction. Demonstrates the lerp + the
