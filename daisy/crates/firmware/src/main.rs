@@ -6,8 +6,10 @@ mod sd;
 #[allow(dead_code)] // some control-handler accessors unused until composite CDC
 mod uac_source;
 mod usb_audio;
+mod usb_cdc;
 
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use daisy_embassy::audio::AudioPeripherals;
 use daisy_embassy::led::UserLed;
@@ -20,6 +22,7 @@ use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_time::Timer;
 use embedded_alloc::LlffHeap as Heap;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use heapless::spsc::{Consumer, Producer, Queue};
 use static_cell::StaticCell;
@@ -42,6 +45,11 @@ static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
 // the host isn't capturing.
 const USB_RING_LEN: usize = 512;
 static USB_RING: StaticCell<Queue<i16, USB_RING_LEN>> = StaticCell::new();
+
+// Stereo frames the SAI callback has actually played. The CDC position task
+// derives song position from this (per audio sample rendered, not wall-clock,
+// so it can't drift from the audio — see PLAN_USB_COMPOSITE complication #3).
+static PLAYED_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 // 2b: audio runs on a high-priority interrupt executor so blocking SD reads
 // (and, later, DSP/MIDI) on the thread executor can never starve the SAI
@@ -91,10 +99,25 @@ async fn main(spawner: Spawner) {
         board.pins.d7,  // PG10 / CS
     );
 
-    if sdcard.num_bytes().is_err() {
-        dbg_uart!("SD: no card / init failed (blink 1)");
+    // Acquire at the slow init clock, retrying a few times — cold-boot supply +
+    // card settling makes the first attempt flaky on the crowded breakout. Then
+    // bump to full speed for streaming.
+    let mut sd_ok = false;
+    for attempt in 1..=5u8 {
+        if sdcard.num_bytes().is_ok() {
+            sd_ok = true;
+            break;
+        }
+        dbg_uart!("SD: init attempt {} failed, retrying", attempt);
+        sdcard.mark_card_uninit();
+        Timer::after_millis(100).await;
+    }
+    if !sd_ok {
+        dbg_uart!("SD: no card / init failed after 5 tries (blink 1)");
         blink_code(&mut led, 1).await;
     }
+    sd::set_fast(&sdcard);
+    dbg_uart!("SD: acquired at 400kHz, SPI -> 24MHz for streaming");
     let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
     let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
         Ok(v) => v,
@@ -118,6 +141,8 @@ async fn main(spawner: Spawner) {
         }
     };
     dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
+    // Loop length in stereo frames (4 bytes/frame) for CDC position wrap.
+    let loop_frames = (file.length() / 4) as u64;
 
     let q = RING.init(Queue::new());
     let (mut producer, consumer) = q.split();
@@ -130,9 +155,9 @@ async fn main(spawner: Spawner) {
     audio_spawner.must_spawn(audio_task(audio_peripherals, consumer, usb_producer));
     dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
 
-    // --- USB: UAC1 audio source (capture) over OTG-FS -----------------------
-    // Stage 1: enumerate as a capture device + stream silence on the iso-IN EP.
-    static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    // --- USB: composite UAC1 audio source + CDC ACM over OTG-FS -------------
+    // 512-byte config descriptor: UAC source + CDC won't fit the default 256.
+    static CONFIG_DESC: StaticCell<[u8; 512]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 32]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     static EP_OUT: StaticCell<[u8; usb_audio::EP_OUT_BUF]> = StaticCell::new();
@@ -162,7 +187,7 @@ async fn main(spawner: Spawner) {
     let mut usb_builder = embassy_usb::Builder::new(
         usb_driver,
         dev_cfg,
-        CONFIG_DESC.init([0; 256]),
+        CONFIG_DESC.init([0; 512]),
         BOS_DESC.init([0; 32]),
         &mut [],
         CONTROL_BUF.init([0; 64]),
@@ -176,10 +201,16 @@ async fn main(spawner: Spawner) {
     );
     usb_builder.handler(UAC_HANDLER.init(uac_handler));
 
+    // CDC ACM in the same composite (Phase C): song-position out to the Pi.
+    // Full-duplex; the inbound (sensor-MIDI) leg is Phase E, pending Engine.
+    static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
+    let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
+
     let usb_device = usb_builder.build();
     spawner.must_spawn(usb_audio::usb_task(usb_device));
     spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
-    dbg_uart!("usb: UAC source built + tasks spawned");
+    spawner.must_spawn(usb_cdc::position_emit_task(cdc, loop_frames));
+    dbg_uart!("usb: UAC source + CDC position built + tasks spawned");
 
     // Producer + heartbeat on the thread executor. Blocking SD reads here can
     // no longer glitch the audio — the interrupt executor preempts them.
@@ -250,6 +281,8 @@ async fn audio_task(
                     let _ = usb_producer.enqueue(l);
                     let _ = usb_producer.enqueue(r);
                 }
+                // Advance the play position by the frames rendered this block.
+                PLAYED_FRAMES.fetch_add((output.len() / 2) as u32, Ordering::Relaxed);
             })
             .await;
     }

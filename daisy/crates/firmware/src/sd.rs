@@ -31,6 +31,14 @@ use embedded_sdmmc::{SdCard, TimeSource, Timestamp};
 /// `SdCard::new`.
 pub type SdSpi<'a> = ExclusiveDevice<Spi<'a, Blocking, Master>, Output<'a>, Delay>;
 
+/// SPI clock for the SD init handshake. The SD spec mandates ≤400 kHz for
+/// CMD0/ACMD41, and slow edges are far more reliable on the crowded hand-wired
+/// breakout — initialising at full speed is the usual cause of intermittent
+/// "card not found" on cold boot.
+const INIT_HZ: u32 = 400_000;
+/// SPI clock for streaming once the card is acquired (SD default-speed ≤25 MHz).
+const FAST_HZ: u32 = 24_000_000;
+
 /// Build the SPI1 bus + CS pin into the SpiDevice that embedded-sdmmc wants,
 /// then wrap in an `SdCard`. Does NOT initialise the card — that happens
 /// lazily on the first block-device call (e.g. `num_bytes()`), which will
@@ -45,15 +53,11 @@ pub fn build_sd_card<'a>(
     miso: SeedPin9<'a>,
     cs: SeedPin7<'a>,
 ) -> SdCard<SdSpi<'a>, Delay> {
-    // SD init technically wants ≤400 kHz, but modern SDHC cards initialise fine
-    // at full speed and we need the throughput + margin: at 8 MHz a single
-    // block read (~0.5 ms) fits the 0.67 ms audio deadline but a FAT-cluster
-    // crossing (~2 blocks, ~1 ms) overruns. 24 MHz (SD default-speed mode tops
-    // at 25 MHz) drops a 2-block read to ~0.35 ms — comfortably inside the
-    // deadline. embassy picks the nearest prescaler ≤ this. If the card or
-    // wiring can't sustain it (garbage reads / FAT mount fail), step back down.
+    // Start slow for a reliable init handshake; `set_fast` bumps to FAST_HZ once
+    // the card is acquired. (Audio is decoupled by the 8192-sample ring on its
+    // own executor, so streaming-clock choice no longer gates the audio deadline.)
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(24_000_000);
+    spi_config.frequency = Hertz(INIT_HZ);
 
     let spi = Spi::new_blocking(spi1, sck, mosi, miso, spi_config);
 
@@ -66,6 +70,17 @@ pub fn build_sd_card<'a>(
     let spi_device = ExclusiveDevice::new(spi, cs, Delay).unwrap();
 
     SdCard::new(spi_device, Delay)
+}
+
+/// Bump the SD SPI clock to streaming speed. Call only after the card has been
+/// acquired at `INIT_HZ` — the card stays initialised across the reconfigure;
+/// only the bus baud rate changes.
+pub fn set_fast(sdcard: &SdCard<SdSpi<'_>, Delay>) {
+    let mut cfg = SpiConfig::default();
+    cfg.frequency = Hertz(FAST_HZ);
+    sdcard.spi(|dev| {
+        let _ = dev.bus_mut().set_config(&cfg);
+    });
 }
 
 /// Stub TimeSource. embedded-sdmmc uses this to stamp FAT directory entries
