@@ -31,7 +31,9 @@ if (MOCK) {
 // (defaults to /dev/ttyACM0) or by setting DAISY_SERIAL to the port path.
 const DAISY = process.env.DAISY === '1' || process.env.DAISY === 'true' || !!process.env.DAISY_SERIAL;
 if (DAISY) {
-  require('./inputs/daisy-position')({ publish });
+  // `bus` lets it tail distance_cm / freeze and write them back to the Daisy as
+  // CC frames on the same port (Phase E).
+  require('./inputs/daisy-position')({ publish, bus: inputBus });
   console.log('daisy-position source: enabled');
 }
 
