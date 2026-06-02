@@ -224,7 +224,12 @@ async fn main(spawner: Spawner) {
     // Spawn the audio consumer on the high-priority interrupt executor.
     interrupt::UART4.set_priority(Priority::P6);
     let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
-    audio_spawner.must_spawn(audio_task(audio_peripherals, consumer, usb_producer));
+    audio_spawner.must_spawn(audio_task(
+        audio_peripherals,
+        consumer,
+        usb_producer,
+        usb_cdc::MIDI_CHANNEL.receiver(),
+    ));
     dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
 
     // --- USB: composite UAC1 audio source + CDC ACM over OTG-FS -------------
@@ -273,10 +278,12 @@ async fn main(spawner: Spawner) {
     );
     usb_builder.handler(UAC_HANDLER.init(uac_handler));
 
-    // CDC ACM in the same composite (Phase C): song-position out to the Pi.
-    // Full-duplex; the inbound (sensor-MIDI) leg is Phase E, pending Engine.
+    // CDC ACM in the same composite: full-duplex. Split into a sender
+    // (song-position out, Phase C) and a receiver (inbound sensor/freeze MIDI
+    // from the Pi → MIDI_CHANNEL → the audio task, Phase E).
     static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
     let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
+    let (cdc_tx, cdc_rx) = cdc.split();
 
     let usb_device = usb_builder.build();
     // Keep USB below the audio interrupt executor (P6) so OTG IRQs can't preempt
@@ -285,7 +292,8 @@ async fn main(spawner: Spawner) {
     interrupt::OTG_FS.set_priority(Priority::P7);
     spawner.must_spawn(usb_audio::usb_task(usb_device));
     spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
-    spawner.must_spawn(usb_cdc::position_emit_task(cdc, loop_frames));
+    spawner.must_spawn(usb_cdc::position_emit_task(cdc_tx, loop_frames));
+    spawner.must_spawn(usb_cdc::midi_in_task(cdc_rx));
     dbg_uart!("usb: UAC source + CDC position built + tasks spawned");
 
     // Producer + heartbeat on the thread executor. Blocking SD reads here can
@@ -342,6 +350,7 @@ async fn audio_task(
     audio: AudioPeripherals<'static>,
     mut consumer: Consumer<'static, i16, RING_LEN>,
     mut usb_producer: Producer<'static, i16, USB_RING_LEN>,
+    midi_rx: usb_cdc::MidiRx,
 ) {
     let interface = audio.prepare_interface(Default::default()).await;
     let mut interface = match interface.start_interface().await {
@@ -364,6 +373,10 @@ async fn audio_task(
     // never allocates.
     tape.process(&mut [0.0f32; HALF_DMA_BUFFER_LENGTH], 0);
     let mut sample_index: u64 = 0;
+    // CC routing for inbound MIDI (Pi -> tape failure / freeze), shared with the
+    // host via install_kiosk_bindings so a CC means the same thing in both.
+    let mut midi_map = dsp::MidiMap::new();
+    dsp::install_kiosk_bindings(&mut midi_map);
     dbg_uart!("audio: interface started, FX chain ready");
 
     loop {
@@ -388,20 +401,20 @@ async fn audio_task(
                     *s = v as f32 / 32768.0;
                 }
 
-                // Placeholder control until the CDC CC path (Phase E): sweep tape
-                // failure 0..1 over 20 s (now cheap to retune live — the loss FIR
-                // rebuild uses a cosine LUT) and freeze a grain every 10 s.
-                let t = sample_index as f32 / SAMPLE_RATE;
-                let xf = {
-                    let x = t * (1.0 / 20.0);
-                    x - (x as u32 as f32) // fract(t / 20)
-                };
-                tape.set_failure(if xf < 0.5 { xf * 2.0 } else { 2.0 - xf * 2.0 });
-                let yf = {
-                    let y = t * (1.0 / 10.0);
-                    y - (y as u32 as f32) // fract(t / 10)
-                };
-                freeze.set_amount(if yf * 10.0 < 0.5 { 1.0 } else { 0.0 });
+                // Apply inbound CC from the Pi (drained off the channel the CDC
+                // read task fills). Decode happened off the RT path; this is just
+                // a lookup + setter. CC23 -> tape failure, CC24 -> freeze.
+                while let Ok(msg) = midi_rx.try_receive() {
+                    if let dsp::MidiMessage::ControlChange { cc, value, .. } = msg {
+                        if let Some((param, v)) = midi_map.map_cc(cc, value) {
+                            match param {
+                                dsp::Param::TapeFailure => tape.set_failure(v),
+                                dsp::Param::Freeze => freeze.set_amount(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
 
                 // Master chain (mirrors Engine::process): tape -> freeze send
                 // (glitch + return while active) -> limiter.

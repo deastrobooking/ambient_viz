@@ -101,26 +101,11 @@ fn main() -> Result<()> {
         println!("--no-seq: step sequencer disabled (no kick/hat/stab triggers)");
     }
 
-    // Default MIDI CC bindings. CCs 71-76 are the GM "Sound Controllers"
-    // and a common starting point for hardware drum-machine knobs. Your
-    // controller may send different CCs — incoming MIDI is printed below
-    // so you can discover what each knob emits and edit this block.
-    //
-    // Trigger: MIDI note 36 (C1, GM kick) fires the kick on note-on.
-    {
-        use dsp::Param;
-        let mut eng = engine.lock().unwrap();
-        let m = eng.midi_map_mut();
-        m.bind_cc(12, Param::KickAccent, 0.0, 1.0);
-        m.bind_cc(13, Param::KickDecay, 0.0, 1.0);
-        m.bind_cc(15, Param::KickAttackFm, 0.0, 1.0);
-        m.bind_cc(16, Param::KickFreq, 30.0, 150.0);
-        m.bind_cc(18, Param::KickTone, 0.0, 1.0);
-        m.bind_cc(19, Param::KickSelfFm, 0.0, 1.0);
-        m.bind_cc(21, Param::ReverbWet, 0.0, 1.0); // CC 91 = "Effects 1" (reverb send)
-        m.bind_cc(22, Param::KickDistDrive, 1.0, 6.0); // CC 93 = "Effects 3"
-        m.bind_cc(23, Param::TapeFailure, 0.0, 1.0); // 0 = pristine TC-250, 1 = eaten tape
-    }
+    // MIDI CC bindings — shared with the Daisy firmware via
+    // dsp::install_kiosk_bindings so a CC means the same thing in both. Trigger:
+    // MIDI note 36 (C1, GM kick) fires the kick on note-on. Incoming MIDI is
+    // printed below so you can discover what a controller's knobs emit.
+    dsp::install_kiosk_bindings(engine.lock().unwrap().midi_map_mut());
 
     // Connect to a MIDI input. midir owns the callback thread; the connection
     // must stay alive (we bind it to a named local so it lives till main exits).

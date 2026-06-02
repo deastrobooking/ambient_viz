@@ -21,8 +21,11 @@
 use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
+use dsp::{MidiByteParser, MidiMessage};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, Receiver};
 use embassy_time::Timer;
-use embassy_usb::class::cdc_acm::CdcAcmClass;
+use embassy_usb::class::cdc_acm::{Receiver as CdcRx, Sender as CdcTx};
 use heapless::String;
 
 use crate::PLAYED_FRAMES;
@@ -31,10 +34,20 @@ use crate::usb_audio::{Drv, SAMPLE_RATE_HZ};
 /// How often to emit a position line.
 const EMIT_PERIOD_MS: u64 = 50;
 
+const MIDI_CH_DEPTH: usize = 16;
+/// Decoded inbound MIDI, from the CDC read task (thread executor) to the audio
+/// task (interrupt executor). Bounded + lock-free `try_send`/`try_receive` so
+/// neither side ever blocks the other — the audio side must never block.
+pub static MIDI_CHANNEL: Channel<CriticalSectionRawMutex, MidiMessage, MIDI_CH_DEPTH> =
+    Channel::new();
+/// Audio-task end of [`MIDI_CHANNEL`].
+pub type MidiRx = Receiver<'static, CriticalSectionRawMutex, MidiMessage, MIDI_CH_DEPTH>;
+
+/// Emit song-position lines (device -> host) on the CDC sender half.
 #[embassy_executor::task]
-pub async fn position_emit_task(mut cdc: CdcAcmClass<'static, Drv>, loop_frames: u64) {
+pub async fn position_emit_task(mut tx: CdcTx<'static, Drv>, loop_frames: u64) {
     loop {
-        cdc.wait_connection().await;
+        tx.wait_connection().await;
         crate::dbg_uart!("cdc: host opened port — emitting POS");
 
         // Track loop position by accumulating deltas of the (wrapping u32) frame
@@ -67,9 +80,39 @@ pub async fn position_emit_task(mut cdc: CdcAcmClass<'static, Drv>, loop_frames:
 
             // If the host closed the port, write_packet errors — go back to
             // waiting for a connection rather than blocking (complication #4).
-            if cdc.write_packet(line.as_bytes()).await.is_err() {
+            if tx.write_packet(line.as_bytes()).await.is_err() {
                 crate::dbg_uart!("cdc: host closed port");
                 break;
+            }
+        }
+    }
+}
+
+/// Read inbound bytes (host -> device) on the CDC receiver half, frame them into
+/// MIDI messages, and forward to the audio task via [`MIDI_CHANNEL`]. The Pi
+/// bridge tunnels sensor/freeze CCs as raw 3-byte frames (`[0xB0|ch, cc, val]`)
+/// — same wire format as the planned TRS-UART MIDI input. Decoding happens here
+/// (off the RT path); the audio task only drains the channel + applies.
+#[embassy_executor::task]
+pub async fn midi_in_task(mut rx: CdcRx<'static, Drv>) {
+    let sender = MIDI_CHANNEL.sender();
+    let mut parser = MidiByteParser::new();
+    let mut buf = [0u8; 64];
+    loop {
+        rx.wait_connection().await;
+        crate::dbg_uart!("cdc: midi-in connected");
+        loop {
+            match rx.read_packet(&mut buf).await {
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        if let Some(msg) = parser.push(b) {
+                            // Drop if the audio task hasn't drained yet — never
+                            // block the USB read on the audio path.
+                            let _ = sender.try_send(msg);
+                        }
+                    }
+                }
+                Err(_) => break, // disconnected
             }
         }
     }

@@ -36,8 +36,8 @@ pub use analog_bass_drum::AnalogBassDrum;
 pub use bass::{BassPatch, RumbleBass};
 pub use fm_stab::{FmPatch, FmStab, Shaper};
 pub use hihat::HiHat;
-pub use midi::MidiMessage;
-pub use midi_map::{MidiMap, Param};
+pub use midi::{MidiByteParser, MidiMessage};
+pub use midi_map::{MidiMap, Param, install_kiosk_bindings};
 pub use svf::Svf;
 
 pub struct Engine {

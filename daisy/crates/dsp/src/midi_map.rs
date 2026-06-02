@@ -100,3 +100,23 @@ impl Default for MidiMap {
         Self::new()
     }
 }
+
+/// Install the standard kiosk CC -> Param bindings. Called from both the Mac
+/// host and the Daisy firmware so a given CC means the same thing in both
+/// environments — keep this the single source of truth (don't inline bindings).
+///
+/// CC 23 = TapeFailure and CC 24 = Freeze are the two the kiosk drives from the
+/// Pi (distance and the browser freeze); the rest are hardware-knob bindings
+/// the host uses and the firmware ignores (no synth Engine there yet).
+pub fn install_kiosk_bindings(map: &mut MidiMap) {
+    map.bind_cc(12, Param::KickAccent, 0.0, 1.0);
+    map.bind_cc(13, Param::KickDecay, 0.0, 1.0);
+    map.bind_cc(15, Param::KickAttackFm, 0.0, 1.0);
+    map.bind_cc(16, Param::KickFreq, 30.0, 150.0);
+    map.bind_cc(18, Param::KickTone, 0.0, 1.0);
+    map.bind_cc(19, Param::KickSelfFm, 0.0, 1.0);
+    map.bind_cc(21, Param::ReverbWet, 0.0, 1.0);
+    map.bind_cc(22, Param::KickDistDrive, 1.0, 6.0);
+    map.bind_cc(23, Param::TapeFailure, 0.0, 1.0); // 0 = pristine, 1 = eaten
+    map.bind_cc(24, Param::Freeze, 0.0, 1.0); // 0 = passthrough, 1 = held grain
+}

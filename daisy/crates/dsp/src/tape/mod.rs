@@ -105,12 +105,14 @@ const FAILURE_BASELINE: FailureSnapshot = FailureSnapshot {
     hiss_amount: 0.0, // hiss disabled — TC-250 S/N spec was too noisy by ear
 };
 
-/// "Tape is being eaten." Tuned by ear in concert — each value is at the
-/// edge of musical, the combined result is unambiguously broken.
+/// "Tape is being eaten." The broken character comes from loss (slow speed +
+/// wide spacing), chew dropouts, and saturation — NOT deep pitch wobble. Wow is
+/// kept to a subtle slow drift (a deep cosine wow reads as a goofy sine-LFO
+/// vibrato), and flutter to a fine shimmer.
 const FAILURE_DESTROYED: FailureSnapshot = FailureSnapshot {
-    wow_rate_hz: 3.0,
-    wow_depth_ms: 15.0,
-    flutter_depth_ms: 1.5,
+    wow_rate_hz: 1.0,
+    wow_depth_ms: 2.5,
+    flutter_depth_ms: 0.6,
     chew_depth: 0.9,
     chew_freq: 0.8,
     speed_ips: 1.5,
