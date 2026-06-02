@@ -27,7 +27,33 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::f32::consts::TAU;
-use libm::{cosf, expf, sinf};
+use libm::cosf;
+
+/// Schraudolph fast exp (~2-3% error), ample for shaping a loss-curve magnitude
+/// and ~100x cheaper than libm `expf` on the Cortex-M7. Inputs here are <= 0;
+/// very-negative inputs clamp to 0.
+#[inline]
+fn fast_exp(x: f32) -> f32 {
+    let t = x * 12_102_203.0_f32 + 1_064_866_805.0_f32;
+    if t < 1.0 {
+        0.0
+    } else {
+        f32::from_bits(t as u32)
+    }
+}
+
+/// Fast sin (~0.2% error) via the parabolic approximation, range-reduced to
+/// [-PI, PI]. Replaces libm `sinf` in the per-bin magnitude loop.
+#[inline]
+fn fast_sin(x: f32) -> f32 {
+    use core::f32::consts::PI;
+    let n = (x * (1.0 / TAU) + 0.5) as i32;
+    let a = x - TAU * n as f32; // [-PI, PI]
+    let abs_a = if a < 0.0 { -a } else { a };
+    let y = (4.0 / PI) * a - (4.0 / (PI * PI)) * a * abs_a;
+    let abs_y = if y < 0.0 { -y } else { y };
+    0.225 * (y * abs_y - y) + y
+}
 
 /// Base FIR order at 44.1 kHz. Scales linearly with sample rate at
 /// construction (`order = BASE_ORDER · fs / 44100`).
@@ -46,6 +72,14 @@ pub struct LossFilter {
     /// so the convolution can read `delay[w + order - k]` without modulo.
     delay: Vec<f32>,
     write_idx: usize,
+    /// `cos(2*PI*m/order)` for m in 0..order, built once. The IDFT in
+    /// `recompute_coefs` is exactly these values, so a rebuild is O(order^2)
+    /// table lookups (incremental index) instead of `cosf` calls — turning a
+    /// ~25 ms rebuild into ~0.1 ms so tape failure can be swept live.
+    cos_lut: Vec<f32>,
+    /// Scratch for the frequency-domain magnitude, reused per rebuild (no alloc
+    /// in the audio callback).
+    h_mag: Vec<f32>,
 
     // Physical params (CHOWTape defaults: 30 IPS, 0.1 μm spacing/thick, 1 μm gap).
     speed_ips: f32,
@@ -58,12 +92,22 @@ pub struct LossFilter {
 impl LossFilter {
     pub fn new(sample_rate: f32) -> Self {
         let order = (((BASE_ORDER as f32) * sample_rate / 44100.0) as usize).max(8);
+        let cos_lut = {
+            let mut t = vec![0.0f32; order];
+            let step = TAU / order as f32;
+            for (m, v) in t.iter_mut().enumerate() {
+                *v = cosf(m as f32 * step);
+            }
+            t
+        };
         let mut f = Self {
             fs: sample_rate,
             order,
             coefs: vec![0.0; order],
             delay: vec![0.0; order * 2],
             write_idx: 0,
+            cos_lut,
+            h_mag: vec![0.0; order],
             speed_ips: 30.0,
             spacing_um: 0.1,
             thickness_um: 0.1,
@@ -110,40 +154,45 @@ impl LossFilter {
 
         // Frequency-domain magnitude, length `order`. Real and symmetric:
         // h_mag[order-k-1] = h_mag[k], so we only fill the lower half.
-        let mut h_mag = vec![0.0f32; order];
         for k in 0..(order / 2) {
             let freq = ((k as f32) * bin_width).max(MIN_FREQ_HZ);
             let wave_number = TAU * freq / (self.speed_ips * IPS_TO_MPS);
 
-            let spacing_loss = expf(-wave_number * self.spacing_um * UM_TO_M);
+            let spacing_loss = fast_exp(-wave_number * self.spacing_um * UM_TO_M);
 
             let thick_k = wave_number * self.thickness_um * UM_TO_M;
             let thickness_loss = if thick_k > 1.0e-6 {
-                (1.0 - expf(-thick_k)) / thick_k
+                (1.0 - fast_exp(-thick_k)) / thick_k
             } else {
                 1.0
             };
 
             let gap_over_two = wave_number * self.gap_um * UM_TO_M / 2.0;
             let gap_loss = if gap_over_two > 1.0e-6 {
-                sinf(gap_over_two) / gap_over_two
+                fast_sin(gap_over_two) / gap_over_two
             } else {
                 1.0
             };
 
             let mag = spacing_loss * thickness_loss * gap_loss;
-            h_mag[k] = mag;
-            h_mag[order - k - 1] = mag;
+            self.h_mag[k] = mag;
+            self.h_mag[order - k - 1] = mag;
         }
 
-        // IDFT-by-summation into a symmetric (linear-phase) FIR.
-        // We fill indices [order/2, order) and mirror to [1, order/2].
-        // Index 0 stays zero — matches CHOWTape's behaviour.
+        // IDFT-by-summation into a symmetric (linear-phase) FIR. The cos term is
+        // `cos(2*PI*(k*n)/order) = cos_lut[(k*n) % order]`; track `(k*n) % order`
+        // incrementally (`idx += n`, wrap) so the inner loop is a LUT read + MAC,
+        // no `cosf`. Fill [order/2, order) and mirror; index 0 stays zero.
         let inv_order = 1.0 / order as f32;
         for n in 0..(order / 2) {
             let mut acc = 0.0f32;
+            let mut idx = 0usize; // (k*n) % order at k=0
             for k in 0..order {
-                acc += h_mag[k] * cosf(TAU * (k * n) as f32 * inv_order);
+                acc += self.h_mag[k] * self.cos_lut[idx];
+                idx += n;
+                if idx >= order {
+                    idx -= order;
+                }
             }
             let c = acc * inv_order;
             self.coefs[order / 2 + n] = c;

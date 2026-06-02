@@ -297,8 +297,10 @@ async fn main(spawner: Spawner) {
             led.off();
             Timer::after_millis(500).await;
             // Safe now that dbg_uart writes per-byte (≤87 µs CS, not ~6 ms).
+            // cb_full spikes ~730 us on loss-FIR rebuild blocks but they're
+            // isolated; sai_err (SAI underruns) is the real health metric.
             dbg_uart!(
-                "diag: cb_full {} us (budget 667) | sai_err {} sd_under {} | peak {}",
+                "diag: cb_full {} us | sai_err {} sd_under {} | peak {}",
                 CB_FULL_US.swap(0, Ordering::Relaxed),
                 SAI_ERR.swap(0, Ordering::Relaxed),
                 SD_UNDERRUN.swap(0, Ordering::Relaxed),
@@ -386,12 +388,15 @@ async fn audio_task(
                     *s = v as f32 / 32768.0;
                 }
 
-                // Placeholder control until the CDC CC path (Phase E) is wired:
-                // failure held steady — a live change triggers the loss-filter FIR
-                // redesign, too slow until its cosine table is precomputed — and a
-                // freeze grain every 10 s to exercise the freeze path.
-                tape.set_failure(0.0);
+                // Placeholder control until the CDC CC path (Phase E): sweep tape
+                // failure 0..1 over 20 s (now cheap to retune live — the loss FIR
+                // rebuild uses a cosine LUT) and freeze a grain every 10 s.
                 let t = sample_index as f32 / SAMPLE_RATE;
+                let xf = {
+                    let x = t * (1.0 / 20.0);
+                    x - (x as u32 as f32) // fract(t / 20)
+                };
+                tape.set_failure(if xf < 0.5 { xf * 2.0 } else { 2.0 - xf * 2.0 });
                 let yf = {
                     let y = t * (1.0 / 10.0);
                     y - (y as u32 as f32) // fract(t / 10)
