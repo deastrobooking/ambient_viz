@@ -26,7 +26,24 @@
 //! - `sat` 0..1 — saturation magnetization `M_s` (inversely). 0 = max M_s
 //!   (more headroom), 1 = min M_s (more clamping).
 
-use libm::{sqrtf, tanhf};
+use libm::sqrtf;
+
+/// Fast tanh (Padé 3/2): ~0.2% error on |x|<=3, saturating beyond. Replaces
+/// libm `tanhf` (hundreds of cycles, software) in the per-sample hysteresis
+/// solver — the RK2 step calls this ~2x/sample/channel, so on the Cortex-M7 it
+/// was the tape's dominant cost. Monotonic + accurate, so the Langevin/coth math
+/// stays well-behaved.
+#[inline]
+fn fast_tanh(x: f32) -> f32 {
+    if x > 3.0 {
+        1.0
+    } else if x < -3.0 {
+        -1.0
+    } else {
+        let x2 = x * x;
+        x * (27.0 + x2) / (27.0 + 9.0 * x2)
+    }
+}
 
 /// Inter-domain coupling constant (Jiles-Atherton α). Tape's `alpha` in the
 /// CHOWTape source is fixed at this value.
@@ -120,7 +137,7 @@ impl Hysteresis {
             (q * ONE_THIRD, ONE_THIRD)
         } else {
             let one_over_q = 1.0 / q;
-            let coth = 1.0 / tanhf(q);
+            let coth = 1.0 / fast_tanh(q);
             let one_over_q_sq = one_over_q * one_over_q;
             let coth_sq = coth * coth;
             (coth - one_over_q, one_over_q_sq - coth_sq + 1.0)

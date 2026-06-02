@@ -16,7 +16,26 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::f32::consts::TAU;
-use libm::cosf;
+/// Fast cos (~0.2% error) for the wow/flutter LFOs. libm `cosf` measured ~1250
+/// cycles on the Cortex-M7 (argument range reduction) and dominated the tape's
+/// CPU cost; this parabolic approximation (Nick's, refined) is ~30x cheaper and
+/// far more accurate than an LFO needs.
+#[inline]
+fn fast_cos(x: f32) -> f32 {
+    use core::f32::consts::{PI, TAU};
+    // Reduce to [-PI, PI) — args here are non-negative LFO phases * TAU.
+    let n = (x * (1.0 / TAU) + 0.5) as i32;
+    let a = x - TAU * n as f32;
+    // cos(a) = sin(a + PI/2); wrap the shifted argument back into [-PI, PI).
+    let mut b = a + PI * 0.5;
+    if b > PI {
+        b -= TAU;
+    }
+    let abs_b = if b < 0.0 { -b } else { b };
+    let y = (4.0 / PI) * b - (4.0 / (PI * PI)) * b * abs_b;
+    let abs_y = if y < 0.0 { -y } else { y };
+    0.225 * (y * abs_y - y) + y
+}
 
 /// Simple ring-buffer fractional delay with linear interpolation.
 struct DelayLine {
@@ -176,7 +195,7 @@ impl WowFlutter {
         } else if self.wow_drift < -0.5 {
             self.wow_drift = -0.5;
         }
-        let wow = cosf(self.wow_phase * TAU) * self.wow_depth_samples
+        let wow = fast_cos(self.wow_phase * TAU) * self.wow_depth_samples
             + self.wow_drift * self.wow_depth_samples;
 
         // --- Flutter (three summed cosines at offset rates/phases) ---
@@ -186,7 +205,7 @@ impl WowFlutter {
             if self.flutter_phases[i] >= 1.0 {
                 self.flutter_phases[i] -= 1.0;
             }
-            flutter += cosf((self.flutter_phases[i] + self.flutter_offsets[i]) * TAU);
+            flutter += fast_cos((self.flutter_phases[i] + self.flutter_offsets[i]) * TAU);
         }
         flutter *= self.flutter_depth_samples * (1.0 / 3.0);
 

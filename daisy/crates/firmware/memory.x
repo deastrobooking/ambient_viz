@@ -35,6 +35,19 @@ SECTIONS
         PROVIDE(__sram1_bss_end__ = _esram1_bss);
     } > RAM_D2
 
+    /* Global heap: on-chip AXI SRAM (cached, fast) instead of external SDRAM, so
+     * the DSP delay-line working set doesn't thrash to slow external memory. The
+     * tape + freeze FX buffers (~137 KB) fit comfortably in 512 KB. */
+    .axisram_bss (NOLOAD) :
+    {
+        . = ALIGN(8);
+        _saxisram_bss = .;
+        *(.axisram_bss)
+        *(.axisram_bss*)
+        . = ALIGN(8);
+        _eaxisram_bss = .;
+    } > SRAM
+
     .sdram_bss (NOLOAD) :
     {
         . = ALIGN(4);

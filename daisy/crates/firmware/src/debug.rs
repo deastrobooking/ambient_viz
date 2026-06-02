@@ -36,18 +36,35 @@ impl Write for Writer<'_> {
     }
 }
 
-/// Backing fn for `dbg_uart!`. Blocking — call from setup / the reader, never
-/// from the audio callback (a blocking write there would stall the real-time
-/// path and cause the very overruns we're chasing).
-pub fn write_fmt(args: core::fmt::Arguments) {
-    DEBUG_TX.lock(|c| {
-        if let Ok(mut g) = c.try_borrow_mut() {
-            if let Some(tx) = g.as_mut() {
-                let mut w = Writer(tx);
-                let _ = write!(w, "{}\r\n", args);
-            }
+/// Real-time-safe writer: takes the UART critical section **one byte at a time**
+/// rather than holding it across the whole (blocking) line. Each byte masks
+/// interrupts only ~one character-time (~87 µs at 115200, well under the 0.67 ms
+/// SAI budget), and the audio interrupt executor runs between bytes — so logging
+/// from the thread executor can no longer starve the audio. (A whole-line CS was
+/// masking ~6 ms and underrunning the SAI.)
+struct ByteWriter;
+
+impl Write for ByteWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            DEBUG_TX.lock(|c| {
+                if let Ok(mut g) = c.try_borrow_mut() {
+                    if let Some(tx) = g.as_mut() {
+                        let _ = tx.blocking_write(&[b]);
+                    }
+                }
+            });
         }
-    });
+        Ok(())
+    }
+}
+
+/// Backing fn for `dbg_uart!`. Real-time-safe (per-byte CS) so it can be called
+/// from the thread executor while audio runs — but still never from the audio
+/// callback itself.
+pub fn write_fmt(args: core::fmt::Arguments) {
+    let mut w = ByteWriter;
+    let _ = write!(w, "{}\r\n", args);
 }
 
 #[macro_export]

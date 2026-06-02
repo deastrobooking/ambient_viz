@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod debug;
 mod sd;
 #[allow(dead_code)] // some control-handler accessors unused until composite CDC
@@ -11,16 +13,19 @@ mod usb_cdc;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use daisy_embassy::audio::AudioPeripherals;
+use daisy_embassy::audio::{AudioPeripherals, HALF_DMA_BUFFER_LENGTH};
 use daisy_embassy::led::UserLed;
 use daisy_embassy::{hal, new_daisy_board};
+use dsp::freeze::{self, Freeze, GlitchTape};
+use dsp::limiter::Limiter;
+use dsp::tape::TapeProcessor;
 use defmt::info;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::join::join;
 use embassy_futures::yield_now;
 use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
-use embassy_time::Timer;
+use embassy_time::{Delay, Timer};
 use embedded_alloc::LlffHeap as Heap;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
@@ -33,8 +38,15 @@ use defmt_rtt as _;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
-const HEAP_SIZE: usize = 64 * 1024;
+// Heap in on-chip AXI SRAM (cached, fast) — NOT external SDRAM. The DSP delay
+// lines (tape ~22 KB + freeze ring ~115 KB) thrash the 16 KB D-cache, so they
+// must sit in fast on-chip memory (an AXI miss is ~12x cheaper than an SDRAM
+// miss). 256 KB fits the FX with headroom; `.axisram_bss` maps to AXI SRAM.
+const HEAP_SIZE: usize = 256 * 1024;
+#[unsafe(link_section = ".axisram_bss")]
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+
+const SAMPLE_RATE: f32 = 48_000.0;
 
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
@@ -50,6 +62,15 @@ static USB_RING: StaticCell<Queue<i16, USB_RING_LEN>> = StaticCell::new();
 // derives song position from this (per audio sample rendered, not wall-clock,
 // so it can't drift from the audio — see PLAN_USB_COMPOSITE complication #3).
 static PLAYED_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+// Audio health counters, logged once/second by the heartbeat over the debug
+// UART. cb_full catches any callback stall/preemption; sai_err counts SAI
+// underruns (the glitch event); sd_under counts an empty SD ring; peak is the
+// post-FX output level (×1000).
+static OUT_PEAK_MILLI: AtomicU32 = AtomicU32::new(0);
+static CB_FULL_US: AtomicU32 = AtomicU32::new(0);
+static SAI_ERR: AtomicU32 = AtomicU32::new(0);
+static SD_UNDERRUN: AtomicU32 = AtomicU32::new(0);
 
 // 2b: audio runs on a high-priority interrupt executor so blocking SD reads
 // (and, later, DSP/MIDI) on the thread executor can never starve the SAI
@@ -67,13 +88,22 @@ unsafe fn UART4() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Enable FPU flush-to-zero + default-NaN. The DSP filter tails decay into
+    // denormals; without FZ the Cortex-M7 traps them to glacial support code
+    // (~300 ms/block measured -> silence via SAI underrun). FPDSCR sets the
+    // default for exception contexts — the audio FX runs in the UART4 interrupt
+    // executor — and FPSCR sets the current (thread) context.
     unsafe {
-        let ptr = (&raw mut HEAP_MEM) as *mut u8;
-        HEAP.init(ptr as usize, HEAP_SIZE);
+        const FPDSCR: *mut u32 = 0xE000_EF3C as *mut u32;
+        core::ptr::write_volatile(FPDSCR, (1 << 24) | (1 << 25)); // FZ | DN
+        let mut fpscr: u32;
+        core::arch::asm!("vmrs {}, fpscr", out(reg) fpscr);
+        fpscr |= (1 << 24) | (1 << 25);
+        core::arch::asm!("vmsr fpscr, {}", in(reg) fpscr);
     }
 
     let p = hal::init(daisy_embassy::default_rcc());
-    info!("ambient-viz-daisy firmware: SD stream (2b, interrupt executor)");
+    info!("ambient-viz-daisy firmware: SD stream + DSP (SDRAM heap)");
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
@@ -84,7 +114,49 @@ async fn main(spawner: Spawner) {
     let dbg_tx =
         embassy_stm32::usart::UartTx::new_blocking(p.USART3, board.pins.d2, dbg_cfg).unwrap();
     debug::init(dbg_tx);
-    dbg_uart!("=== ambient-viz-daisy boot: SD stream (2b) ===");
+    dbg_uart!("=== ambient-viz-daisy boot ===");
+
+    // Bring up external SDRAM and relocate the global heap into it — the DSP FX
+    // buffers don't fit the 64 KB internal RAM. Must precede any allocation.
+    let mut cm = cortex_m::Peripherals::take().unwrap();
+    let mut sdram = board.sdram.build(&mut cm.MPU, &mut cm.SCB);
+    let mut sdram_delay = Delay;
+    let sdram_addr = sdram.init(&mut sdram_delay) as usize; // SDRAM up (for the future Engine)
+    unsafe { HEAP.init((&raw mut HEAP_MEM) as usize, HEAP_SIZE) };
+    dbg_uart!(
+        "heap: {} KB in AXI SRAM; SDRAM 64M ready @ {:#010x}",
+        HEAP_SIZE / 1024,
+        sdram_addr
+    );
+
+    // Caches: the DSP is data-bound on the external SDRAM, so the D-cache is the
+    // real fix (I-cache alone bought ~14%). The SDRAM maps at 0xC000_0000 (FMC
+    // bank 1), which the default memory map treats as non-cacheable device, so
+    // we add our own MPU regions: SDRAM cacheable write-back for fast DSP, and
+    // SRAM1 (where the SAI DMA buffers live, `.sram1_bss`) non-cacheable so the
+    // DMA stays coherent with the cache. Then enable both caches.
+    cm.SCB.enable_icache();
+    unsafe {
+        use cortex_m::asm::{dmb, dsb, isb};
+        dmb();
+        cm.MPU.ctrl.write(0); // disable while editing regions
+        // Region 1: SDRAM @ 0xC000_0000, 8 MB, normal cacheable write-back
+        // (AP=full, C=1, B=1, SIZE=2^23).
+        cm.MPU.rnr.write(1);
+        cm.MPU.rbar.write(0xC000_0000);
+        cm.MPU.rasr.write((0b011 << 24) | (1 << 17) | (1 << 16) | ((23 - 1) << 1) | 1);
+        // Region 2: SRAM1 @ 0x3000_0000, 128 KB, normal non-cacheable
+        // (AP=full, TEX=001/C=0/B=0, SIZE=2^17) — keeps SAI DMA coherent.
+        cm.MPU.rnr.write(2);
+        cm.MPU.rbar.write(0x3000_0000);
+        cm.MPU.rasr.write((0b011 << 24) | (0b001 << 19) | ((17 - 1) << 1) | 1);
+        // Re-enable MPU: background default map for privileged + MPU on.
+        cm.MPU.ctrl.write(0x05);
+        dsb();
+        isb();
+    }
+    cm.SCB.enable_dcache(&mut cm.CPUID);
+    dbg_uart!("cache: I+D on (SDRAM cacheable, SRAM1 DMA non-cacheable)");
 
     // Hand the audio peripherals to the interrupt-executor task (below). Doing
     // all SAI setup inside the task keeps the non-Send Interface from crossing
@@ -207,6 +279,10 @@ async fn main(spawner: Spawner) {
     let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
 
     let usb_device = usb_builder.build();
+    // Keep USB below the audio interrupt executor (P6) so OTG IRQs can't preempt
+    // the audio callback mid-write and starve the SAI (glitches). USB tolerates
+    // the ~callback-length delay; audio must not.
+    interrupt::OTG_FS.set_priority(Priority::P7);
     spawner.must_spawn(usb_audio::usb_task(usb_device));
     spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
     spawner.must_spawn(usb_cdc::position_emit_task(cdc, loop_frames));
@@ -220,6 +296,14 @@ async fn main(spawner: Spawner) {
             Timer::after_millis(500).await;
             led.off();
             Timer::after_millis(500).await;
+            // Safe now that dbg_uart writes per-byte (≤87 µs CS, not ~6 ms).
+            dbg_uart!(
+                "diag: cb_full {} us (budget 667) | sai_err {} sd_under {} | peak {}",
+                CB_FULL_US.swap(0, Ordering::Relaxed),
+                SAI_ERR.swap(0, Ordering::Relaxed),
+                SD_UNDERRUN.swap(0, Ordering::Relaxed),
+                OUT_PEAK_MILLI.swap(0, Ordering::Relaxed),
+            );
         }
     };
     let reader = async {
@@ -265,26 +349,95 @@ async fn audio_task(
             return;
         }
     };
-    dbg_uart!("audio: interface started");
+    // Master FX chain applied to the SD stream. We run the effects standalone
+    // (the synth Engine ignores external input), mirroring its master order:
+    // tape -> freeze send (glitch + return while active) -> limiter. Buffers
+    // (~155 KB) come from the SDRAM heap.
+    let mut tape = TapeProcessor::new(SAMPLE_RATE);
+    tape.set_enabled(true);
+    let mut freeze = Freeze::new(SAMPLE_RATE);
+    let mut glitch = GlitchTape::new(SAMPLE_RATE);
+    let mut limiter = Limiter::new(SAMPLE_RATE);
+    // Prime tape's scratch (it resizes on first process()) so the RT callback
+    // never allocates.
+    tape.process(&mut [0.0f32; HALF_DMA_BUFFER_LENGTH], 0);
+    let mut sample_index: u64 = 0;
+    dbg_uart!("audio: interface started, FX chain ready");
+
     loop {
         // start_callback returns only on a SAI error; on its own executor that
         // shouldn't happen now. Restart rather than panic if it ever does.
         let _ = interface
             .start_callback(|_input, output| {
-                for frame in output.chunks_mut(2) {
-                    let l = consumer.dequeue().unwrap_or(0);
-                    let r = consumer.dequeue().unwrap_or(0);
-                    frame[0] = i16_to_u24(l);
-                    frame[1] = i16_to_u24(r);
-                    // Tee what we play to the USB capture ring. Drops on full,
-                    // which is exactly when the host isn't draining (not capturing).
-                    let _ = usb_producer.enqueue(l);
-                    let _ = usb_producer.enqueue(r);
+                let cb_t = embassy_time::Instant::now();
+                let n = output.len().min(HALF_DMA_BUFFER_LENGTH);
+                let mut buf = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+                let mut send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+
+                // SD i16 -> f32 master block.
+                for s in buf[..n].iter_mut() {
+                    let v = match consumer.dequeue() {
+                        Some(v) => v,
+                        None => {
+                            SD_UNDERRUN.fetch_add(1, Ordering::Relaxed);
+                            0
+                        }
+                    };
+                    *s = v as f32 / 32768.0;
                 }
-                // Advance the play position by the frames rendered this block.
-                PLAYED_FRAMES.fetch_add((output.len() / 2) as u32, Ordering::Relaxed);
+
+                // Placeholder control until the CDC CC path (Phase E) is wired:
+                // failure held steady — a live change triggers the loss-filter FIR
+                // redesign, too slow until its cosine table is precomputed — and a
+                // freeze grain every 10 s to exercise the freeze path.
+                tape.set_failure(0.0);
+                let t = sample_index as f32 / SAMPLE_RATE;
+                let yf = {
+                    let y = t * (1.0 / 10.0);
+                    y - (y as u32 as f32) // fract(t / 10)
+                };
+                freeze.set_amount(if yf * 10.0 < 0.5 { 1.0 } else { 0.0 });
+
+                // Master chain (mirrors Engine::process): tape -> freeze send
+                // (glitch + return while active) -> limiter.
+                tape.process(&mut buf[..n], sample_index);
+                freeze.process(&buf[..n], &mut send[..n]);
+                if freeze.active() {
+                    glitch.process(&mut send[..n]);
+                    for (o, &g) in buf[..n].iter_mut().zip(send[..n].iter()) {
+                        *o += g * freeze::FREEZE_RETURN_GAIN;
+                    }
+                }
+                limiter.process(&mut buf[..n]);
+
+                let mut pk = 0.0f32;
+                for &s in buf[..n].iter() {
+                    let a = if s < 0.0 { -s } else { s };
+                    if a > pk {
+                        pk = a;
+                    }
+                }
+                OUT_PEAK_MILLI.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
+
+                // f32 -> SAI 24-bit, and tee the *processed* (heard) audio to USB.
+                for (i, frame) in output[..n].chunks_mut(2).enumerate() {
+                    let l = buf[2 * i];
+                    let r = buf[2 * i + 1];
+                    frame[0] = f32_to_u24(l);
+                    frame[1] = f32_to_u24(r);
+                    let _ = usb_producer.enqueue(f32_to_i16(l));
+                    let _ = usb_producer.enqueue(f32_to_i16(r));
+                }
+
+                let frames = (n / 2) as u64;
+                sample_index += frames;
+                PLAYED_FRAMES.fetch_add(frames as u32, Ordering::Relaxed);
+                CB_FULL_US.fetch_max(cb_t.elapsed().as_micros() as u32, Ordering::Relaxed);
             })
             .await;
+        // start_callback returns Result<Infallible, _>, so a return == a SAI
+        // error (underrun/overrun) — the glitch event. Count + restart.
+        SAI_ERR.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -301,8 +454,15 @@ async fn blink_code(led: &mut UserLed<'_>, code: u8) -> ! {
     }
 }
 
-/// i16 sample -> 24-bit signed (low bits of a u32), the SAI callback's format.
+/// f32 [-1,1] -> 24-bit signed in a u32's low bits, the SAI callback's format
+/// (sign-extended i32-as-u32, matching the old i16<<8 path the codec expects).
 #[inline(always)]
-fn i16_to_u24(s: i16) -> u32 {
-    ((s as i32) << 8) as u32
+fn f32_to_u24(s: f32) -> u32 {
+    ((s.clamp(-1.0, 1.0) * 8_388_607.0) as i32) as u32
+}
+
+/// f32 [-1,1] -> i16, for the USB capture tee.
+#[inline(always)]
+fn f32_to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32_767.0) as i16
 }
