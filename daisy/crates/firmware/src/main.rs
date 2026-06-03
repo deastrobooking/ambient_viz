@@ -272,7 +272,11 @@ async fn main(spawner: Spawner) {
         usb_cfg,
     );
 
-    let mut dev_cfg = embassy_usb::Config::new(0x1209, 0x0001); // pid.codes test VID
+    // VID 0x1209 = pid.codes (hobby space). PID 0xDA15 instead of the 0x0001
+    // "Test PID": 0x0001 is in usb.ids, so Linux/PipeWire names the device
+    // "pid.codes Test PID" from the database rather than our product string. An
+    // unallocated PID has no usb.ids entry, so the name falls back to `product`.
+    let mut dev_cfg = embassy_usb::Config::new(0x1209, 0xDA15);
     dev_cfg.manufacturer = Some("ambient-viz");
     dev_cfg.product = Some("Daisy audio source");
     dev_cfg.serial_number = Some("0001");
