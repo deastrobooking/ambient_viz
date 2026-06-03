@@ -198,26 +198,40 @@ async fn main(spawner: Spawner) {
     sd::set_fast(&sdcard);
     dbg_uart!("SD: acquired at 400kHz, SPI -> 24MHz for streaming");
     let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
-    let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
-        Ok(v) => v,
-        Err(_) => {
-            dbg_uart!("SD: FAT volume mount failed (blink 2)");
-            blink_code(&mut led, 2).await
+    // Retry the FAT mount + open the same way as the acquire: a marginal MBR /
+    // boot-sector / FAT read on cold boot can fail any of these (blink 2/3) even
+    // though the card acquired fine, and a re-read after a short settle recovers
+    // without a power cycle. Each step retries independently; the label-break-
+    // value keeps the borrow chain (volume <- root <- file) intact on success.
+    let volume = 'mount: {
+        for _ in 0..5 {
+            if let Ok(v) = volume_mgr.open_volume(VolumeIdx(0)) {
+                break 'mount v;
+            }
+            Timer::after_millis(100).await;
         }
+        dbg_uart!("SD: FAT volume mount failed after retries (blink 2)");
+        blink_code(&mut led, 2).await
     };
-    let root = match volume.open_root_dir() {
-        Ok(r) => r,
-        Err(_) => {
-            dbg_uart!("SD: open root dir failed (blink 2)");
-            blink_code(&mut led, 2).await
+    let root = 'root: {
+        for _ in 0..5 {
+            if let Ok(r) = volume.open_root_dir() {
+                break 'root r;
+            }
+            Timer::after_millis(100).await;
         }
+        dbg_uart!("SD: open root dir failed after retries (blink 2)");
+        blink_code(&mut led, 2).await
     };
-    let file = match root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
-        Ok(f) => f,
-        Err(_) => {
-            dbg_uart!("SD: AMBIENT.RAW open failed (blink 3)");
-            blink_code(&mut led, 3).await
+    let file = 'open: {
+        for _ in 0..5 {
+            if let Ok(f) = root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
+                break 'open f;
+            }
+            Timer::after_millis(100).await;
         }
+        dbg_uart!("SD: AMBIENT.RAW open failed after retries (blink 3)");
+        blink_code(&mut led, 3).await
     };
     dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
     // Loop length in stereo frames (4 bytes/frame) for CDC position wrap.
