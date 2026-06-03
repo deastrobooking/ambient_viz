@@ -460,6 +460,13 @@ After=graphical-session.target
 
 [Service]
 WorkingDirectory=%h/ambient_viz/server
+# DAISY=1 loads the Daisy USB-CDC song-position bridge (Phase D) so the
+# visualizer can run with ?clock=daisy. Without it, no `song_position` is
+# published and clock=daisy freezes the lanes. systemd does NOT run ExecStart
+# through a shell, so this must be an Environment= line — prepending DAISY=1 to
+# ExecStart would make systemd look for a binary named "DAISY=1". The service
+# user must also be in the `dialout` group to open /dev/ttyACM0.
+Environment=DAISY=1
 ExecStart=/usr/bin/node src/index.js
 Restart=on-failure
 RestartSec=2
@@ -501,9 +508,18 @@ For Chromium kiosk autostart, add to `~/.config/autostart/kiosk.desktop`:
 [Desktop Entry]
 Type=Application
 Name=ambient_viz kiosk
-Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required http://localhost:8080/?lite=1&bitmap=360&distanceToBitmap=on
+Exec=chromium-browser --kiosk --noerrdialogs --disable-infobars --autoplay-policy=no-user-gesture-required "http://localhost:8080/?lite=1&bitmap=360&distanceToBitmap=on"
 X-GNOME-Autostart-enabled=true
 ```
+
+**The URL must be double-quoted.** The `&` separating query params is a
+reserved character in a `.desktop` `Exec=` line — unquoted, the launcher
+splits the command at each `&` and Chromium receives only `?lite=1`,
+silently dropping `bitmap=360` and `distanceToBitmap=on`. That renders at
+full native resolution and saturates the Pi 4's GPU, which freezes the
+cursor/desktop (the page itself still loads, so it looks like it "works").
+Verify with `pgrep -a chromium-browser` — the URL should be intact, not cut
+off at the first `&`.
 
 `?lite=1` hides DOM overlays and sparsens the lattice.
 `?bitmap=360` caps render bitmap height to 360px (browser upscales to
@@ -514,7 +530,9 @@ fps. Aesthetic cost: chunky dither / CRT-y look, which fits the
 visualizer's vibe. Try `bitmap=480` if you want a sharper look at the
 cost of fps, or drop both flags entirely if your Pi handles native res.
 `?distanceToBitmap=on` wires the VL53L1X reading to scale the bitmap
-ceiling down to 64 px as someone approaches — see `SENSOR_MAPPING.md`
+ceiling down to 64 px as someone walks away (full res within 75 cm,
+lowest res at/beyond the sensor's reach — ~130 cm short mode / ~400 cm
+long mode) — see `SENSOR_MAPPING.md`
 for the full mapping. Append `&debug=1` to surface a diagnostic
 overlay that survives lite mode.
 

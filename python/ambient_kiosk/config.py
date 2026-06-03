@@ -16,7 +16,17 @@ PIR_BOOT_SUPPRESS_S = 60.0  # ignore output for the first 60s post-process-start
 # VL53L1X
 VL53_DISTANCE_MODE = 1     # 1 = short, 2 = long. Fallback when auto-select
                            # is off or can't read ambient (see below).
-VL53_TIMING_BUDGET_MS = 20
+# Timing budget (ms), per the VL53L1X datasheet: 20 ms is the floor and is valid
+# ONLY in short mode; 33 ms is the floor for any mode; 140 ms is required to
+# reach the full 4 m in long mode (dark, white target). The Adafruit lib accepts
+# a discrete set {15,20,33,50,100,200,500}, so long mode uses 200 ms (the next
+# value ≥140) to guarantee the 4 m reach — at the cost of a ~5 Hz ranging rate,
+# which the hold/snap logic and browser EMA absorb. Mode-dependent so short mode
+# keeps its fast 50 Hz feel. VL53_TIMING_BUDGET_MS is the short/default used for
+# the boot ambient sample (always taken in short mode).
+VL53_TIMING_BUDGET_MS_SHORT = 20
+VL53_TIMING_BUDGET_MS_LONG = 200
+VL53_TIMING_BUDGET_MS = VL53_TIMING_BUDGET_MS_SHORT
 
 # Auto distance-mode select. The projector at the install is curator-supplied
 # and unknown: a bright lamp engine throws real 940 nm IR onto the wall the
@@ -32,7 +42,13 @@ VL53_AMBIENT_LONG_MAX = 1500   # ambient at/below this -> long; above -> short
 
 VL53_PUBLISH_HZ = 50
 VL53_SMOOTH_ALPHA = 0.25
-VL53_FAR_CM = 100.0
+# "Far" reach (cm) — the no-target snap value AND the saturation end of every
+# distance→effect mapping (twist, bitmap, tape failure), published downstream as
+# `distance_far_cm`. Mode dependent: short mode reaches ~130 cm, long mode ~4 m.
+# VL53_FAR_CM is the short/default used before mode is decided and in mock mode.
+VL53_FAR_CM_SHORT = 130.0
+VL53_FAR_CM_LONG = 400.0
+VL53_FAR_CM = VL53_FAR_CM_SHORT
 VL53_NEAR_CM = 25.0
 
 # HR202 / TLC555 breath detection

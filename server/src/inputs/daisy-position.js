@@ -7,8 +7,10 @@
 //
 //  WRITE (Phase E): we tunnel sensor/freeze control to the Daisy as raw 3-byte
 //    MIDI CC frames `[0xB0, cc, value]` (the firmware frames + decodes them):
-//      - `distance_cm`  -> CC 23 (tape failure): near = present = pristine,
-//        far = absent = tape eaten.
+//      - `distance_cm`  -> CC 23 (tape failure): near (≤75cm) = present =
+//        pristine, far (≥ the sensor's reach) = absent = tape eaten.
+//      - `distance_far_cm` -> sets that far reach (sensor mode dependent); not
+//        forwarded to the Daisy, only shapes the distance_cm curve above.
 //      - `freeze` (0..1, posted by the browser to /ingest) -> CC 24.
 //    On-change + rate-capped so the bulk-OUT pipe + param smoothers don't flood.
 //
@@ -27,9 +29,14 @@ const REOPEN_MS = 1000;
 const CC_TAPE_FAILURE = 23;
 const CC_FREEZE = 24;
 // Distance -> failure curve (cm). Mirror of the visualizer's presence shaping:
-// near (present) resolves the tape; far (absent) lets it fall apart.
-const NEAR_CM = 25;
-const FAR_CM = 100;
+// at/within NEAR_CM the tape sits at its subtle default (failure 0); past it
+// the deck falls apart with distance, fully destroyed at/beyond the far reach.
+// The far reach is NOT fixed — it tracks the sensor's distance mode (short
+// ~130 cm / long ~400 cm), published by the Python sidecar as `distance_far_cm`.
+// We default to the short-mode reach until the first value arrives.
+const NEAR_CM = 75;
+const FAR_DEFAULT_CM = 130;
+let farCm = FAR_DEFAULT_CM;
 const MIN_WRITE_MS = 33; // cap each CC to ~30 Hz (complication #13)
 
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -52,8 +59,11 @@ function writeCc(cc, value) {
 
 function onChange(name, value) {
   if (typeof value !== 'number') return;
-  if (name === 'distance_cm') {
-    const failure = clamp((value - NEAR_CM) / (FAR_CM - NEAR_CM), 0, 1);
+  if (name === 'distance_far_cm') {
+    // Sensor's mode-derived reach; the far end of the failure ramp tracks it.
+    if (value > NEAR_CM) farCm = value;
+  } else if (name === 'distance_cm') {
+    const failure = clamp((value - NEAR_CM) / (farCm - NEAR_CM), 0, 1);
     writeCc(CC_TAPE_FAILURE, failure * 127);
   } else if (name === 'freeze') {
     writeCc(CC_FREEZE, clamp(value, 0, 1) * 127);

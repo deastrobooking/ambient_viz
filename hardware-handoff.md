@@ -171,12 +171,13 @@ while True:
 
 1. **Smooth raw readings** with an exponential moving average: `smoothed = α * new + (1 - α) * smoothed` with `α ≈ 0.25`. Optionally use a one-euro filter for adaptive smoothing if jitter at rest is objectionable.
 2. **Handle invalid reads** (`distance` is `None`): treat as "no target / far" and decay the visual effect toward its idle state. Do not freeze the last valid reading indefinitely.
-3. **Engagement zones:**
-   - `distance >= 100 cm` → idle state (visual at rest)
-   - `25 cm < distance < 100 cm` → active state, map distance to visual intensity
-   - `distance <= 25 cm` → lock to full intensity (dead zone for close inspection)
+3. **Engagement zones** (distortion grows WITH distance — close = clean, far = destroyed).
+   `FAR` is the sensor's mode-derived reach: ~130 cm in short mode, ~400 cm in long mode:
+   - `distance <= 75 cm` → idle state (no distance-induced distortion; subtle default tape)
+   - `75 cm < distance < FAR` → active state, map distance to visual/tape intensity
+   - `distance >= FAR` (or no target) → lock to full intensity (max twist, lowest bitmap, eaten tape)
 4. **Non-linear mapping** from distance to visual parameter feels better than linear:
-   `intensity = 1 - ((distance - 25) / 75)²` for the active zone, clamped to [0, 1].
+   `intensity = ((distance - 75) / (FAR - 75))²` for the active zone, clamped to [0, 1].
 5. **Multiple people:** sensor naturally returns the closest object in its narrow cone, which is the desired behavior. No additional logic needed.
 
 #### Remote VL53L1X over Cat5 (2 m run)

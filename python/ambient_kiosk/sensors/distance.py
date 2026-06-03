@@ -39,6 +39,22 @@ class DistanceDriver:
         self._i2c = None
         self._smoothed: Optional[float] = None
         self._last_published: Optional[float] = None
+        # Sensor's far reach in cm — the no-target snap value and the saturation
+        # end of the downstream effect mappings. Mode dependent; resolved once
+        # the distance mode is chosen in _init_sensor (short default until then).
+        self._far_cm: float = config.VL53_FAR_CM
+
+    @staticmethod
+    def _budget_for_mode(mode: int) -> int:
+        """Timing budget (ms) valid for the given distance mode. Long mode needs
+        a much larger budget to reach 4 m (20 ms is short-mode-only)."""
+        return (config.VL53_TIMING_BUDGET_MS_LONG if mode == 2
+                else config.VL53_TIMING_BUDGET_MS_SHORT)
+
+    @staticmethod
+    def _far_for_mode(mode: int) -> float:
+        """Far reach (cm) for the given distance mode."""
+        return config.VL53_FAR_CM_LONG if mode == 2 else config.VL53_FAR_CM_SHORT
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="distance", daemon=True)
@@ -56,12 +72,17 @@ class DistanceDriver:
             # so there's no glitch if we don't switch.
             mode = 1 if config.VL53_AUTO_MODE else config.VL53_DISTANCE_MODE
             self._sensor.distance_mode = mode
-            self._sensor.timing_budget = config.VL53_TIMING_BUDGET_MS
+            # Auto-select samples ambient in short mode, so start at the short
+            # budget; the final mode's budget is applied below / in _calibrate.
+            self._sensor.timing_budget = (config.VL53_TIMING_BUDGET_MS
+                                          if config.VL53_AUTO_MODE
+                                          else self._budget_for_mode(mode))
             self._sensor.start_ranging()
             if config.VL53_AUTO_MODE:
                 mode = self._calibrate_distance_mode(mode)
-            log.info("distance: VL53L1X ready (mode=%d, budget=%dms)",
-                     mode, config.VL53_TIMING_BUDGET_MS)
+            self._far_cm = self._far_for_mode(mode)
+            log.info("distance: VL53L1X ready (mode=%d, budget=%dms, far=%.0fcm)",
+                     mode, self._budget_for_mode(mode), self._far_cm)
             return True
         except Exception as e:
             log.error("distance: VL53L1X init failed: %s", e)
@@ -116,11 +137,12 @@ class DistanceDriver:
                  median, len(samples), config.VL53_AMBIENT_LONG_MAX,
                  "long" if chosen == 2 else "short")
         if chosen != current_mode:
-            # Mode switch must bracket a ranging stop; re-assert the timing
-            # budget afterward since valid budgets are mode-dependent.
+            # Mode switch must bracket a ranging stop; apply the chosen mode's
+            # timing budget — long mode needs ≥140 ms to reach 4 m, whereas the
+            # 20 ms short budget is invalid for long mode entirely.
             self._sensor.stop_ranging()
             self._sensor.distance_mode = chosen
-            self._sensor.timing_budget = config.VL53_TIMING_BUDGET_MS
+            self._sensor.timing_budget = self._budget_for_mode(chosen)
             self._sensor.start_ranging()
         return chosen
 
@@ -152,7 +174,17 @@ class DistanceDriver:
         # first one arrives, so initial published value is FAR (idle).
         last_valid_t = 0.0
 
+        # Re-publish the (static) far reach every ~2 s so a downstream restart
+        # (Node server / browser reconnect) re-learns it; the Node bridge dedups
+        # so the bus stays quiet between changes.
+        far_pub_every = max(1, int(config.VL53_PUBLISH_HZ * 2))
+        loop_i = 0
+
         while not self._stop.wait(period):
+            if loop_i % far_pub_every == 0:
+                self.ingest.publish("distance_far_cm", round(self._far_cm, 1))
+            loop_i += 1
+
             if self.mock:
                 t = ((time.monotonic() - cycle_start) % CYCLE) / CYCLE
                 if t < 0.05 or t >= 0.85:
@@ -173,11 +205,11 @@ class DistanceDriver:
                 last_valid_t = now
                 self._smoothed = raw if self._smoothed is None else (a * raw + (1 - a) * self._smoothed)
             elif last_valid_t == 0.0 or (now - last_valid_t) > self.NO_TARGET_TIMEOUT_S:
-                # Sustained no-target — snap to FAR. Gradual decay would
-                # leave the smoothed value stuck near the user's last
-                # close-range position for ~150 ms after the hold expires,
-                # which reads as "kiosk thinks I'm still here" lag.
-                self._smoothed = config.VL53_FAR_CM
+                # Sustained no-target — snap to the mode-derived FAR. Gradual
+                # decay would leave the smoothed value stuck near the user's last
+                # close-range position for ~150 ms after the hold expires, which
+                # reads as "kiosk thinks I'm still here" lag.
+                self._smoothed = self._far_cm
             # else: brief None during a known-present target — hold value.
 
             # Quantize publication to 0.1 cm to suppress trivial JSON noise

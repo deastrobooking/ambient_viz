@@ -60,7 +60,11 @@ def main() -> int:
     mode = driver._calibrate_distance_mode(1)
     mode_name = "long" if mode == 2 else "short"
 
-    print(f"VL53L1X ready: {mode_name} mode, {config.VL53_TIMING_BUDGET_MS} ms timing budget")
+    # _calibrate_distance_mode applies the chosen mode's budget on a switch, so
+    # report that (not the short-mode sample budget) and the resulting far reach.
+    print(f"VL53L1X ready: {mode_name} mode, "
+          f"{driver._budget_for_mode(mode)} ms timing budget, "
+          f"far reach {driver._far_for_mode(mode):.0f} cm")
     print("hold target steady to read noise floor; wave to track motion")
     print("ambient = scene IR load (ST ULD units). Compare projector ON vs OFF,")
     print("on the real wall, to tune VL53_AMBIENT_LONG_MAX in config.py.")

@@ -33,39 +33,51 @@ keyed by the wire name (`distance_cm`, `motion`, `touch_mask`,
 
 Scales the authored `maxTwistDeg` slider value by a distance-derived
 gain. Implements the [[artistic-statement-pain-material]] idea of an
-effect that builds as someone approaches the kiosk.
+effect that builds as someone *retreats* from the kiosk — close
+inspection leaves the image untouched, distance pulls it apart.
 
 | Distance | `twistGain` | Effective `maxTwistDeg` |
 |---|---|---|
-| ≤ 25 cm | 1.0 | authored ceiling (full) |
-| ≥ 100 cm | 0 | 0 (no twist) |
-| 25-100 cm | `1 - x²` where `x = (d-25)/75` | gain × authored |
+| ≤ 75 cm | 0 | 0 (no twist) |
+| ≥ FAR | 1.0 | authored ceiling (full) |
+| 75-FAR cm | `x²` where `x = (d-75)/(FAR-75)` | gain × authored |
 
-Curve is *ease-in toward zero* — the effect holds near-max for most of
-the close range, then drops off rapidly as someone walks away. The
+Curve is *ease-in from zero* — no distance-induced twist within 75 cm,
+then a subtle onset that accelerates to full as someone walks away. The
 dev-panel slider keeps showing the authored ceiling; only the value
 posted to the worker is scaled.
+
+`FAR` is **not fixed**: it tracks the sensor's actual reach, which
+depends on the distance mode the Python sidecar auto-selects at boot
+(short ≈ 130 cm, long ≈ 400 cm). The sidecar publishes that reach as the
+`distance_far_cm` SSE topic; the browser reads it live (`distanceFarCm()`)
+and falls back to 130 cm until the first value arrives. See
+[Distance mode & reach](#distance-mode--reach) below.
 
 Constants at top of the `applyAutomation` block in
 `static/index.html`:
 
-- `DISTANCE_TWIST_NEAR_CM` = 25
-- `DISTANCE_TWIST_FAR_CM` = 100
+- `DISTANCE_NEAR_CM` = 75 (shared onset for twist + bitmap)
+- `DISTANCE_FAR_DEFAULT_CM` = 130 (fallback until `distance_far_cm` arrives)
 
 ### `distance_cm` → `bitmapHeight` (opt-in)
 
 When enabled, scales the authored bitmap-height ceiling down to a
-64-pixel floor as someone approaches. The world coarsens with
-proximity.
+64-pixel floor as someone walks away. The world coarsens with
+distance.
 
 | Distance | Effective `bitmapHeight` |
 |---|---|
-| ≥ 100 cm | authored ceiling |
-| ≤ 25 cm | 64 |
-| 25-100 cm | `64 + (ceiling - 64) · x²` where `x = (d-25)/75` |
+| ≤ 75 cm | authored ceiling |
+| ≥ FAR | 64 |
+| 75-FAR cm | `ceiling - (ceiling - 64) · x²` where `x = (d-75)/(FAR-75)` |
 
-Curve is *ease-out from MIN* — sticky at the low-res "dissociation"
-state when close, then recovers rapidly as someone leaves. Quantized
+`FAR` is the same mode-derived reach as the twist mapping (≈130 cm short
+/ ≈400 cm long, from `distance_far_cm`).
+
+Curve is *ease-in toward MIN* — full res within 75 cm, then the low-res
+"dissociation" state builds as someone leaves, hitting the floor at the
+FAR reach. Quantized
 to 20-pixel steps to bound the GPU buffer realloc rate. Routes
 through `PARAMS.bitmapHeight.setLive()` (which mutates the
 main-thread variable and calls `resize()`); the worker's `params`
@@ -82,13 +94,41 @@ Enable mechanisms (in precedence order):
 3. **Default**: `off`. The visualizer behaves exactly as before
    without the mapping.
 
-Constants at top of the `applyAutomation` block in
-`static/index.html`:
+Onset (`DISTANCE_NEAR_CM` = 75) and FAR (`distanceFarCm()`) are shared
+with the twist mapping. Bitmap-specific constants at the top of the
+`applyAutomation` block in `static/index.html`:
 
-- `DISTANCE_BITMAP_NEAR_CM` = 25
-- `DISTANCE_BITMAP_FAR_CM` = 100
 - `DISTANCE_BITMAP_MIN` = 64 (pixel floor)
 - `DISTANCE_BITMAP_QUANTIZE` = 20 (px step)
+
+## Distance mode & reach
+
+The VL53L1X runs in one of two distance modes, auto-selected at boot by
+the Python sidecar from an ambient-IR sample (`VL53_AUTO_MODE`,
+`_calibrate_distance_mode` in `distance.py`):
+
+| Mode | Reach (`distance_far_cm`) | Timing budget | Ranging rate |
+|---|---|---|---|
+| short | `VL53_FAR_CM_SHORT` = 130 cm | 20 ms | ~50 Hz |
+| long | `VL53_FAR_CM_LONG` = 400 cm | 200 ms | ~5 Hz |
+
+- **Why the budget changes with mode.** Per the datasheet, the 20 ms
+  budget is valid *only* in short mode; long mode needs ≥ 33 ms to range
+  at all and ≥ 140 ms to reach the full 4 m. The Adafruit lib only
+  accepts a discrete set `{15,20,33,50,100,200,500}`, so long mode uses
+  **200 ms** (the next step ≥ 140). That drops the ranging rate to ~5 Hz,
+  which the `None`-hold logic and browser EMA absorb. (`_budget_for_mode`.)
+- **Reach is published, not assumed.** Because the active mode isn't
+  known until boot, the chosen reach is published as the `distance_far_cm`
+  topic and re-sent every ~2 s (so a Node/browser restart re-learns it).
+  All three effect consumers read it as the FAR end of their ramp:
+  - browser twist + bitmap — `distanceFarCm()` in `static/index.html`
+  - tape failure — `farCm` in `server/src/inputs/daisy-position.js`
+- **Real-world reach.** 4 m is the best-case long-mode figure (dark room,
+  white target). A person's clothing is low-reflectivity, so they often
+  read `None` somewhere around 2.5–3.6 m → which snaps to the far value →
+  max effect anyway. So the smooth ramp covers the trackable range and
+  "very far / absent" lands on full destruction regardless.
 
 ## Smoothing
 
@@ -102,10 +142,11 @@ arrived/left" transitions.
 - `None` reads (sensor dropout — common on shiny targets, motion
   edges, below-min-range, etc.) **hold** the smoothed value rather
   than decaying. Without this, every dropped frame would yank the
-  published value toward `VL53_FAR_CM`, biasing the SSE feed upward
+  published value toward the far reach, biasing the SSE feed upward
   even with a target consistently present.
 - After `NO_TARGET_TIMEOUT_S = 0.6` seconds of continuous `None`
-  reads, the smoothed value **snaps** to `VL53_FAR_CM = 100`. Snap
+  reads, the smoothed value **snaps** to the mode-derived far reach
+  (`_far_cm`; 130 cm short / 400 cm long). Snap
   (not gradual decay) is intentional — gradual decay leaves the
   visualizer thinking "user still close" for an extra ~150 ms after
   the hold expires.
@@ -124,8 +165,8 @@ still thinks you're here" lag after departure.
   as a hard cut. The Python side already filters most of the
   jitter.
 
-Net response time, "person walks out of cone" → "bitmap at full":
-~0.9 s (0.6 s hold + 0.25 s browser EMA convergence).
+Net response time, "person walks out of cone" → "bitmap at MIN /
+twist at full": ~0.9 s (0.6 s hold + 0.25 s browser EMA convergence).
 
 ## Operational tooling
 
@@ -167,7 +208,7 @@ overlay showing live mapping state. Works in lite mode (where the
 dev panel is hidden):
 
 ```
-toggle=on raw=47.3 d=47.5 ceil=1080 eff=240 bh=240 tg=0.70
+toggle=on raw=119.0 d=120.0 ceil=1080 eff=400 bh=400 far=130 tg=0.67
 ```
 
 | Field | Meaning |
@@ -178,6 +219,7 @@ toggle=on raw=47.3 d=47.5 ceil=1080 eff=240 bh=240 tg=0.70
 | `ceil` | Authored bitmap ceiling (slider/lane value) |
 | `eff` | Computed effective bitmap (post quantization) |
 | `bh` | Actual `bitmapHeight` runtime variable in computeDpr() |
+| `far` | Active FAR reach (`distance_far_cm`; 130 short / 400 long mode) |
 | `tg` | `twistGain` factor multiplying `maxTwistDeg` |
 
 A divergence between `raw` and `d` indicates browser smoothing in
@@ -192,16 +234,17 @@ inspection, regardless of `?debug=1`.
 
 | Knob | Where | Default | Effect of increase |
 |---|---|---|---|
-| `DISTANCE_TWIST_NEAR_CM` | static/index.html | 25 | Twist holds max over a wider close zone |
-| `DISTANCE_TWIST_FAR_CM` | static/index.html | 100 | Twist still partially active at larger distances |
-| `DISTANCE_BITMAP_NEAR_CM` | static/index.html | 25 | Bitmap floor (MIN) starts further out |
-| `DISTANCE_BITMAP_FAR_CM` | static/index.html | 100 | Bitmap reaches ceiling later |
-| `DISTANCE_BITMAP_MIN` | static/index.html | 64 | Less aggressive low-res floor when close |
+| `DISTANCE_NEAR_CM` | static/index.html | 75 | Onset distance — no distortion out to here (shared twist + bitmap) |
+| `DISTANCE_FAR_DEFAULT_CM` | static/index.html | 130 | FAR fallback until `distance_far_cm` arrives |
+| `DISTANCE_BITMAP_MIN` | static/index.html | 64 | Lower = more aggressive low-res floor when far |
 | `DISTANCE_BITMAP_QUANTIZE` | static/index.html | 20 | Fewer resize events, but visibly coarser steps |
 | `DISTANCE_SMOOTH_TAU_S` | static/index.html | 0.25 | Slower response, less noise |
 | `NO_TARGET_TIMEOUT_S` | distance.py | 0.6 | Rides out longer dropouts at cost of slower "walked away" |
 | `VL53_SMOOTH_ALPHA` | config.py | 0.25 | Higher = more responsive (more noise) |
-| `VL53_FAR_CM` | config.py | 100 | Snap target — also determines the FAR end of the mappings |
+| `VL53_FAR_CM_SHORT` | config.py | 130 | Short-mode reach + FAR end of the mappings (snap target) |
+| `VL53_FAR_CM_LONG` | config.py | 400 | Long-mode reach + FAR end of the mappings (snap target) |
+| `VL53_TIMING_BUDGET_MS_LONG` | config.py | 200 | Larger = longer reach + better repeatability, slower ranging |
+| `VL53_AMBIENT_LONG_MAX` | config.py | 1500 | Higher = picks long mode in brighter scenes (less reliable) |
 
 ## See also
 

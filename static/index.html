@@ -429,6 +429,13 @@
   body.lite-kiosk #editor,
   body.lite-kiosk #editor-menu,
   body.lite-kiosk #timeline-wrap { display: none !important; }
+  /* Hide the pointer in kiosk mode: the exhibit is touchless, and a USB mouse
+     freezes anyway under the Daisy's iso capture — a stuck cursor on the
+     visuals looks broken. `none` everywhere, incl. the editor canvas, since
+     that's hidden in lite mode too. Display-server-agnostic (works on Wayland,
+     unlike unclutter). Toggle the dev panel with `d`/`~` if you need to click. */
+  body.lite-kiosk,
+  body.lite-kiosk * { cursor: none !important; }
 </style>
 </head>
 <body>
@@ -5097,21 +5104,30 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     return k0.v + (k1.v - k0.v) * f;
   }
 
-  // Distance→maxTwistDeg scaling thresholds. At/below NEAR_CM, the
-  // authored ceiling (slider/lane value) is used as-is. At/above FAR_CM,
-  // maxTwistDeg goes to zero. In between, a quadratic ease-in per
-  // hardware-handoff.md §VL53L1X: gain = 1 - ((d - NEAR) / (FAR - NEAR))².
-  const DISTANCE_TWIST_NEAR_CM = 25;
-  const DISTANCE_TWIST_FAR_CM = 100;
+  // Distance→effect onset (cm). Both the twist and bitmap mappings share a
+  // fixed 75 cm onset: at/within this distance there is no distance-induced
+  // distortion. The FAR end (where the effect saturates) is NOT fixed — it
+  // tracks the sensor's actual reach, which depends on the distance mode the
+  // Python sidecar auto-selects at boot (short ~130 cm / long ~400 cm). The
+  // sidecar publishes that reach as `distance_far_cm`; we read it live below
+  // and fall back to the short-mode value until the first value arrives.
+  const DISTANCE_NEAR_CM = 75;
+  const DISTANCE_FAR_DEFAULT_CM = 130;
+  function distanceFarCm() {
+    const f = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_far_cm;
+    return (typeof f === 'number' && f > DISTANCE_NEAR_CM) ? f : DISTANCE_FAR_DEFAULT_CM;
+  }
 
-  // Distance→bitmapHeight (opt-in via the distanceToBitmap toggle). At/below
-  // NEAR_CM the effective bitmap is locked to MIN; at/above FAR_CM it equals
-  // the authored ceiling. Curve eases-in so the low-res "dissociation" state
-  // is sticky when close, then recovers quickly as someone walks away.
-  // QUANTIZE rounds the effective value before applying so we don't trigger a
-  // GPU buffer realloc on every micro-change.
-  const DISTANCE_BITMAP_NEAR_CM = 25;
-  const DISTANCE_BITMAP_FAR_CM = 100;
+  // Distance→maxTwistDeg: distortion grows WITH distance. At/within NEAR the
+  // authored maxTwistDeg goes to zero; at/beyond the live FAR reach the ceiling
+  // is used as-is (max twist). Quadratic ease-in: gain = ((d-NEAR)/(FAR-NEAR))².
+  //
+  // Distance→bitmapHeight (opt-in via the distanceToBitmap toggle): resolution
+  // drops WITH distance. At/within NEAR the effective bitmap equals the authored
+  // ceiling (full res); at/beyond FAR it is locked to MIN (lowest res). Eases-in
+  // so the low-res "dissociation" state builds as someone walks away, snapping
+  // back to full res when they approach. QUANTIZE rounds the effective value so
+  // we don't trigger a GPU buffer realloc on every micro-change.
   const DISTANCE_BITMAP_MIN = 64;
   const DISTANCE_BITMAP_QUANTIZE = 20;
   let _lastEffectiveBitmap = null;
@@ -5151,7 +5167,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   function applyAutomation(t) {
     let dirty = false;
     for (const k in _automationBatch) delete _automationBatch[k];
-    // VL53L1X distance gain: 1.0 close (≤25cm), 0.0 far (≥100cm), quadratic
+    // VL53L1X distance gain: 0.0 close (≤75cm), 1.0 far (≥100cm), quadratic
     // ease-in between. Multiplies the authored maxTwistDeg before posting
     // to the worker — slider/lane authoring still sees the ceiling value.
     // When no SSE distance is published (sensor offline / not yet wired),
@@ -5174,15 +5190,15 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       }
     }
     const d = _smoothedDistance;
+    const farCm = distanceFarCm();
     if (typeof d === 'number') {
-      if (d <= DISTANCE_TWIST_NEAR_CM) {
-        twistGain = 1;
-      } else if (d >= DISTANCE_TWIST_FAR_CM) {
+      if (d <= DISTANCE_NEAR_CM) {
         twistGain = 0;
+      } else if (d >= farCm) {
+        twistGain = 1;
       } else {
-        const x = (d - DISTANCE_TWIST_NEAR_CM) /
-                  (DISTANCE_TWIST_FAR_CM - DISTANCE_TWIST_NEAR_CM);
-        twistGain = 1 - x * x;
+        const x = (d - DISTANCE_NEAR_CM) / (farCm - DISTANCE_NEAR_CM);
+        twistGain = x * x;
       }
     }
     let resolvedBitmap = null;
@@ -5210,12 +5226,11 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       let effective = resolvedBitmap;
       if (typeof d === 'number') {
         let x;
-        if (d <= DISTANCE_BITMAP_NEAR_CM) x = 0;
-        else if (d >= DISTANCE_BITMAP_FAR_CM) x = 1;
-        else x = (d - DISTANCE_BITMAP_NEAR_CM) /
-                (DISTANCE_BITMAP_FAR_CM - DISTANCE_BITMAP_NEAR_CM);
+        if (d <= DISTANCE_NEAR_CM) x = 0;
+        else if (d >= farCm) x = 1;
+        else x = (d - DISTANCE_NEAR_CM) / (farCm - DISTANCE_NEAR_CM);
         const ease = x * x;
-        effective = DISTANCE_BITMAP_MIN + (resolvedBitmap - DISTANCE_BITMAP_MIN) * ease;
+        effective = resolvedBitmap - (resolvedBitmap - DISTANCE_BITMAP_MIN) * ease;
       }
       effective = Math.round(effective / DISTANCE_BITMAP_QUANTIZE) * DISTANCE_BITMAP_QUANTIZE;
       _dbgEffective = effective;
@@ -5233,6 +5248,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       lastApplied: _lastEffectiveBitmap,
       bitmapHeightVar: bitmapHeight,
       twistGain: twistGain,
+      farCm: farCm,
     };
     // Visible overlay when ?debug=1. Survives lite mode (which hides
     // every other DOM overlay) — so a kiosk run can show state without
@@ -5246,6 +5262,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         ' ceil=' + (resolvedBitmap !== null ? resolvedBitmap : '-') +
         ' eff=' + (_dbgEffective !== null ? _dbgEffective : '-') +
         ' bh=' + bitmapHeight +
+        ' far=' + farCm.toFixed(0) +
         ' tg=' + twistGain.toFixed(2);
     }
   }
