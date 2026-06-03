@@ -6532,6 +6532,25 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     const timelinePromise = fetch(timelineUrl)
       .then(r => r.ok ? r.json() : null)
       .catch(() => null);
+
+    // Kiosk: ?mic=1 starts live capture immediately (no gesture) instead of
+    // waiting for a click to play the local file — for unattended boot off the
+    // Daisy UAC. Relies on Chromium's --autoplay-policy=no-user-gesture-required
+    // + --use-fake-ui-for-media-stream, with the Daisy UAC as the default capture
+    // device. Lanes are clocked by ?clock=daisy off the CDC song position; we
+    // still load the timeline so the lanes exist. The mic is never routed to
+    // destination, so the browser is silent — the audience hears the Daisy's
+    // analog line-out.
+    if (new URLSearchParams(location.search).get('mic') === '1') {
+      startMic();
+      timelinePromise.then(timelineObj => {
+        if (timelineObj) {
+          try { loadFromObject(timelineObj); } catch (_) {}
+        }
+      });
+      return;
+    }
+
     let started = false;
     const startOnGesture = (e) => {
       if (started) return;
