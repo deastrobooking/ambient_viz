@@ -41,6 +41,11 @@ sudo apt install -y \
 
 # Enable I²C (kernel module + /dev/i2c-1)
 sudo raspi-config nonint do_i2c 0
+# If using the VL53L5CX: raise the bus to 400 kHz so its ~84 KB boot firmware
+# upload isn't painfully slow. Add to /boot/firmware/config.txt:
+#   dtparam=i2c_arm=on,i2c_arm_baudrate=400000
+# 400 kHz is the shared-bus max (MPR121 + ADS1115 limit) — do NOT use 1 MHz
+# with the MPR121 present. Skip this if you're only running the VL53L1X.
 
 # pigpiod is needed only by the breath driver, but enable it now
 sudo systemctl enable --now pigpiod
@@ -167,7 +172,7 @@ the sensor reads accurately before involving the SSE pipeline:
 
 ```sh
 cd ~/ambient_viz/python && source .venv/bin/activate
-python test_vl53l1x.py
+python test_tof.py          # auto-detects L1X vs L5CX; force with: python test_tof.py l1x
 ```
 
 Prints live readings + rolling 1 s mean/stddev. Hold a target steady

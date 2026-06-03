@@ -28,7 +28,7 @@ cd ~/ambient_viz && sudo i2cdetect -y 1
 
 ```sh
 cd ~/ambient_viz/python && source .venv/bin/activate
-python test_vl53l1x.py
+python test_tof.py          # L1X auto-detected; this calibration step is L1X-only
 ```
 
 - Point at the real wall. Read the **`amb`** column with the **projector OFF**, then **ON**.

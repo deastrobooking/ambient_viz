@@ -1,8 +1,17 @@
-"""VL53L1X time-of-flight distance sensor over I²C.
+"""Time-of-flight distance sensing over I²C.
 
-Polls at ~50 Hz, smooths with an exponential moving average, publishes
-`distance_cm`. Invalid reads (no target in cone) decay smoothed value
-toward `far` rather than freezing.
+Supports two interchangeable ST ToF sensors behind a common backend
+interface (selected by `VL53_SENSOR`, or auto-detected — both default to
+I²C address 0x29 but report distinct model IDs):
+
+  - VL53L1X  — single-point ToF, short/long distance modes, ambient-IR
+               auto-mode select. The original kiosk sensor.
+  - VL53L5CX — multizone (4x4 / 8x8) ToF; the zone grid is reduced to one
+               distance by taking the closest valid zone in the cone.
+
+Either way the driver polls at ~50 Hz, smooths with an EMA, and publishes
+a single `distance_cm` plus the sensor's far reach as `distance_far_cm`.
+Invalid reads (no target in cone) snap toward `far` rather than freezing.
 """
 
 import logging
@@ -15,14 +24,19 @@ from .. import config
 log = logging.getLogger(__name__)
 
 
-class DistanceDriver:
-    # Seconds with no valid read before we snap to VL53_FAR_CM. Long
-    # enough to ride out the typical multi-frame dropouts on a real
-    # target (a moving hand drops 1-3 frames at a time), short enough
-    # that walking out of the cone shows up as "idle" within a beat
-    # rather than holding the user's last close-range position for
-    # multiple seconds.
-    NO_TARGET_TIMEOUT_S = 0.6
+def _open_i2c():
+    """Open the shared I²C bus. Raises if hardware/libs are unavailable."""
+    import board
+    import busio
+    return busio.I2C(board.SCL, board.SDA)
+
+
+class _L1XBackend:
+    """VL53L1X single-point ToF. Behaviour unchanged from the original
+    single-sensor driver: ambient-IR sample picks short vs long mode, and the
+    timing budget + far reach follow the chosen mode."""
+
+    name = "VL53L1X"
 
     # VL53L1X result register holding the per-measurement ambient IR count
     # rate (ST ULD name: VL53L1_RESULT__AMBIENT_COUNT_RATE_MCPS_SD0). The
@@ -30,19 +44,23 @@ class DistanceDriver:
     # Only valid after a completed measurement (data_ready).
     _REG_AMBIENT_RATE = 0x0090
 
-    def __init__(self, ingest, mock: bool = False):
-        self.ingest = ingest
-        self.mock = mock
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._sensor = None
-        self._i2c = None
-        self._smoothed: Optional[float] = None
-        self._last_published: Optional[float] = None
-        # Sensor's far reach in cm — the no-target snap value and the saturation
-        # end of the downstream effect mappings. Mode dependent; resolved once
-        # the distance mode is chosen in _init_sensor (short default until then).
-        self._far_cm: float = config.VL53_FAR_CM
+    def __init__(self, sensor):
+        self._sensor = sensor
+        self.far_cm: float = config.VL53_FAR_CM  # resolved in configure()
+
+    @staticmethod
+    def probe(i2c) -> Optional["_L1XBackend"]:
+        """Construct the L1X driver. The Adafruit constructor reads the model
+        ID and raises on anything that isn't a VL53L1X (0xEACC) *before* it
+        writes any init sequence, so this doubles as a non-destructive probe:
+        returns the backend on a real L1X, or None otherwise."""
+        try:
+            import adafruit_vl53l1x
+            sensor = adafruit_vl53l1x.VL53L1X(i2c, address=config.VL53L1X_ADDR)
+        except Exception as e:
+            log.debug("distance: not a VL53L1X (%s)", e)
+            return None
+        return _L1XBackend(sensor)
 
     @staticmethod
     def _budget_for_mode(mode: int) -> int:
@@ -56,17 +74,8 @@ class DistanceDriver:
         """Far reach (cm) for the given distance mode."""
         return config.VL53_FAR_CM_LONG if mode == 2 else config.VL53_FAR_CM_SHORT
 
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="distance", daemon=True)
-        self._thread.start()
-
-    def _init_sensor(self) -> bool:
+    def configure(self) -> bool:
         try:
-            import board
-            import busio
-            import adafruit_vl53l1x
-            self._i2c = busio.I2C(board.SCL, board.SDA)
-            self._sensor = adafruit_vl53l1x.VL53L1X(self._i2c, address=config.VL53L1X_ADDR)
             # Start in short mode for the ambient sample: it's the ambient-safe
             # fallback we stay in if auto-select decides the scene is too bright,
             # so there's no glitch if we don't switch.
@@ -80,12 +89,12 @@ class DistanceDriver:
             self._sensor.start_ranging()
             if config.VL53_AUTO_MODE:
                 mode = self._calibrate_distance_mode(mode)
-            self._far_cm = self._far_for_mode(mode)
+            self.far_cm = self._far_for_mode(mode)
             log.info("distance: VL53L1X ready (mode=%d, budget=%dms, far=%.0fcm)",
-                     mode, self._budget_for_mode(mode), self._far_cm)
+                     mode, self._budget_for_mode(mode), self.far_cm)
             return True
         except Exception as e:
-            log.error("distance: VL53L1X init failed: %s", e)
+            log.error("distance: VL53L1X configure failed: %s", e)
             return False
 
     def _read_ambient_rate(self) -> Optional[int]:
@@ -146,7 +155,7 @@ class DistanceDriver:
             self._sensor.start_ranging()
         return chosen
 
-    def _read_raw(self) -> Optional[float]:
+    def read_raw(self) -> Optional[float]:
         """Returns distance in cm, or None for no-target / invalid."""
         try:
             if not self._sensor.data_ready:
@@ -157,6 +166,163 @@ class DistanceDriver:
         except Exception as e:
             log.debug("distance: read error: %s", e)
             return None
+
+    def stop(self) -> None:
+        try:
+            self._sensor.stop_ranging()
+        except Exception:
+            pass
+
+
+class _L5CXBackend:
+    """VL53L5CX multizone ToF. No short/long mode — a single ~4 m ranging
+    range. The 4x4 / 8x8 grid is reduced to one distance by taking the closest
+    valid zone within the configured cone window (edge zones graze the
+    wall/floor, so a sub-window can be selected via VL53L5CX_CONE_ZONES).
+
+    NOTE: the library calls below target Pimoroni's `vl53l5cx_ctypes`. If you
+    install a different binding, adjust the method/attribute names here — the
+    rest of the pipeline only needs read_raw() -> Optional[cm] and far_cm.
+    """
+
+    name = "VL53L5CX"
+
+    # ST per-zone target_status values we treat as a usable range. 5 = range
+    # valid (good); 9 = valid but with reduced confidence (wraparound-checked).
+    # Anything else (0/255 not updated, 4 phase fail, etc.) is ignored.
+    _VALID_STATUS = (5, 9)
+
+    def __init__(self, sensor):
+        self._sensor = sensor
+        self._grid_n = config.VL53L5CX_RESOLUTION  # 16 (4x4) or 64 (8x8)
+        self.far_cm: float = config.VL53L5CX_FAR_CM
+
+    @staticmethod
+    def probe(i2c) -> Optional["_L5CXBackend"]:
+        """Construct the L5CX driver. Its constructor checks the device is
+        alive and uploads the ~84 KB firmware blob, raising if no L5CX is
+        present — so this is the probe. (i2c is accepted for symmetry; the
+        ctypes lib opens its own handle.)"""
+        try:
+            import vl53l5cx_ctypes as vl53l5cx  # noqa: F401  (verify your lib)
+        except Exception as e:
+            log.debug("distance: VL53L5CX lib unavailable (%s)", e)
+            return None
+        try:
+            sensor = vl53l5cx.VL53L5CX()
+        except Exception as e:
+            log.debug("distance: not a VL53L5CX (%s)", e)
+            return None
+        return _L5CXBackend(sensor)
+
+    def configure(self) -> bool:
+        try:
+            self._sensor.set_resolution(self._grid_n)
+            self._sensor.set_ranging_frequency_hz(config.VL53L5CX_RANGING_HZ)
+            self._sensor.start_ranging()
+            side = 8 if self._grid_n == 64 else 4
+            log.info("distance: VL53L5CX ready (%dx%d @ %dHz, far=%.0fcm)",
+                     side, side, config.VL53L5CX_RANGING_HZ, self.far_cm)
+            return True
+        except Exception as e:
+            log.error("distance: VL53L5CX configure failed: %s", e)
+            return False
+
+    def read_raw(self) -> Optional[float]:
+        """Reduce the zone grid to the closest valid distance (cm) in the cone,
+        or None if no zone has a usable target this frame."""
+        try:
+            if not self._sensor.data_ready():
+                return None
+            data = self._sensor.get_data()
+            dists = data.distance_mm     # per-zone, mm
+            stats = data.target_status   # per-zone status
+            n = min(self._grid_n, len(dists), len(stats))
+            zones = config.VL53L5CX_CONE_ZONES
+            if not zones:
+                zones = range(n)
+            best = None
+            for z in zones:
+                if z >= n:
+                    continue
+                if stats[z] in self._VALID_STATUS and dists[z] > 0:
+                    cm = dists[z] / 10.0
+                    if best is None or cm < best:
+                        best = cm
+            return best
+        except Exception as e:
+            log.debug("distance: L5CX read error: %s", e)
+            return None
+
+    def stop(self) -> None:
+        try:
+            self._sensor.stop_ranging()
+        except Exception:
+            pass
+
+
+def _make_backend(i2c):
+    """Select a sensor backend per VL53_SENSOR ('auto' | 'l1x' | 'l5cx').
+
+    In 'auto' we probe the L1X first: that probe is cheap and non-destructive
+    (model-ID read, no firmware upload), so we only fall through to the L5CX —
+    which uploads its firmware blob — when the L1X isn't the one wired."""
+    want = (getattr(config, "VL53_SENSOR", "auto") or "auto").lower()
+    if want == "l1x":
+        return _L1XBackend.probe(i2c)
+    if want == "l5cx":
+        return _L5CXBackend.probe(i2c)
+    # auto
+    backend = _L1XBackend.probe(i2c)
+    if backend is not None:
+        return backend
+    return _L5CXBackend.probe(i2c)
+
+
+class DistanceDriver:
+    # Seconds with no valid read before we snap to the far reach. Long enough
+    # to ride out the typical multi-frame dropouts on a real target (a moving
+    # hand drops 1-3 frames at a time), short enough that walking out of the
+    # cone shows up as "idle" within a beat rather than holding the user's last
+    # close-range position for multiple seconds.
+    NO_TARGET_TIMEOUT_S = 0.6
+
+    def __init__(self, ingest, mock: bool = False):
+        self.ingest = ingest
+        self.mock = mock
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._backend = None
+        self._i2c = None
+        self._smoothed: Optional[float] = None
+        self._last_published: Optional[float] = None
+        # Sensor's far reach in cm — the no-target snap value and the saturation
+        # end of the downstream effect mappings. Resolved once the backend is
+        # configured (short-mode default until then, also used in mock mode).
+        self._far_cm: float = config.VL53_FAR_CM
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="distance", daemon=True)
+        self._thread.start()
+
+    def _init_sensor(self) -> bool:
+        """Open the bus, select + configure a backend. Returns success."""
+        try:
+            self._i2c = _open_i2c()
+        except Exception as e:
+            log.error("distance: I²C open failed: %s", e)
+            return False
+        backend = _make_backend(self._i2c)
+        if backend is None:
+            log.error("distance: no supported ToF sensor detected at 0x29 "
+                      "(VL53_SENSOR=%s)", getattr(config, "VL53_SENSOR", "auto"))
+            return False
+        if not backend.configure():
+            return False
+        self._backend = backend
+        self._far_cm = backend.far_cm
+        log.info("distance: using %s (far=%.0fcm)", backend.name, self._far_cm)
+        return True
 
     def _run(self) -> None:
         period = 1.0 / config.VL53_PUBLISH_HZ
@@ -196,7 +362,7 @@ class DistanceDriver:
                 else:
                     raw = 30.0 + (t - 0.65) / 0.20 * 170.0
             else:
-                raw = self._read_raw()
+                raw = self._backend.read_raw()
 
             now = time.monotonic()
             a = config.VL53_SMOOTH_ALPHA
@@ -205,8 +371,8 @@ class DistanceDriver:
                 last_valid_t = now
                 self._smoothed = raw if self._smoothed is None else (a * raw + (1 - a) * self._smoothed)
             elif last_valid_t == 0.0 or (now - last_valid_t) > self.NO_TARGET_TIMEOUT_S:
-                # Sustained no-target — snap to the mode-derived FAR. Gradual
-                # decay would leave the smoothed value stuck near the user's last
+                # Sustained no-target — snap to the sensor's FAR. Gradual decay
+                # would leave the smoothed value stuck near the user's last
                 # close-range position for ~150 ms after the hold expires, which
                 # reads as "kiosk thinks I'm still here" lag.
                 self._smoothed = self._far_cm
@@ -221,10 +387,7 @@ class DistanceDriver:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._sensor is not None:
-            try:
-                self._sensor.stop_ranging()
-            except Exception:
-                pass
+        if self._backend is not None:
+            self._backend.stop()
         if self._thread is not None:
             self._thread.join(timeout=1.0)

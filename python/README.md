@@ -73,11 +73,12 @@ All values land on the SSE bus and become available in the browser as
   decay-toward-FAR design introduced into the published `distance_cm`
   feed. Idle visualizer state is "nobody here," and is reached within
   ~0.6 s of departure (not 2-3 s as in earlier versions).
-- **VL53L1X bringup**: `python test_vl53l1x.py` is a standalone
-  sanity-check script (talks straight to the sensor library, no
-  sidecar / Node / browser). Prints live readings + rolling 1 s
-  mean/stddev. Use it during Phase 4 of `PI_KIOSK_BRINGUP.md` to
-  validate the sensor before involving the SSE pipeline.
+- **ToF bringup**: `python test_tof.py` is a standalone sanity-check
+  script (talks straight to the sensor library, no sidecar / Node /
+  browser). Auto-detects L1X vs L5CX (override with the first arg or
+  `VL53_SENSOR` env); L1X prints raw + rolling 1 s mean/stddev, L5CX
+  prints the closest zone + a live grid. Use it during Phase 4 of
+  `PI_KIOSK_BRINGUP.md` to validate the sensor before the SSE pipeline.
 - **MPR121 baseline auto-cal**: first ~30 s after init, touch behavior
   may be inconsistent while the MPR121 calibrates to its environment.
   The handoff doc flags this.

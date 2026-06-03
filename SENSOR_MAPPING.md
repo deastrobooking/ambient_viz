@@ -101,7 +101,27 @@ with the twist mapping. Bitmap-specific constants at the top of the
 - `DISTANCE_BITMAP_MIN` = 64 (pixel floor)
 - `DISTANCE_BITMAP_QUANTIZE` = 20 (px step)
 
-## Distance mode & reach
+## Which sensor (VL53L1X or VL53L5CX)
+
+`distance.py` supports two interchangeable ST ToF sensors behind a common
+backend interface, chosen by `VL53_SENSOR` (`"auto"` | `"l1x"` | `"l5cx"`):
+
+- **VL53L1X** — single-point. Short/long mode auto-select (below). The
+  original sensor; behaviour unchanged.
+- **VL53L5CX** — multizone (4×4 / 8×8). No short/long mode — a single
+  ~4 m range (`VL53L5CX_FAR_CM`). Its zone grid is reduced to one number
+  by taking the **closest valid zone in the cone** (`VL53L5CX_CONE_ZONES`
+  restricts which zones count), so it publishes the *same* `distance_cm`
+  and `distance_far_cm` topics — every downstream mapping is untouched.
+
+Both default to I²C `0x29` but report distinct model IDs, so `"auto"`
+probes the L1X first (a cheap, non-destructive model-ID read) and only
+falls through to the L5CX (which uploads an ~84 KB firmware blob) when the
+L1X isn't wired. Pin `VL53_SENSOR` explicitly for a deterministic install
+boot. The L5CX wants VIN on the Pi's **5 V pin** (≈200 mA peak draw) with a
+bulk decoupling cap at the breakout — see `hardware-handoff.md`.
+
+## Distance mode & reach (VL53L1X)
 
 The VL53L1X runs in one of two distance modes, auto-selected at boot by
 the Python sidecar from an ambient-IR sample (`VL53_AUTO_MODE`,
@@ -185,16 +205,19 @@ enabled). Pass overrides as positional args, e.g.:
 ./run_kiosk.sh --no-touch            # distance only
 ```
 
-### `python/test_vl53l1x.py`
+### `python/test_tof.py`
 
-Standalone bringup sanity check. Bypasses the full kiosk software
-stack — talks straight to the sensor library and prints live
-readings plus rolling 1 s mean/stddev so you can validate accuracy
-(vs a tape measure) and noise floor (target held steady).
+Standalone bringup sanity check for either ToF sensor. Bypasses the
+full kiosk software stack — reuses the driver's backend probe to
+auto-identify L1X vs L5CX (override: first arg or `VL53_SENSOR` env),
+then prints live readings. L1X shows raw + rolling 1 s mean/stddev +
+ambient IR (vs a tape measure / for `VL53_AMBIENT_LONG_MAX` tuning);
+L5CX shows the closest valid zone plus a live distance grid.
 
 ```sh
 cd python && source .venv/bin/activate
-python test_vl53l1x.py
+python test_tof.py            # auto-detect
+python test_tof.py l5cx       # force a sensor
 ```
 
 If raw values from this script disagree with the SSE feed observed

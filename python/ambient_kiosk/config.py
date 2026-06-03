@@ -13,7 +13,14 @@ MPR121_ADDR = 0x5A
 # AM312
 PIR_BOOT_SUPPRESS_S = 60.0  # ignore output for the first 60s post-process-start
 
-# VL53L1X
+# ToF distance sensor selection. The VL53L1X and VL53L5CX both default to I²C
+# address 0x29 but report distinct model IDs, so "auto" can tell them apart:
+# it probes the L1X first (a cheap, non-destructive model-ID read) and only
+# falls through to the L5CX (which uploads an ~84 KB firmware blob) when the
+# L1X isn't wired. Pin it explicitly for a deterministic install boot.
+VL53_SENSOR = "auto"       # "auto" | "l1x" | "l5cx"
+
+# --- VL53L1X (single-point) -------------------------------------------------
 VL53_DISTANCE_MODE = 1     # 1 = short, 2 = long. Fallback when auto-select
                            # is off or can't read ambient (see below).
 # Timing budget (ms), per the VL53L1X datasheet: 20 ms is the floor and is valid
@@ -34,7 +41,7 @@ VL53_TIMING_BUDGET_MS = VL53_TIMING_BUDGET_MS_SHORT
 # At boot we sample the sensor's ambient IR rate and pick long mode only when
 # the scene is dark enough to support it; otherwise short mode, which is far
 # more ambient-tolerant. VL53_AMBIENT_LONG_MAX is in ST ULD units and MUST be
-# tuned on-site: run test_vl53l1x.py with the projector ON, on the real wall,
+# tuned on-site: run test_tof.py with the projector ON, on the real wall,
 # read the printed ambient rate, and set this just above the dark baseline.
 VL53_AUTO_MODE = True
 VL53_AMBIENT_CAL_S = 1.0       # how long to sample ambient before deciding
@@ -50,6 +57,19 @@ VL53_FAR_CM_SHORT = 130.0
 VL53_FAR_CM_LONG = 400.0
 VL53_FAR_CM = VL53_FAR_CM_SHORT
 VL53_NEAR_CM = 25.0
+
+# --- VL53L5CX (multizone) ---------------------------------------------------
+# Used when VL53_SENSOR selects it. No short/long mode like the L1X — a single
+# ~4 m range. The zone grid is reduced to one distance by taking the closest
+# valid zone in the cone, so it publishes the same `distance_cm` topic.
+VL53L5CX_RESOLUTION = 16    # 16 = 4x4 (up to 60 Hz), 64 = 8x8 (up to 15 Hz)
+VL53L5CX_RANGING_HZ = 15
+VL53L5CX_FAR_CM = 400.0     # far reach + no-target snap (published as distance_far_cm)
+# Which zones form the "cone." None = every zone (closest target anywhere in
+# the FoV). To ignore edge zones grazing the wall/floor, set a tuple of indices
+# (row-major, 0..15 for 4x4 / 0..63 for 8x8) — e.g. the central 2x2 of a 4x4
+# is (5, 6, 9, 10).
+VL53L5CX_CONE_ZONES = None
 
 # HR202 / TLC555 breath detection
 BREATH_WINDOW_S = 0.2       # measurement window

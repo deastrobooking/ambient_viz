@@ -65,7 +65,9 @@ All I2C devices share the Pi's hardware I2C bus on GPIO2 (SDA) and GPIO3 (SCL).
 
 **Verification:** `sudo i2cdetect -y 1` should reliably show all three addresses. If devices appear/disappear between scans, the bus has integrity issues — check pull-ups, wire length, and decoupling first.
 
-**Bus speed:** Default 100 kHz is fine. If issues arise, drop to 50 kHz via `dtparam=i2c_arm_baudrate=50000` in `/boot/firmware/config.txt`.
+**Bus speed:** Default 100 kHz is fine for the L1X. If issues arise, drop to 50 kHz via `dtparam=i2c_arm_baudrate=50000` in `/boot/firmware/config.txt`.
+
+**Bus speed for the VL53L5CX:** the L5CX uploads an ~84 KB firmware blob over I²C at every boot, which is slow at 100 kHz (several seconds). Raise the bus to **400 kHz** to roughly halve it vs the 200 kHz default — `dtparam=i2c_arm=on,i2c_arm_baudrate=400000`. **400 kHz is the ceiling for this shared bus**: it's the MPR121's *and* the ADS1115's I²C maximum (Fast Mode). The L5CX library hint that you "can use 1 MHz" applies **only if the L5CX is the sole device** — 1 MHz exceeds the MPR121's 400 kHz spec, so do **not** use it here. Note 400 kHz is tighter on rise-time over the 2 m Cat5 run than 100 kHz; validate `i2cdetect` is rock-solid after raising it, and fall back to 100 kHz (accepting the slower L5CX boot) if it flickers.
 
 ---
 
@@ -224,6 +226,31 @@ can't supply. Tie XSHUT high to local 3V3 (single sensor, address 0x29).
 **Validate:** `i2cdetect -y 1` must show 0x29 on every scan. Any flicker →
 drop to 50 kHz (`dtparam=i2c_arm_baudrate=50000`) before suspecting anything
 else.
+
+#### If using the VL53L5CX instead (multizone, drop-in software-wise)
+
+The kiosk driver supports the **VL53L5CX** as an alternative to the L1X
+(`VL53_SENSOR` in `config.py`; `"auto"` distinguishes them by model ID since
+both sit at 0x29). It reuses the same I²C bus, address, and pull-ups — but two
+hardware differences matter on the 2 m run:
+
+- **Power: feed VIN from the Pi's 5 V pin, not 3V3.** The L5CX draws up to
+  **~200 mA peak** (≈10× the L1X) during ranging and its boot firmware upload —
+  too much for the Pi's 3V3 header pin, and enough to brown out over thin Cat5.
+  A 3–5 V breakout regulates 3.3 V locally, so put **5 V** on the Cat5 3V3-pair
+  conductor instead (it's now a 5 V feed; the breakout makes its own 3.3 V) and
+  size that pair generously — double up onto the spare pair 4 if you see droop.
+  **Do not** do this with a 3.3 V-only (Qwiic) board.
+- **Bulk cap at the sensor end:** keep a **~22 µF** (10–47 µF) cap from the
+  feed→GND right at the breakout to ride out the firmware-upload current spike
+  at the far end of the cable (the board's own 0.1 µF ceramics handle the fast
+  edges). A too-large cap can trip the breakout regulator's inrush limit at
+  power-on — stay in the tens-of-µF range.
+
+I²C stays at 100 kHz (or 400 kHz max over this run); full 8×8 @ 15 Hz wants
+1 MHz, which is marginal at 2 m, so prefer 4×4 or a lower 8×8 rate. Software
+reduces the zone grid to one `distance_cm` (closest valid zone in the cone),
+so nothing downstream changes.
 
 **Adding more distance sensors:** the wiring is trivial (tap SDA/SCL/3V3/GND);
 the blocker is the **0x29 address collision** — every VL53L1X boots at 0x29.
