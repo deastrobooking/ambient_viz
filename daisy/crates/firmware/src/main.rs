@@ -491,10 +491,20 @@ async fn audio_task(
                                 }
                             }
                         }
-                        // A note-on strikes the bell (the Pi/timeline decides
-                        // when and at what pitch).
+                        // A note-on strikes the FM bank (the Pi/timeline decides
+                        // when, at what pitch, and which timbre). The MIDI channel
+                        // selects the patch on the shared bank: ch0 = bell, ch1 =
+                        // industrial stab. The patch is snapshotted per-voice at
+                        // strike, so swapping it here colours only this new note —
+                        // any ringing tails keep their own timbre. Same render +
+                        // delay path either way, so both mix identically.
                         #[cfg(feature = "bell")]
-                        dsp::MidiMessage::NoteOn { note, velocity, .. } => {
+                        dsp::MidiMessage::NoteOn { channel, note, velocity } => {
+                            bell.load_patch(if channel == 1 {
+                                FmPatch::industrial()
+                            } else {
+                                FmPatch::bell()
+                            });
                             bell.note_on(note, velocity as f32 / 127.0);
                         }
                         _ => {}

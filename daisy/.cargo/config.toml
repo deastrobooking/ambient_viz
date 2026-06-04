@@ -35,7 +35,13 @@ bin = ["objcopy", "-p", "firmware", "--target", "thumbv7em-none-eabihf", "--rele
 # --- Production build ----------------------------------------------------
 # `--no-default-features` drops the `debug-uart` feature: no USART3 boot log,
 # health heartbeat, chip-temperature readout, or panic print — the shipping
-# kiosk firmware carries zero debug UART traffic. Use these instead of the
-# plain `flash` / `bin` aliases when building the exhibit image.
-flash-prod = "run -p firmware --target thumbv7em-none-eabihf --release --no-default-features"
-bin-prod = "objcopy -p firmware --target thumbv7em-none-eabihf --release --no-default-features -- -O binary target/firmware-prod.bin"
+# kiosk firmware carries zero debug UART traffic. `--features bell` adds the
+# entry chime (the exhibit needs it). Use these instead of the plain
+# `flash` / `bin` aliases when building the exhibit image.
+#
+# INVARIANT: flash-prod and bin-prod MUST stay in parity — same crate, target,
+# profile, and feature flags. They differ ONLY in the action (probe-flash vs
+# emit a .bin); both produce the identical shipping image. If you change the
+# feature set or flags on one, change the other in the same edit.
+flash-prod = "run -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell"
+bin-prod = "objcopy -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell -- -O binary target/firmware-prod.bin"
