@@ -4602,7 +4602,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // causing Chrome to silently restart playback from 0 on any seek
   // past the buffered window. A blob: URL is in-memory and
   // unconditionally seekable, so scrubbing works regardless of host.
-  function loadFromUrl(url, displayName) {
+  function loadFromUrl(url, displayName, opts) {
     ensureCtx();
     teardownSource();
 
@@ -4621,7 +4621,9 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       const mediaSrc = audioCtx.createMediaElementSource(audio);
       mediaSrc.connect(analyser);
       mediaSrc.connect(transientAnalyser);
-      analyser.connect(audioCtx.destination);
+      // `silent` (localaudio mode) analyses the track without routing it to the
+      // output — the audience hears the Daisy, the browser only reads its levels.
+      if (!(opts && opts.silent)) analyser.connect(audioCtx.destination);
       currentSource = mediaSrc;
 
       // play() may fire synchronously from the user-gesture handler
@@ -6585,15 +6587,25 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // Daisy when present and falls back to local audio otherwise (dev).
   const SONG_CLOCK_MODE = (new URLSearchParams(location.search).get('clock') || 'auto').toLowerCase();
   const SONG_STALE_MS = 2000;
-  function songClock() {
+  // Interpolated Daisy song position (seconds) from the CDC POS feed, or null.
+  function daisyPos() {
     const s = window.AMBIENT_SONG;
-    if (SONG_CLOCK_MODE !== 'local' && s && s.have) {
-      const age = performance.now() - s.wall;
-      return age <= SONG_STALE_MS ? s.pos + age / 1000 : s.pos;
-    }
+    if (!s || !s.have) return null;
+    const age = performance.now() - s.wall;
+    return age <= SONG_STALE_MS ? s.pos + age / 1000 : s.pos;
+  }
+  function songClock() {
+    const p = daisyPos();
+    if (SONG_CLOCK_MODE !== 'local' && p != null) return p;
     if (SONG_CLOCK_MODE === 'daisy') return null; // freeze lanes until first POS
     return (currentEl && isFinite(currentEl.currentTime)) ? currentEl.currentTime : null;
   }
+  // localaudio mode: analyse the local mp3 (muted) and seek it to the Daisy POS
+  // so the audio-reactive visuals run off the pristine master while the audience
+  // hears the Daisy. Set in tryAutoload. SYNC_THRESH bounds the drift tolerated
+  // before re-seeking (output is muted, so a re-seek is inaudible).
+  let localAudioMode = false;
+  const LOCAL_AUDIO_SYNC_THRESH = 0.25; // seconds
 
   function frame() {
     const now = performance.now();
@@ -6605,6 +6617,21 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     const songT = songClock();
     if (songT != null && isFinite(songT)) {
       applyAutomation(songT);
+    }
+    // localaudio: keep the muted local mp3 aligned to the Daisy's position so the
+    // analysed audio matches what the audience hears (and re-syncs on loop/RESET).
+    if (localAudioMode && currentEl) {
+      const pos = daisyPos();
+      if (pos != null && isFinite(currentEl.currentTime)) {
+        // Wrap into the mp3 duration so a POS past the clip end (slight
+        // RAW/mp3 length mismatch) can't throw on seek.
+        let target = pos;
+        const dur = currentEl.duration;
+        if (isFinite(dur) && dur > 0 && target >= dur) target %= dur;
+        if (Math.abs(currentEl.currentTime - target) > LOCAL_AUDIO_SYNC_THRESH) {
+          try { currentEl.currentTime = target; } catch (_) {}
+        }
+      }
     }
     const b = bands();
     window.__level = b.level;     // linear RMS — the value the visuals gate on
@@ -6665,6 +6692,38 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         if (timelineObj) {
           try { loadFromObject(timelineObj); } catch (_) {}
         }
+      });
+      return;
+    }
+
+    // Kiosk (exhibit default): ?localaudio=1 plays the local mp3 MUTED purely for
+    // audio analysis, seeked to the Daisy POS (use with ?clock=daisy), so the
+    // audio-reactive visuals run off the pristine master. The Daisy's USB capture
+    // is unusable (see daisy-uac-async-sd); the audience hears the Daisy's analog
+    // out and the browser stays silent. Autoplays under the kiosk
+    // --autoplay-policy flag; falls back to first-gesture for manual testing.
+    if (new URLSearchParams(location.search).get('localaudio') === '1') {
+      localAudioMode = true;
+      try {
+        loadFromUrl(audioUrl, audioUrl, { silent: true });
+        if (currentEl) {
+          currentEl.play().catch(err => {
+            console.warn('[ambient_viz] localaudio autoplay blocked, starting on first gesture:', err && err.name);
+            const onGesture = () => {
+              window.removeEventListener('pointerdown', onGesture, true);
+              window.removeEventListener('keydown', onGesture, true);
+              if (currentEl) currentEl.play().catch(() => {});
+            };
+            window.addEventListener('pointerdown', onGesture, true);
+            window.addEventListener('keydown', onGesture, true);
+          });
+        }
+      } catch (e2) {
+        console.error('[ambient_viz] localaudio load threw:', e2);
+        statusEl.textContent = 'load err: ' + (e2 && (e2.message || e2.name) || 'unknown');
+      }
+      timelinePromise.then(timelineObj => {
+        if (timelineObj) { try { loadFromObject(timelineObj); } catch (_) {} }
       });
       return;
     }
