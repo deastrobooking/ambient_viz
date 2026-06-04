@@ -100,11 +100,14 @@ EMPTY_ROOM_STILLNESS_WINDOW_S = float(os.environ.get("EMPTY_ROOM_STILLNESS_WINDO
 # Once a still scene persists, don't re-adopt more often than this (s). Keeps
 # the estimate updating "periodically" without thrashing every frame.
 EMPTY_ROOM_RELEARN_S = 5.0
-# Smallest distance (cm) that can plausibly be the empty room. A stable reading
-# nearer than this is treated as a present, motionless subject — not the room —
-# and never lowers the baseline. Lower it for a tight install (sensor close to
-# a wall); raise it if there is no near clutter to ever read legitimately.
-EMPTY_ROOM_MIN_CM = float(os.environ.get("EMPTY_ROOM_MIN_CM", "100.0"))
+# Smallest distance (cm) that can plausibly be the empty room — the minimum
+# below which a still reading is NEVER assigned as the max/far ("empty-room")
+# distance. A stable reading nearer than this is treated as a present,
+# motionless subject — not the room — so someone standing still and watching
+# the exhibit can't become the max distance, and it never lowers the baseline.
+# Lower it for a tight install (sensor close to a wall); raise it if there is
+# no near clutter to ever read legitimately.
+EMPTY_ROOM_MIN_CM = float(os.environ.get("EMPTY_ROOM_MIN_CM", "200.0"))
 # EMA weight (0..1, applied per re-learn) used when a confirmed empty-room
 # reading is CLOSER than the current estimate (a genuine layout change). Small
 # = slow: a single still visitor barely moves the baseline and it recovers once
