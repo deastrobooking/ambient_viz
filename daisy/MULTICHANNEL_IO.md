@@ -253,7 +253,62 @@ caveat as `TAPE_SIMULATION.md §16`.)
 
 ---
 
-## 9. Scope boundary — what this is NOT
+## 9. Alternatives considered — the Daisy's onboard converters
+
+The Daisy datasheet advertises **12× 16-bit ADC inputs** and **2× 12-bit DAC
+outputs**. Tempting as a zero-extra-chip path, but they're the STM32H750's
+*general-purpose* converters, not audio parts — the comparison breaks down
+differently for input vs output.
+
+**Output side — settled: the AK4458 stays mandatory.** The "2× 12-bit DAC" is
+two general-purpose DAC channels: that's *one* stereo pair (only two channels
+exist) at 12-bit (~72 dB best case). It can't produce 4 stereo out and is poor
+for audio. No contest — the external DAC is required regardless.
+
+**Input side — the onboard ADC is *not* an audio ADC.** The 12 inputs are the
+H750's **general-purpose SAR ADCs** (3 units, multiplexed across 12 pins),
+intended for control-rate signals — pots, CV, expression, sensors. The AK5558
+is a **delta-sigma audio ADC**. That's an architectural gap, not just a spec
+gap:
+
+| Dimension | Onboard STM32 SAR ADC | AK5558 (delta-sigma) |
+|---|---|---|
+| **Real dynamic range** | "16-bit" nominal, **~11–12 ENOB in practice** (~70 dB SINAD per the H7 datasheet, worse in the Daisy's noisy digital environment) | **~112 dB** (~18 effective bits) |
+| **Anti-aliasing** | **None built in** — SAR samples at exactly fs, needs a *steep analog* AAF per channel | Oversampled → built-in steep decimation; only a gentle RC needed |
+| **Coupling** | Unipolar, DC-coupled (0–VREF); audio is bipolar → must bias to mid-rail + AC-couple, losing half the range unless differential | Native bipolar line-level |
+| **Clocking** | Timer-triggered → sampling **jitter tied to the timer clock** (hurts HF SNR) | MCLK/LRCLK low-jitter audio clocking |
+| **Simultaneity** | Only **3 true sample-and-holds**; 8 channels means multiplexing → **inter-channel skew** (phase error within/across stereo pairs) | All 8 channels **truly simultaneous** |
+| **Cost to add** | "Free" — no chip, no SAI pins | Extra chip + clean analog board + SAI/I²C pins |
+
+Net: clean line-level capture lands around **~70 dB with audible aliasing and
+channel skew** on the onboard path, versus **~112 dB, alias-free,
+sample-locked** on the AK5558 — a ~40 dB noise-floor gap *plus* structural
+problems (aliasing, skew, biasing) the AK5558 doesn't have.
+
+**The oversampling steelman.** The H7 ADC has a hardware oversampler; running
+each channel at ~16× (768 kHz) + decimation buys roughly **+2 ENOB / ~+12 dB**
+(→ ~82 dB) and relaxes the analog AAF. But 16× × 8 ch = 6.1 MSPS **exceeds one
+ADC's ~3.6 MSPS** (must split across all 3 units), oversampling only suppresses
+*white* noise (not the Daisy's correlated supply/digital spurs), and you're
+still ~30 dB short of the AK5558 after much more firmware/analog work. It makes
+the onboard path *usable*, not *better*.
+
+**Where the onboard ADC actually wins.** Given this project's idiom (tape
+emulation, degradation/dissociation themes), lower fidelity can be the *point*.
+For contact-mic / field / lo-fi sources headed straight into low-pass + freeze
++ the failure-tape ghost — or anything that only drives the visualizer, where
+noise doesn't survive into the FFT envelopes — ~12-bit grit and mild aliasing
+are character you'd otherwise dial in deliberately, for free.
+
+**Recommended posture: hybrid.** Use the **AK5558** for channels that need
+clean, sample-locked, alias-free stereo capture; keep the **onboard 12× ADC**
+for **CV / control / expression / lo-fi auxiliary inputs** — exactly what it's
+good at, at no chip or SAI-pin cost. The onboard DAC has no comparable role
+here; the AK4458 owns the output.
+
+---
+
+## 10. Scope boundary — what this is NOT
 
 - Not needed for, and not part of, the current single-stereo exhibit.
 - Not a perfboard mod to Board A (`BREAKOUT.md`) — it's a separate fabbed
@@ -264,7 +319,7 @@ caveat as `TAPE_SIMULATION.md §16`.)
 
 ---
 
-## 10. References
+## 11. References
 
 - `BREAKOUT.md` — current Board A (stereo line-out, MIDI in, SD); pad-summary
   style this doc should match once pins are verified.
