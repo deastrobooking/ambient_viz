@@ -105,6 +105,11 @@ mod imp {
         // The whole reason for the custom handler: synchronously print the panic
         // (location + message) so it lands on the Shikra even though the executor
         // is dead. try_borrow guards against a panic that fired mid-write.
+        //
+        // NB: this does NOT meaningfully affect flash size. Formatting floats
+        // (flt2dec, ~10 KB) is pulled into the debug-uart build by a separate
+        // core::fmt path, not by this handler — printing location-only here was
+        // tried and changed nothing. See PLAN_QSPI_BOOTLOADER.md.
         DEBUG_TX.lock(|c| {
             if let Ok(mut g) = c.try_borrow_mut() {
                 if let Some(tx) = g.as_mut() {

@@ -22,6 +22,8 @@ use daisy_embassy::{hal, new_daisy_board};
 use dsp::freeze::{self, Freeze, GlitchTape};
 use dsp::limiter::Limiter;
 use dsp::tape::TapeProcessor;
+#[cfg(feature = "bell")]
+use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _, PingPongDelay};
 use defmt::info;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::join::join;
@@ -50,6 +52,10 @@ const HEAP_SIZE: usize = 256 * 1024;
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
 
 const SAMPLE_RATE: f32 = 48_000.0;
+
+/// How much of the bell's wet ping-pong to fold on top of the dry chime.
+#[cfg(feature = "bell")]
+const BELL_DELAY_WET: f32 = 0.6;
 
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
@@ -408,6 +414,36 @@ async fn audio_task(
     // Prime tape's scratch (it resizes on first process()) so the RT callback
     // never allocates.
     tape.process(&mut [0.0f32; HALF_DMA_BUFFER_LENGTH], 0);
+
+    // Bell voice + its ping-pong delay, summed on top of the master pre-limiter
+    // (a dry chime over the post-tape backing track). Both are constructed once
+    // here — never in the callback — and primed below so the RT path stays
+    // alloc-free. FmStab itself allocates nothing (it drives the oscillators via
+    // `tick`, not `process`); only the delay's ring buffers hit the heap.
+    #[cfg(feature = "bell")]
+    let mut bell = {
+        let mut b = FmStab::new(SAMPLE_RATE);
+        b.load_patch(FmPatch::bell()); // pure-sine FM, ~5 s ring
+        b
+    };
+    #[cfg(feature = "bell")]
+    let mut bell_delay = {
+        // 0.25 s max ring ≈ 96 KB on the AXI heap (the Engine's 1.0 s default
+        // would be ~384 KB and overflow it). `mix = 1.0` → wet-only output; we
+        // scale the wet ourselves when summing, like the host Engine's stab bus.
+        let mut d = PingPongDelay::new(
+            0.25,
+            AudioParam::seconds(0.22),
+            AudioParam::linear(0.55),
+            AudioParam::linear(1.0),
+        );
+        d.set_sample_rate(SAMPLE_RATE);
+        // Prime its internal scratch (resizes on first process()) — the same
+        // no-alloc-in-callback discipline as tape above.
+        d.process(&mut [0.0f32; HALF_DMA_BUFFER_LENGTH], 0);
+        d
+    };
+
     let mut sample_index: u64 = 0;
     // CC routing for inbound MIDI (Pi -> tape failure / freeze), shared with the
     // host via install_kiosk_bindings so a CC means the same thing in both.
@@ -425,6 +461,8 @@ async fn audio_task(
                 let mut buf = [0.0f32; HALF_DMA_BUFFER_LENGTH];
                 #[cfg(feature = "freeze")]
                 let mut send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+                #[cfg(feature = "bell")]
+                let mut bell_send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
 
                 // SD i16 -> f32 master block.
                 for s in buf[..n].iter_mut() {
@@ -442,15 +480,24 @@ async fn audio_task(
                 // read task fills). Decode happened off the RT path; this is just
                 // a lookup + setter. CC23 -> tape failure, CC24 -> freeze.
                 while let Ok(msg) = midi_rx.try_receive() {
-                    if let dsp::MidiMessage::ControlChange { cc, value, .. } = msg {
-                        if let Some((param, v)) = midi_map.map_cc(cc, value) {
-                            match param {
-                                dsp::Param::TapeFailure => tape.set_failure(v),
-                                #[cfg(feature = "freeze")]
-                                dsp::Param::Freeze => freeze.set_amount(v),
-                                _ => {}
+                    match msg {
+                        dsp::MidiMessage::ControlChange { cc, value, .. } => {
+                            if let Some((param, v)) = midi_map.map_cc(cc, value) {
+                                match param {
+                                    dsp::Param::TapeFailure => tape.set_failure(v),
+                                    #[cfg(feature = "freeze")]
+                                    dsp::Param::Freeze => freeze.set_amount(v),
+                                    _ => {}
+                                }
                             }
                         }
+                        // A note-on strikes the bell (the Pi/timeline decides
+                        // when and at what pitch).
+                        #[cfg(feature = "bell")]
+                        dsp::MidiMessage::NoteOn { note, velocity, .. } => {
+                            bell.note_on(note, velocity as f32 / 127.0);
+                        }
+                        _ => {}
                     }
                 }
 
@@ -467,6 +514,28 @@ async fn audio_task(
                         }
                     }
                 }
+
+                // Bell + ping-pong summed on top of the (post-tape) master,
+                // before the limiter — so the chime sits over the backing track
+                // and the limiter catches the combined peaks. The dry bell goes
+                // to both channels; the delay send is left-only so the
+                // cross-feedback bounces the echoes L<->R.
+                #[cfg(feature = "bell")]
+                {
+                    let frames = n / 2;
+                    for i in 0..frames {
+                        let s = bell.tick();
+                        buf[2 * i] += s;
+                        buf[2 * i + 1] += s;
+                        bell_send[2 * i] = s;
+                        bell_send[2 * i + 1] = 0.0;
+                    }
+                    bell_delay.process(&mut bell_send[..n], sample_index);
+                    for (o, &w) in buf[..n].iter_mut().zip(bell_send[..n].iter()) {
+                        *o += w * BELL_DELAY_WET;
+                    }
+                }
+
                 limiter.process(&mut buf[..n]);
 
                 let mut pk = 0.0f32;

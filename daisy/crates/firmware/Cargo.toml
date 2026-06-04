@@ -18,6 +18,11 @@ debug-uart = []
 # out, leaving the master chain as tape -> limiter. Add `--features freeze` to a
 # firmware build to bring it back.
 freeze = []
+# `bell` (OFF by default) compiles a high FM bell + ping-pong delay summed on
+# top of the master *before* the limiter — a dry chime that sits over the
+# post-tape backing track. Struck by inbound MIDI note-on. Without it the voice,
+# its 0.25 s delay ring (~96 KB AXI heap), and the note-on routing compile out.
+bell = []
 
 [dependencies]
 dsp = { path = "../dsp" }

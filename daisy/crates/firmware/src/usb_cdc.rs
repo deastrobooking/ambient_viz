@@ -67,15 +67,25 @@ pub async fn position_emit_task(mut tx: CdcTx<'static, Drv>, loop_frames: u64) {
             if wrapped {
                 loop_pos %= loop_frames;
             }
-            let secs = loop_pos as f32 / SAMPLE_RATE_HZ as f32;
+            // Seconds at millisecond precision, formatted by hand as
+            // whole.frac with integer math. Using `{:.3}` on an f32 would drag
+            // core::fmt's float path (flt2dec/grisu + f64 soft-float, ~10 KB of
+            // flash) into the build — and the H750's internal flash is only
+            // 128 KB. Rounded to nearest ms; loop_pos is already < loop_frames
+            // so `* 1000` can't overflow u64.
+            let sr = SAMPLE_RATE_HZ as u64;
+            let total_ms = (loop_pos * 1000 + sr / 2) / sr;
+            let whole = total_ms / 1000;
+            let millis = total_ms % 1000;
 
             line.clear();
             // On a loop wrap, prefix RESET so the host hard-snaps rather than
-            // interpolating across the seam (complication #10).
+            // interpolating across the seam (complication #10). Same text format
+            // as the old `{:.3}` ("12.345"), so the host parser is unchanged.
             let _ = if wrapped {
-                write!(line, "RESET {:.3}\nPOS {:.3}\n", secs, secs)
+                write!(line, "RESET {whole}.{millis:03}\nPOS {whole}.{millis:03}\n")
             } else {
-                write!(line, "POS {:.3}\n", secs)
+                write!(line, "POS {whole}.{millis:03}\n")
             };
 
             // If the host closed the port, write_packet errors — go back to
