@@ -608,8 +608,40 @@ Reload labwc (log out/in, or `labwc --reconfigure` for config — but the
 env var needs a fresh session). Chromium relaunches under the kiosk
 autostart and inherits the same theme.
 
+#### Getting the cursor back for debugging
+
+The blank theme hides the cursor for *everyone*, including a USB mouse you
+plug in to debug. Two ways to get one back, fastest first:
+
+**Quick — per-window theme override, no relogin (try this first).** Launch
+your debug window with a real cursor theme in its environment; the kiosk
+keeps running untouched:
+
+```bash
+# list installed themes: ls /usr/share/icons */cursors 2>/dev/null
+XCURSOR_THEME=PiXflat chromium-browser "http://localhost:8080/?debug=1" &
+```
+
+Drop `?lite`/`distanceToBitmap` from the debug URL too, so the page's own
+`cursor: none` (active only under `body.lite-kiosk`) doesn't re-hide it.
+Caveat: this only works if your Chromium build uses *client-side* cursors.
+Newer builds negotiate the `cursor-shape-v1` protocol, where the
+**compositor** draws the cursor from *its* theme (still blank) and the
+per-process override is ignored — in that case use the relogin toggle.
+
+**Reliable — relogin toggle.** Comment the blank line out of
+`~/.config/labwc/environment` and log out/in for a normal cursor
+everywhere; restore it when done. Two helpers make it one command each
+(works over SSH; you still need to restart the session to apply):
+
+```bash
+cursor-show() { sed -i 's/^XCURSOR_THEME=blank/#XCURSOR_THEME=blank/' ~/.config/labwc/environment; echo 'cursor on next login'; }
+cursor-hide() { sed -i 's/^#\?XCURSOR_THEME=blank/XCURSOR_THEME=blank/'  ~/.config/labwc/environment; echo 'cursor off next login'; }
+```
+
 (Steps written from the diagnosis above; not yet validated on the kiosk
-hardware — confirm during bring-up.)
+hardware — confirm during bring-up, including which cursor protocol this
+Chromium build uses.)
 
 ---
 
