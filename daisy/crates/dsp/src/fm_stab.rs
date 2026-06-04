@@ -137,6 +137,31 @@ impl FmPatch {
             mod_decay_s: 1.18, // brightness lingers — stays harsh through the tail
         }
     }
+
+    /// A high, clean FM bell — Chowning's classic inharmonic bell recipe.
+    ///
+    /// The ~1.4:1 (inharmonic) mod ratio gives the metallic, clangorous
+    /// partials a real bell has; the mod envelope decays the FM index quickly,
+    /// so the strike rings bright and the long tail settles toward a near-pure
+    /// sine. No grit (zero feedback), gentle tanh rounding only.
+    ///
+    /// Envelope: low attack (~4 ms mallet strike), long exponential ring-out.
+    /// This voice has no sustain/release *stage* — the long `decay_s` is the
+    /// ring: its early seconds read as the sustained body, the tail as a long
+    /// release. Strike it a few octaves above A440 for the "high bell" — e.g.
+    /// MIDI note 93 = A6 = 1760 Hz (A440 up two octaves), or 105 = A7 = 3520 Hz.
+    pub fn bell() -> Self {
+        FmPatch {
+            mod_ratio: 1.4,       // inharmonic — Chowning's bell ratio, metallic partials
+            index: 5.0,           // bright, clangorous strike...
+            feedback: 0.0,        // clean — a bell is near-sinusoidal, no grit
+            drive: 1.0,           // unity into the shaper
+            shaper: Shaper::Tanh, // gentle rounding, no added harmonics
+            attack_s: 0.004,      // ~4 ms — a quick mallet strike (low attack)
+            decay_s: 5.0,         // very long ring-out (sustained body → long release)
+            mod_decay_s: 0.6,     // ...that quickly mellows toward a pure sine tail
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -520,6 +545,38 @@ mod tests {
         assert!(
             dirty > clean,
             "industrial ({dirty}) should be brighter/harsher than clean ({clean})"
+        );
+    }
+
+    #[test]
+    fn bell_is_high_and_rings_far_longer_than_the_default_pluck() {
+        // Tuning: A440 up two octaves = A6 = MIDI 93 = 1760 Hz.
+        assert!((midi_to_freq(93) - 1760.0).abs() < 0.01, "note 93 should be A6 = 1760 Hz");
+
+        fn tail_energy(patch: FmPatch) -> f64 {
+            let mut bank = FmStab::new(48_000.0);
+            bank.load_patch(patch);
+            bank.note_on(93, 1.0); // high bell, A6
+            // Skip the first 2 s, then measure energy in the following 200 ms.
+            for _ in 0..(48_000 * 2) {
+                bank.tick();
+            }
+            let mut e = 0.0f64;
+            for _ in 0..9_600 {
+                let s = bank.tick();
+                e += (s * s) as f64;
+            }
+            e
+        }
+
+        let bell_tail = tail_energy(FmPatch::bell());
+        let pluck_tail = tail_energy(FmPatch::default());
+        // The default pluck (decay_s 0.28) is long dead by 2 s; the bell
+        // (decay_s 5.0) should still be ringing with real energy.
+        assert!(bell_tail > 0.0, "the bell should still ring ~2 s after the strike");
+        assert!(
+            bell_tail > pluck_tail * 100.0,
+            "bell tail ({bell_tail:.6}) should dwarf the default pluck tail ({pluck_tail:.6})"
         );
     }
 
