@@ -1,11 +1,112 @@
-//! Test sounds in the DSP engine without creating the full stack.
+//! Audition the firmware "bell on top" topology on the desktop, without the
+//! Daisy. We deliberately do NOT use `dsp::Engine` here — the firmware doesn't
+//! either. Instead we hand-roll the bell-side sub-graph the way firmware will:
+//!
+//!   FM bell (mono)
+//!     ├─ dry → master bus (both channels)
+//!     └─ panned hard-left → stereo send → ping-pong delay (wet-only)
+//!                                              → wet folded on top of master
+//!   master bus → master limiter → output
+//!
+//! In firmware this whole block is summed into the master *after* tape +
+//! destruction but *before* the limiter (see firmware/src/main.rs:470). Here
+//! there's no backing track to destroy — we're auditioning the bell + delay +
+//! limiter portion so the routing and timbre can be judged in isolation.
+//!
+//! The bell chimes every 10 s. The preset uses `Shaper::Off` (pure-sine FM) —
+//! auditioned identical to a tanh shaper and cheaper on the Daisy.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{FromSample, SizedSample};
-use dsp::{Engine, FmPatch};
+use dsp::limiter::Limiter;
+use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _, PingPongDelay};
+
+/// The bell-on-top sub-graph: FM voice + ping-pong delay + master limiter,
+/// summed in the same order the firmware master bus will use.
+struct BellRig {
+    bell: FmStab,
+    delay: PingPongDelay,
+    limiter: Limiter,
+    /// Stereo-interleaved send buffer for the delay (resized to the block).
+    send: Vec<f32>,
+    /// How much of the wet ping-pong to fold on top of the dry bell.
+    wet: f32,
+    sample_index: u64,
+}
+
+impl BellRig {
+    fn new(sample_rate: f32) -> Self {
+        let mut bell = FmStab::new(sample_rate);
+        bell.load_patch(FmPatch::bell());
+
+        // Firmware-realistic delay sizing. The first ctor arg is the *max*
+        // buffer in seconds, and that's what gets allocated: at 48 kHz stereo
+        // f32, 0.25 s ≈ 96 KB — fits the firmware's 256 KB AXI-SRAM heap
+        // (the Engine's 1.0 s default would be ~384 KB and overflow it). Keep
+        // the actual delay time under that ceiling. `mix = 1.0` → wet-only
+        // output, so we scale the wet ourselves when summing, exactly like the
+        // Engine's stab bus.
+        let mut delay = PingPongDelay::new(
+            0.25,                       // max delay buffer, seconds (fits AXI heap)
+            AudioParam::seconds(0.22),  // ~quarter-note bounce, < the 0.25 s ceiling
+            AudioParam::linear(0.55),   // feedback → a few L<->R repeats
+            AudioParam::linear(1.0),    // mix = wet-only
+        );
+        delay.set_sample_rate(sample_rate);
+
+        BellRig {
+            bell,
+            delay,
+            limiter: Limiter::new(sample_rate),
+            send: Vec::new(),
+            wet: 0.6,
+            sample_index: 0,
+        }
+    }
+
+    /// Grow the delay's internal scratch up front so the real-time callback
+    /// never allocates — the discipline firmware requires (it can't alloc in
+    /// the audio IRQ; firmware primes tape the same way).
+    fn prime(&mut self) {
+        let mut scratch = vec![0.0f32; 2048 * 2];
+        self.delay.process(&mut scratch, 0);
+    }
+
+    /// Strike the bell (patch is loaded once in `new`).
+    fn chime(&mut self) {
+        self.bell.note_on(93, 1.0); // A6 = A440 up two octaves = 1760 Hz
+    }
+
+    /// Render `out.len()/2` stereo frames (interleaved) of the full sub-graph.
+    fn render(&mut self, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        self.send.resize(frames * 2, 0.0);
+
+        for i in 0..frames {
+            let s = self.bell.tick(); // mono bell sample
+            out[2 * i] = s; // dry bell on both channels...
+            out[2 * i + 1] = s;
+            self.send[2 * i] = s; // ...and into the delay send, left only —
+            self.send[2 * i + 1] = 0.0; // the cross-feedback bounces it L<->R.
+        }
+
+        // Ping-pong the send (wet-only), then fold the wet on top of the dry.
+        self.delay.process(&mut self.send, self.sample_index);
+        let wet = self.wet;
+        for (o, &w) in out.iter_mut().zip(self.send.iter()) {
+            *o += w * wet;
+        }
+
+        // Master limiter — in firmware the bell is summed *before* this stage.
+        self.limiter.process(out);
+
+        self.sample_index += frames as u64;
+    }
+}
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -14,50 +115,44 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no default output device"))?;
 
     let supported = device.default_output_config()?;
-    let engine_sample_rate = supported.sample_rate().0 as f32;
+    let sample_rate = supported.sample_rate().0 as f32;
     let channels = supported.channels() as usize;
     let format = supported.sample_format();
 
     println!(
         "output: {}  sr={} Hz  ch={}  fmt={:?}",
         device.name().unwrap_or_else(|_| "<unnamed>".into()),
-        engine_sample_rate,
+        sample_rate,
         channels,
         format,
     );
 
-    let engine = Arc::new(Mutex::new(Engine::new(engine_sample_rate)));
+    let rig = Arc::new(Mutex::new(BellRig::new(sample_rate)));
+    rig.lock().unwrap().prime();
 
-    // Load the bell patch and strike A6 (A440 up two octaves = 1760 Hz).
-    {
-        let mut eng = engine.lock().unwrap();
-        let bank = eng.stabs_mut();
-        bank.load_patch(FmPatch::bell());
-        bank.note_on(93, 1.0); // use 105 for A7 = 3520 Hz if you want it higher
-    }
-    println!("ding");
-
-    // Build and START an output stream that pulls from the engine each block.
-    // Without this, nothing is ever rendered and you hear silence.
     let config: cpal::StreamConfig = supported.into();
     let stream = match format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, engine)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, engine)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, engine)?,
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, channels, rig.clone())?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, channels, rig.clone())?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, channels, rig.clone())?,
         other => anyhow::bail!("unsupported sample format {other:?}"),
     };
     stream.play()?;
 
-    // Keep the process (and the stream) alive while the ~5 s bell rings out.
-    std::thread::sleep(std::time::Duration::from_secs(6));
-    Ok(())
+    // Chime every 10 s. Ctrl-C to stop.
+    println!("chiming every 10 s — Ctrl-C to stop");
+    loop {
+        rig.lock().unwrap().chime();
+        println!("chime");
+        std::thread::sleep(Duration::from_secs(10));
+    }
 }
 
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     channels: usize,
-    engine: Arc<Mutex<Engine>>,
+    rig: Arc<Mutex<BellRig>>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,
@@ -68,7 +163,7 @@ where
         move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
             let frames = output.len() / channels;
             scratch.resize(frames * 2, 0.0);
-            engine.lock().unwrap().process(&[], &mut scratch);
+            rig.lock().unwrap().render(&mut scratch);
 
             for (cpal_frame, dsp_frame) in
                 output.chunks_exact_mut(channels).zip(scratch.chunks_exact(2))

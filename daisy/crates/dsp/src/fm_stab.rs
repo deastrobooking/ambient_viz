@@ -143,7 +143,9 @@ impl FmPatch {
     /// The ~1.4:1 (inharmonic) mod ratio gives the metallic, clangorous
     /// partials a real bell has; the mod envelope decays the FM index quickly,
     /// so the strike rings bright and the long tail settles toward a near-pure
-    /// sine. No grit (zero feedback), gentle tanh rounding only.
+    /// sine. No grit (zero feedback) and no waveshaping — pure-sine FM, which
+    /// auditioned identical to a tanh shaper here and saves a per-sample
+    /// `tanhf` on the Daisy.
     ///
     /// Envelope: low attack (~4 ms mallet strike), long exponential ring-out.
     /// This voice has no sustain/release *stage* — the long `decay_s` is the
@@ -156,7 +158,7 @@ impl FmPatch {
             index: 5.0,           // bright, clangorous strike...
             feedback: 0.0,        // clean — a bell is near-sinusoidal, no grit
             drive: 1.0,           // unity into the shaper
-            shaper: Shaper::Tanh, // gentle rounding, no added harmonics
+            shaper: Shaper::Off, // pure-sine FM — auditioned identical to Tanh, no per-sample tanhf
             attack_s: 0.004,      // ~4 ms — a quick mallet strike (low attack)
             decay_s: 5.0,         // very long ring-out (sustained body → long release)
             mod_decay_s: 0.6,     // ...that quickly mellows toward a pure sine tail
