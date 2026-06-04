@@ -22,12 +22,12 @@ debug = 2
 debug-assertions = false
 incremental = false
 lto = 'fat'
-# TEMPORARY WORKAROUND ('s' -> 'z'): size-first optimization keeps the
-# `debug-uart + bell` firmware under the H750's 128 KB internal-flash ceiling
-# (~127 KB at 'z' vs overflow at 's'). REMOVE — revert to 's' — once the QSPI
-# migration lifts the flash limit; see PLAN_QSPI_BOOTLOADER.md. Caveat: 'z' can
-# slow hot DSP loops, so watch CB_FULL_US / SAI_ERR on hardware.
-opt-level = 'z'
+# Production/baseline stays size-balanced 's'. The *debug* firmware aliases
+# (`firmware`/`flash`/`bin`) override this to 'z' via `--config` to squeeze
+# `debug-uart + bell` under the 128 KB internal-flash ceiling — a TEMPORARY
+# workaround to drop once QSPI lifts the limit. See .cargo/config.toml and
+# PLAN_QSPI_BOOTLOADER.md.
+opt-level = 's'
 overflow-checks = false
 
 [profile.dev]

@@ -16,12 +16,21 @@ DEFMT_LOG = "debug"
 
 # Workspace-scoped aliases so firmware commands work from the root.
 # `cargo run -p host` for Mac dev — no alias needed; native target is default.
+#
+# The debug aliases (firmware/flash/bin, default features → `debug-uart`)
+# override opt-level to 'z' via --config: size-first keeps `debug-uart + bell`
+# under the H750's 128 KB internal-flash ceiling (~127 KB at 'z' vs an overflow
+# at the profile default 's'). The PRODUCTION aliases below (flash-prod/bin-prod)
+# deliberately omit this, so the shipping image keeps the profile's 's'. This is
+# a TEMPORARY workaround — drop the --config once QSPI lifts the flash limit (see
+# PLAN_QSPI_BOOTLOADER.md). Caveat: 'z' can slow hot DSP loops; watch
+# CB_FULL_US / SAI_ERR on hardware.
 [alias]
-firmware = "build -p firmware --target thumbv7em-none-eabihf --release"
-flash    = "run -p firmware --target thumbv7em-none-eabihf --release"
+firmware = ["build", "-p", "firmware", "--target", "thumbv7em-none-eabihf", "--release", "--config", "profile.release.opt-level=\"z\""]
+flash    = ["run",   "-p", "firmware", "--target", "thumbv7em-none-eabihf", "--release", "--config", "profile.release.opt-level=\"z\""]
 # `cargo bin` produces target/firmware.bin for DFU flashing.
 # Requires `cargo install cargo-binutils` once.
-bin = "objcopy -p firmware --target thumbv7em-none-eabihf --release -- -O binary target/firmware.bin"
+bin = ["objcopy", "-p", "firmware", "--target", "thumbv7em-none-eabihf", "--release", "--config", "profile.release.opt-level=\"z\"", "--", "-O", "binary", "target/firmware.bin"]
 
 # --- Production build ----------------------------------------------------
 # `--no-default-features` drops the `debug-uart` feature: no USART3 boot log,

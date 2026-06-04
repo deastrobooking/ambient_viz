@@ -93,21 +93,22 @@ Run code from QSPI instead of internal flash. This needs three things:
 
 - The bell ships fine in the **production** firmware (`--no-default-features
   --features bell`).
-- **`opt-level='z'` workaround (in place — REMOVE after QSPI).** The workspace
-  release profile is temporarily set to `opt-level='z'` (size-first) instead of
-  `'s'`. This frees ~7.5 KB and keeps `debug-uart + bell` under the 128 KB
-  ceiling (~127 KB vs an overflow at `'s'`). It's a stopgap so debug builds with
-  the bell fit on internal flash; **revert it to `'s'` once we migrate to QSPI**
-  and the flash limit is gone. Caveat: `'z'` can slow hot DSP loops — verify
-  `CB_FULL_US` / `SAI_ERR` stay healthy on hardware; if `'z'` regresses audio,
-  fall back to building only the debug image with `RUSTFLAGS="-C opt-level=z"`
-  (or a per-package override keeping `dsp` faster) rather than the whole
-  workspace.
+- **`opt-level='z'` workaround (in place — REMOVE after QSPI).** Only the
+  *debug* firmware aliases (`firmware`/`flash`/`bin` in `.cargo/config.toml`,
+  default features → `debug-uart`) override `opt-level` to `'z'` via `--config`.
+  The shared `[profile.release]` stays `'s'`, so **production
+  (`flash-prod`/`bin-prod`, `--no-default-features`) is unaffected** and keeps
+  `'s'`. The `'z'` override frees ~7.5 KB on the debug build, keeping
+  `debug-uart + bell` under the 128 KB ceiling (~127 KB vs an overflow at `'s'`).
+  **Revert it (drop the `--config` from the debug aliases) once QSPI lifts the
+  flash limit.** Caveat: `'z'` can slow hot DSP loops — verify `CB_FULL_US` /
+  `SAI_ERR` stay healthy on hardware; if it regresses audio, narrow it with a
+  per-package override that keeps `dsp` faster.
 
-### Flash budget at `opt-level='z'` (current)
+### Flash budget (current)
 
-| Build | text+data | vs 128 KB |
-|---|---|---|
-| `--no-default-features --features bell` (production) | ~78 KB | ~50 KB free |
-| default (`debug-uart`, no bell) | ~122 KB | ~9 KB free |
-| `--features bell` (`debug-uart` + bell) | ~127 KB | ~4 KB free |
+| Build | opt-level | text+data | vs 128 KB |
+|---|---|---|---|
+| `flash-prod`/`bin-prod` (production, `--no-default-features`, +bell) | `s` | ~84 KB | ~44 KB free |
+| `firmware`/`flash` (debug, `debug-uart`, no bell) | `z` | ~122 KB | ~9 KB free |
+| `firmware --features bell` (debug, `debug-uart` + bell) | `z` | ~127 KB | ~4 KB free |
