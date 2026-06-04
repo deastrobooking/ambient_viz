@@ -580,16 +580,11 @@ independent cursor sources, and hideaway only handles one:
    it. This is the stray static cursor you see over the kiosk; it only
    disappears when Chromium quits and the compositor's idle-hide kicks in.
 
-**Fix for case 3 — a transparent cursor theme.** Make the compositor's
-default cursor image itself invisible. Both the compositor and
+**Fix for case 3 — a transparent cursor theme.** This kiosk runs **labwc**
+(the recent Raspberry Pi OS default), which has no built-in cursor-hide, so
+make the compositor's default cursor image itself invisible. Both labwc and
 Chromium-on-Wayland (Ozone) honor the same `XCURSOR_THEME`, so one blank
-theme covers both. First find which compositor is running:
-
-```bash
-echo "$XDG_CURRENT_DESKTOP"; ps -e | grep -E 'labwc|wayfire|cage|cog|sway|weston'
-```
-
-Then build a blank theme (compositor-agnostic):
+theme covers both. Build it:
 
 ```bash
 sudo apt install x11-apps imagemagick      # xcursorgen + convert
@@ -602,16 +597,16 @@ for n in default arrow top_left_arrow hand1 hand2 xterm crosshair watch left_ptr
 printf '[Icon Theme]\nName=blank\n' > ~/.icons/blank/index.theme
 ```
 
-Set `XCURSOR_THEME=blank` in the session environment and restart the
-session. On recent Raspberry Pi OS (labwc) put it in
-`~/.config/labwc/environment`:
+Then point labwc at it via its environment file
+`~/.config/labwc/environment` (create the dir if needed):
 
 ```
 XCURSOR_THEME=blank
 ```
 
-On older Pi OS (wayfire) you can instead enable the built-in `hide-cursor`
-/ idle plugin in `~/.config/wayfire.ini` rather than using a theme.
+Reload labwc (log out/in, or `labwc --reconfigure` for config — but the
+env var needs a fresh session). Chromium relaunches under the kiosk
+autostart and inherits the same theme.
 
 (Steps written from the diagnosis above; not yet validated on the kiosk
 hardware — confirm during bring-up.)
