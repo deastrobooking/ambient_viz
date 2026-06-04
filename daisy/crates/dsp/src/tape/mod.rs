@@ -111,14 +111,14 @@ const FAILURE_BASELINE: FailureSnapshot = FailureSnapshot {
 /// vibrato), and flutter to a fine shimmer.
 const FAILURE_DESTROYED: FailureSnapshot = FailureSnapshot {
     wow_rate_hz: 1.0,
-    wow_depth_ms: 2.5,
-    flutter_depth_ms: 0.6,
+    wow_depth_ms: 7.,
+    flutter_depth_ms: 1.0,
     chew_depth: 0.9,
     chew_freq: 0.8,
     speed_ips: 1.5,
     spacing_um: 18.0,
     hysteresis_drive: 0.95,
-    hiss_amount: 0.0, // hiss disabled across the whole failure range
+    hiss_amount: 0.2, // slight hiss when failed
 };
 
 #[inline]
