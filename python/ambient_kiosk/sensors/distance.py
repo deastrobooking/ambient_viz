@@ -296,10 +296,39 @@ class DistanceDriver:
         self._i2c = None
         self._smoothed: Optional[float] = None
         self._last_published: Optional[float] = None
+        # Wall-clock of the last valid (non-None) read. Stays 0.0 until the
+        # first one arrives, so the initial published value is FAR (idle).
+        self._last_valid_t: float = 0.0
         # Sensor's far reach in cm — the no-target snap value and the saturation
-        # end of the downstream effect mappings. Resolved once the backend is
-        # configured (short-mode default until then, also used in mock mode).
+        # end of the downstream effect mappings. Starts at the sensor's configured
+        # reach and is then driven by the learned empty-room distance (see below).
+        # Resolved once the backend is configured (short-mode default until then,
+        # also used in mock mode).
         self._far_cm: float = config.VL53_FAR_CM
+        # Hard ceiling for the learned far reach — the sensor's reliable max,
+        # captured at configure() time. The empty-room estimate can move freely
+        # below this but never beyond it (readings past the sensor's reach are
+        # unreliable). Stays at the config default in mock mode.
+        self._far_ceiling: float = config.VL53_FAR_CM
+
+        # --- Empty-room learning state -------------------------------------
+        # Trailing window of (monotonic_t, smoothed_cm) from VALID reads only,
+        # used to gauge stillness via peak-to-peak excursion over the window.
+        self._dist_hist: list = []
+        # When the current run of continuous valid reads began (None when idle/
+        # no-target). Distinct from the trimmed history span so we know we have
+        # observed for at least a full window before judging stillness.
+        self._collect_start_t: Optional[float] = None
+        # Learned empty-room distance (cm); None until the first still scene is
+        # confirmed. When set, it drives self._far_cm.
+        self._empty_room_cm: Optional[float] = None
+        self._last_learn_t: float = 0.0
+        # Smoothed signed velocity (cm/s) — approach negative, retreat positive.
+        # Published as distance_velocity_cm_s for downstream interactivity.
+        self._vel_ema: Optional[float] = None
+        self._prev_t: Optional[float] = None
+        self._prev_d: Optional[float] = None
+        self._last_vel_published: Optional[float] = None
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="distance", daemon=True)
@@ -321,6 +350,7 @@ class DistanceDriver:
             return False
         self._backend = backend
         self._far_cm = backend.far_cm
+        self._far_ceiling = backend.far_cm
         log.info("distance: using %s (far=%.0fcm)", backend.name, self._far_cm)
         return True
 
@@ -335,10 +365,6 @@ class DistanceDriver:
         # Mock state
         cycle_start = time.monotonic()
         CYCLE = 25.0
-
-        # Wall-clock of the last valid (non-None) read. Stays 0.0 until the
-        # first one arrives, so initial published value is FAR (idle).
-        last_valid_t = 0.0
 
         # Re-publish the (static) onset + far reach every ~2 s so a downstream
         # restart (Node server / browser reconnect) re-learns them; the Node
@@ -366,18 +392,7 @@ class DistanceDriver:
                 raw = self._backend.read_raw()
 
             now = time.monotonic()
-            a = config.VL53_SMOOTH_ALPHA
-            if raw is not None:
-                # Valid read — smooth into existing trace.
-                last_valid_t = now
-                self._smoothed = raw if self._smoothed is None else (a * raw + (1 - a) * self._smoothed)
-            elif last_valid_t == 0.0 or (now - last_valid_t) > self.NO_TARGET_TIMEOUT_S:
-                # Sustained no-target — snap to the sensor's FAR. Gradual decay
-                # would leave the smoothed value stuck near the user's last
-                # close-range position for ~150 ms after the hold expires, which
-                # reads as "kiosk thinks I'm still here" lag.
-                self._smoothed = self._far_cm
-            # else: brief None during a known-present target — hold value.
+            self._process_sample(raw, now)
 
             # Quantize publication to 0.1 cm to suppress trivial JSON noise
             if self._smoothed is not None:
@@ -385,6 +400,159 @@ class DistanceDriver:
                 if v != self._last_published:
                     self.ingest.publish("distance_cm", v)
                     self._last_published = v
+
+    def _process_sample(self, raw: Optional[float], now: float) -> None:
+        """Fold one raw read (cm, or None for no-target) into the smoothed
+        trace, velocity, and empty-room learner — the single per-sample step
+        shared by the live loop and the test_tof tuning view, so both behave
+        identically. Updates self._smoothed and may update self._far_cm."""
+        a = config.VL53_SMOOTH_ALPHA
+        if raw is not None:
+            # Valid read — smooth into existing trace.
+            self._last_valid_t = now
+            self._smoothed = raw if self._smoothed is None else (a * raw + (1 - a) * self._smoothed)
+            # Velocity + empty-room learning run ONLY on real measurements —
+            # never on the snapped-to-far idle value, which isn't a reading of
+            # the room's geometry.
+            self._track_velocity(now, self._smoothed)
+            if self._collect_start_t is None:
+                self._collect_start_t = now
+            self._dist_hist.append((now, self._smoothed))
+            cutoff = now - config.EMPTY_ROOM_STILLNESS_WINDOW_S
+            while self._dist_hist and self._dist_hist[0][0] < cutoff:
+                self._dist_hist.pop(0)
+            if self._learn_empty_room(now):
+                # Push the new far reach out immediately rather than waiting for
+                # the ~2 s periodic bounds publish.
+                self.ingest.publish("distance_far_cm", round(self._far_cm, 1))
+        elif self._last_valid_t == 0.0 or (now - self._last_valid_t) > self.NO_TARGET_TIMEOUT_S:
+            # Sustained no-target — snap to the sensor's FAR. Gradual decay would
+            # leave the smoothed value stuck near the user's last close-range
+            # position for ~150 ms after the hold expires, which reads as "kiosk
+            # thinks I'm still here" lag.
+            self._smoothed = self._far_cm
+            # The snap-to-far plateau is not a measurement; drop the stillness
+            # history and velocity trace so it can't be learned or counted.
+            self._dist_hist.clear()
+            self._collect_start_t = None
+            self._prev_t = None
+            self._prev_d = None
+            self._vel_ema = None
+        # else: brief None during a known-present target — hold value.
+
+    def empty_room_status(self, now: float) -> dict:
+        """Live snapshot of the empty-room learner for tuning UIs (test_tof).
+
+        Mirrors the gate in _learn_empty_room without mutating anything, so the
+        printed `still`/`avg_speed` match what actually drives adoption.
+        """
+        window = config.EMPTY_ROOM_STILLNESS_WINDOW_S
+        hist = self._dist_hist
+        span = (now - self._collect_start_t) if self._collect_start_t is not None else 0.0
+        if len(hist) >= 2:
+            lo = min(d for _, d in hist)
+            hi = max(d for _, d in hist)
+            pp = hi - lo
+        else:
+            pp = 0.0
+        avg_speed = (pp / window) if window > 0 else 0.0
+        full = window > 0 and span >= window
+        still = full and avg_speed <= config.EMPTY_ROOM_VELOCITY_CM_S
+        return {
+            "smoothed": self._smoothed,
+            "velocity": self._vel_ema,
+            "span": span,
+            "window": window,
+            "pp": pp,
+            "avg_speed": avg_speed,
+            "window_full": full,
+            "still": still,
+            "empty_room": self._empty_room_cm,
+            "far": self._far_cm,
+            "samples": len(hist),
+        }
+
+    def _track_velocity(self, now: float, d: float) -> None:
+        """Maintain a smoothed signed first derivative of distance (cm/s) and
+        publish it as `distance_velocity_cm_s` for downstream interactivity
+        (approach is negative, retreat positive). Stillness detection does NOT
+        use this — it uses the windowed peak-to-peak in _learn_empty_room, which
+        resolves sub-cm/s — so the heavy smoothing/latency here is harmless."""
+        if self._prev_t is not None:
+            dt = now - self._prev_t
+            # Skip degenerate or post-dropout gaps: a stale prev sample across a
+            # multi-frame None gap would manufacture a velocity spike.
+            if 1e-4 < dt < 1.0:
+                inst = (d - self._prev_d) / dt
+                # EMA toward a ~0.5 s time constant so per-frame jitter averages
+                # out instead of dominating.
+                beta = min(1.0, dt / 0.5)
+                self._vel_ema = inst if self._vel_ema is None else beta * inst + (1 - beta) * self._vel_ema
+                v = round(self._vel_ema, 2)
+                if v != self._last_vel_published:
+                    self.ingest.publish("distance_velocity_cm_s", v)
+                    self._last_vel_published = v
+        self._prev_t = now
+        self._prev_d = d
+
+    def _learn_empty_room(self, now: float) -> bool:
+        """If the scene has held still long enough, adopt the current reading as
+        the empty-room far reach. Returns True if self._far_cm changed.
+
+        Stillness = peak-to-peak distance excursion over a full stillness window
+        staying at/below EMPTY_ROOM_VELOCITY_CM_S × window. Using the windowed
+        excursion (rather than a per-sample derivative) is what makes sub-cm/s
+        measurable at 50 Hz, and it rejects both steady drift and small wobble.
+        """
+        if not config.EMPTY_ROOM_LEARN:
+            return False
+        window = config.EMPTY_ROOM_STILLNESS_WINDOW_S
+        hist = self._dist_hist
+        # Need a continuous run of valid reads spanning at least a full window
+        # before judging stillness (hist itself is trimmed TO the window, so its
+        # span can't exceed it — track the run start separately).
+        if (window <= 0 or len(hist) < 2 or self._collect_start_t is None
+                or (now - self._collect_start_t) < window):
+            return False
+        lo = min(d for _, d in hist)
+        hi = max(d for _, d in hist)
+        avg_speed = (hi - lo) / window  # cm/s; the "velocity" inactivity gauge
+        if avg_speed > config.EMPTY_ROOM_VELOCITY_CM_S:
+            return False
+        # Throttle re-adoption while a still scene persists (update periodically,
+        # not every frame).
+        if (now - self._last_learn_t) < config.EMPTY_ROOM_RELEARN_S:
+            return False
+        # Robust central distance of the still window.
+        vals = sorted(d for _, d in hist)
+        candidate = vals[len(vals) // 2]
+        # A reading nearer than the plausible floor is a motionless subject, not
+        # the room — never let it become or lower the baseline.
+        if candidate < config.EMPTY_ROOM_MIN_CM:
+            return False
+
+        self._last_learn_t = now
+        if self._empty_room_cm is None:
+            est = candidate                      # first confirmation: adopt as-is
+        elif candidate >= self._empty_room_cm:
+            est = candidate                      # farther/clearer: trust immediately
+        else:
+            # Closer: a genuine layout change OR a still visitor. Ease in slowly
+            # so a transient still person barely moves it and it recovers.
+            a = config.EMPTY_ROOM_DOWN_ALPHA
+            est = self._empty_room_cm + a * (candidate - self._empty_room_cm)
+        # Clamp to a sane band: never below the floor, never past the sensor's
+        # reliable reach.
+        est = max(config.EMPTY_ROOM_MIN_CM, min(est, self._far_ceiling))
+        self._empty_room_cm = est
+
+        if round(est, 1) != round(self._far_cm, 1):
+            self._far_cm = est
+            log.info("distance: empty-room far updated -> %.1f cm "
+                     "(candidate=%.1f, pp=%.2f cm over %.0fs)",
+                     est, candidate, hi - lo, window)
+            return True
+        return False
 
     def stop(self) -> None:
         self._stop.set()

@@ -70,6 +70,47 @@ VL53_NEAR_CM = 25.0
 # NOTE: distinct from VL53_NEAR_CM above (a legacy 25 cm "present" reference).
 DISTANCE_NEAR_CM = float(os.environ.get("DISTANCE_NEAR_CM", "75"))
 
+# --- Empty-room distance learning -------------------------------------------
+# The far end of every distance→effect mapping (the "full destruction" point,
+# published as distance_far_cm) should be the ACTUAL empty-room reading, not a
+# fixed guess. The VL53L1X reflects off whatever surface it faces, so even a
+# clear line of sight may return a finite distance (e.g. ~350 cm off a far
+# wall) rather than no-target. We learn that background live from the feed:
+# when the smoothed distance holds essentially still — velocity below the
+# threshold — for longer than the stillness window, nobody is moving in the
+# cone, so the current reading IS the room, and we adopt it as the far reach.
+#
+# Re-learned continuously so it tracks the room over time (furniture moved, the
+# sensor nudged or repositioned post-bootup, a new backdrop). Adoption is
+# deliberately asymmetric: a stable reading FARTHER than the current estimate
+# is trusted immediately (a clearer line of sight can only mean the previous
+# estimate was occluded), while a CLOSER one is adopted slowly — a visitor
+# standing dead-still is closer than the wall and must NOT pull the baseline
+# in, or the empty room would read as "someone's here" forever.
+EMPTY_ROOM_LEARN = True
+# Velocity (cm/s) at/below which the scene counts as "not moving." Sized for
+# sensor vibration / thermal drift (sub-cm/s), well under human motion. Gauged
+# as the peak-to-peak distance excursion over the stillness window ÷ window,
+# which resolves sub-cm/s (a per-sample derivative is swamped by jitter at
+# 50 Hz) and is robust to small zero-mean wobble.
+EMPTY_ROOM_VELOCITY_CM_S = float(os.environ.get("EMPTY_ROOM_VELOCITY_CM_S", "0.8"))
+# How long (s) velocity must stay below the threshold before the current
+# reading is accepted as the empty-room background. The request's ">10 s".
+EMPTY_ROOM_STILLNESS_WINDOW_S = float(os.environ.get("EMPTY_ROOM_STILLNESS_WINDOW_S", "10.0"))
+# Once a still scene persists, don't re-adopt more often than this (s). Keeps
+# the estimate updating "periodically" without thrashing every frame.
+EMPTY_ROOM_RELEARN_S = 5.0
+# Smallest distance (cm) that can plausibly be the empty room. A stable reading
+# nearer than this is treated as a present, motionless subject — not the room —
+# and never lowers the baseline. Lower it for a tight install (sensor close to
+# a wall); raise it if there is no near clutter to ever read legitimately.
+EMPTY_ROOM_MIN_CM = float(os.environ.get("EMPTY_ROOM_MIN_CM", "100.0"))
+# EMA weight (0..1, applied per re-learn) used when a confirmed empty-room
+# reading is CLOSER than the current estimate (a genuine layout change). Small
+# = slow: a single still visitor barely moves the baseline and it recovers once
+# a farther stable reading reappears after they leave.
+EMPTY_ROOM_DOWN_ALPHA = 0.25
+
 # --- VL53L5CX (multizone) ---------------------------------------------------
 # Used when VL53_SENSOR selects it. No short/long mode like the L1X — a single
 # ~4 m range. The zone grid is reduced to one distance by taking the closest

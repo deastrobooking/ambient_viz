@@ -15,9 +15,14 @@ Run with the kiosk venv active, from the python/ dir so the package imports:
     python test_tof.py l5cx            # force VL53L5CX
     VL53_SENSOR=l1x python test_tof.py # force VL53L1X via env
 
-L1X: prints raw + rolling 1 s mean/stddev + ambient IR (tune
-VL53_AMBIENT_LONG_MAX). L5CX: prints the closest valid zone + a live distance
-grid so you can see the cone and aim it. Ctrl-C to exit.
+L1X: live raw + rolling 1 s mean/stddev + ambient IR (tune VL53_AMBIENT_LONG_MAX).
+L5CX: closest valid zone + a live distance grid so you can see the cone and aim it.
+
+Both views also run the real empty-room learner and show it live — smoothed
+distance, velocity, the stillness-window fill, and the learned "full-destruction"
+far reach — so you can tune EMPTY_ROOM_* in config.py (or via env, e.g.
+`EMPTY_ROOM_VELOCITY_CM_S=0.5 EMPTY_ROOM_STILLNESS_WINDOW_S=8 python test_tof.py`)
+and watch the empty room get learned. Ctrl-C to exit.
 """
 
 import collections
@@ -53,19 +58,70 @@ def _resolve_choice(argv) -> str:
     return choice
 
 
-def _loop_l1x(backend) -> int:
-    """Rolling raw / mean / stddev / ambient — mirrors the live auto-mode read."""
-    sensor = backend._sensor
-    print("\nhold target steady to read noise floor; wave to track motion")
-    print("ambient = scene IR load (ST ULD units). Compare projector ON vs OFF,")
-    print("on the real wall, to tune VL53_AMBIENT_LONG_MAX in config.py.")
-    print("ctrl-c to exit\n")
-    print(f"{'raw':>10}   {'mean(1s)':>10}   {'sd':>6}   {'amb':>6}   {'n':>3}")
+class _NullIngest:
+    """Swallows publishes — the tuning view reads driver state directly."""
+    def publish(self, name, value):  # noqa: D401  (stub)
+        pass
 
-    window = collections.deque(maxlen=50)  # ~1 s at 50 Hz
+
+def _make_driver(backend):
+    """A DistanceDriver wired to an already-configured backend so the tuning
+    view runs the EXACT live smoothing + velocity + empty-room learner (no
+    logic duplicated here). _process_sample is fed the per-frame read; the
+    learner mutates the driver's far reach just as it does in the kiosk."""
+    drv = D.DistanceDriver(_NullIngest(), mock=False)
+    drv._backend = backend
+    drv._far_cm = backend.far_cm
+    drv._far_ceiling = backend.far_cm
+    return drv
+
+
+def _bar(frac, width=24):
+    frac = 0.0 if frac < 0 else (1.0 if frac > 1 else frac)
+    fill = int(round(frac * width))
+    return "#" * fill + "-" * (width - fill)
+
+
+def _empty_room_lines(drv, now):
+    """Multi-line live readout of the empty-room learner for tuning."""
+    s = drv.empty_room_status(now)
+    sm = f"{s['smoothed']:.1f} cm" if s['smoothed'] is not None else "--"
+    vel = f"{s['velocity']:+.2f} cm/s" if s['velocity'] is not None else "--"
+    thr = config.EMPTY_ROOM_VELOCITY_CM_S
+    er = f"{s['empty_room']:.1f} cm" if s['empty_room'] is not None else "(not learned yet)"
+    if s['still']:
+        state = "STILL -> learning"
+    elif not s['window_full']:
+        state = "filling window"
+    else:
+        state = "moving"
+    win_frac = (s['span'] / s['window']) if s['window'] else 0.0
+    return [
+        f"  smoothed {sm:>11}      velocity {vel:>11}",
+        f"  window   [{_bar(win_frac)}] {s['span']:5.1f}/{s['window']:.0f} s  (n={s['samples']})",
+        f"  motion   pp={s['pp']:5.2f} cm   speed={s['avg_speed']:5.3f}  vs thr {thr:.2f} cm/s   -> {state}",
+        f"  EMPTY ROOM (full-destruction far): {er}    [live far = {s['far']:.1f} cm]",
+    ]
+
+
+_TUNE_HINT = (
+    "  tune (config.py or env): EMPTY_ROOM_VELOCITY_CM_S, EMPTY_ROOM_STILLNESS_WINDOW_S,\n"
+    "                           EMPTY_ROOM_MIN_CM, EMPTY_ROOM_RELEARN_S, EMPTY_ROOM_DOWN_ALPHA\n"
+    "  empty the cone and hold still to learn the far reach; approach/wave to see it hold."
+)
+
+
+def _loop_l1x(backend) -> int:
+    """Live dashboard: raw / mean / stddev / ambient PLUS the empty-room learner
+    (velocity, stillness window fill, learned far reach). Reads run through the
+    real DistanceDriver step, so what you see is what the kiosk computes."""
+    sensor = backend._sensor
+    drv = _make_driver(backend)
+    window = collections.deque(maxlen=50)  # ~1 s at 50 Hz, for the noise-floor sd
     last_print = 0.0
     last_d = None
     last_amb = None
+    sys.stdout.write("\033[2J")  # clear once; the loop repaints in place
     while True:
         if sensor.data_ready:
             d = sensor.distance  # cm, or None when no valid target in cone
@@ -74,20 +130,28 @@ def _loop_l1x(backend) -> int:
             last_amb = backend._read_ambient_rate()
             sensor.clear_interrupt()
             last_d = d
+            # Feed every reading (including None = no-target) into the live
+            # smoothing + velocity + empty-room learner.
+            drv._process_sample(d, time.monotonic())
             if d is not None:
                 window.append(d)
         now = time.monotonic()
         if now - last_print >= 0.1:
-            raw_s = f"{last_d:6.1f} cm" if last_d is not None else "    --   "
-            amb_s = f"{last_amb:>6d}" if last_amb is not None else f"{'--':>6}"
-            if len(window) >= 2:
-                mu = statistics.mean(window)
-                sd = statistics.stdev(window)
-                print(f"{raw_s:>10}   {mu:6.1f} cm   {sd:5.2f}   {amb_s}   {len(window):>3}",
-                      end="\r", flush=True)
-            else:
-                print(f"{raw_s:>10}   {'--':>10}   {'--':>6}   {amb_s}   {len(window):>3}",
-                      end="\r", flush=True)
+            raw_s = f"{last_d:.1f} cm" if last_d is not None else "--"
+            amb_s = f"{last_amb}" if last_amb is not None else "--"
+            mu_s = f"{statistics.mean(window):.1f} cm" if len(window) >= 2 else "--"
+            sd_s = f"{statistics.stdev(window):.2f}" if len(window) >= 2 else "--"
+            # Repaint in place: home cursor + clear below (same trick as L5CX).
+            sys.stdout.write("\033[H\033[J")
+            print(f"[VL53L1X]  far ceiling = {backend.far_cm:.0f} cm    "
+                  f"ambient = {amb_s} (tune VL53_AMBIENT_LONG_MAX, projector ON, real wall)")
+            print(f"  raw {raw_s:>11}   mean(1s) {mu_s:>11}   sd {sd_s:>6}   n={len(window)}")
+            print()
+            for ln in _empty_room_lines(drv, now):
+                print(ln)
+            print()
+            print(_TUNE_HINT)
+            print("  ctrl-c to exit", flush=True)
             last_print = now
         time.sleep(0.005)
 
@@ -97,6 +161,7 @@ def _loop_l5cx(backend) -> int:
     sensor = backend._sensor
     n = backend._grid_n
     side = 8 if n == 64 else 4
+    drv = _make_driver(backend)
     print(f"\nclosest = nearest valid zone in the cone (what publishes as distance_cm)")
     print("grid shows per-zone distance in cm ('--' = no valid target this frame)")
     print("ctrl-c to exit\n")
@@ -118,8 +183,11 @@ def _loop_l5cx(backend) -> int:
                 else:
                     cells.append("   --")
             now = time.monotonic()
+            closest = min(valid_cm) if valid_cm else None
+            # Feed the reduced closest-zone distance (None = no-target) through
+            # the real driver step so the empty-room learner runs live.
+            drv._process_sample(closest, now)
             if now - last_print >= 0.25:
-                closest = min(valid_cm) if valid_cm else None
                 closest_s = f"{closest:5.1f} cm" if closest is not None else "   -- "
                 rows = "\n".join(
                     "  " + " ".join(cells[r * side:(r + 1) * side])
@@ -130,8 +198,12 @@ def _loop_l5cx(backend) -> int:
                 sys.stdout.write("\033[H\033[J")
                 print(f"[L5CX {side}x{side} @ {config.VL53L5CX_RANGING_HZ}Hz] "
                       f"closest={closest_s}  valid={len(valid_cm)}/{m}  "
-                      f"far={backend.far_cm:.0f}cm\n")
-                print(rows, flush=True)
+                      f"far ceiling={backend.far_cm:.0f}cm\n")
+                print(rows + "\n")
+                for ln in _empty_room_lines(drv, now):
+                    print(ln)
+                print()
+                print(_TUNE_HINT, flush=True)
                 last_print = now
         time.sleep(0.01)
 
