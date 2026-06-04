@@ -4811,7 +4811,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // --- audio band extraction ---
   // returns 0..1 averaged energies over coarse bands
   function bands() {
-    if (!analyser) return { bass: 0, mid: 0, treble: 0, level: 0, bassFast: 0 };
+    if (!analyser) return { bass: 0, mid: 0, treble: 0, level: 0, levelDb: 0, bassFast: 0 };
     analyser.getByteFrequencyData(freqData);
     const n = freqData.length;
     // analyser bins map linearly to 0..nyquist; for 48k sample rate that's 0..24k, bin = index/n * nyquist
@@ -4827,15 +4827,29 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     const bass = avgRange(freqData, n, 20, 200);
     const mid = avgRange(freqData, n, 200, 2000);
     const treble = avgRange(freqData, n, 2000, 12000);
+    // Spectral mean of the dB-mapped bytes — kept only as a diagnostic
+    // (window.__levelDb). It's logarithmic and clamped to the analyser's
+    // [minDecibels,maxDecibels] window, so it reads on/off for quiet inputs and
+    // a linear input gain barely moves it.
+    let levelDb = 0;
+    for (let i = 0; i < n; i++) levelDb += freqData[i];
+    levelDb = levelDb / n / 255;
+    // Energy level the visuals gate on: LINEAR time-domain RMS. Scales
+    // proportionally with the signal (so ?micgain actually works) and tracks the
+    // music smoothly instead of snapping between silence and saturation.
     let level = 0;
-    for (let i = 0; i < n; i++) level += freqData[i];
-    level = level / n / 255;
+    analyser.getByteTimeDomainData(timeData);
+    for (let i = 0; i < timeData.length; i++) {
+      const s = (timeData[i] - 128) / 128;
+      level += s * s;
+    }
+    level = Math.sqrt(level / timeData.length);
     let bassFast = 0;
     if (transientAnalyser) {
       transientAnalyser.getByteFrequencyData(transientFreqData);
       bassFast = avgRange(transientFreqData, transientFreqData.length, 20, 200);
     }
-    return { bass, mid, treble, level, bassFast };
+    return { bass, mid, treble, level, levelDb, bassFast };
   }
 
   // --- silhouette names (for PARAMS.silhouette dropdown) ---
@@ -6564,7 +6578,9 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       applyAutomation(songT);
     }
     const b = bands();
-    window.__level = b.level; // mic-gain calibration readout (see ?micgain)
+    window.__level = b.level;     // linear RMS — the value the visuals gate on
+    window.__levelDb = b.levelDb; // old dB spectral-mean, diagnostic only
+    window.__actx = audioCtx && audioCtx.state; // 'running' | 'suspended'
     if (renderWorker) {
       renderWorker.postMessage({
         type: 'audio',
