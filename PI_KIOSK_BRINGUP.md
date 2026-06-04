@@ -541,6 +541,27 @@ long mode) — see `SENSOR_MAPPING.md`
 for the full mapping. Append `&debug=1` to surface a diagnostic
 overlay that survives lite mode.
 
+### Hiding the mouse cursor (Wayland)
+
+The kiosk runs under Wayland, where the usual X11 cursor-hiding tricks
+(`unclutter`, `xdotool`, etc.) don't work — they target the X server,
+which isn't there. Instead, hide the pointer at the evdev layer with
+[interception-tools](https://gitlab.com/interception/linux/tools) and its
+`hideaway` plugin, driven by `udevmon`. This is compositor-agnostic: it
+intercepts the pointer device before the cursor ever reaches the
+compositor.
+
+```bash
+sudo apt install interception-tools          # provides udevmon + intercept/uinput
+# install the hideaway plugin (interception-tools-hideaway), then point
+# udevmon at it via /etc/interception/udevmon.d/*.yaml and enable the service:
+sudo systemctl enable --now udevmon
+```
+
+If the cursor reappears, check that the `udevmon` service is running
+(`systemctl status udevmon`) and that its config still routes the pointer
+device through `hideaway`.
+
 ---
 
 ## Troubleshooting quick reference
