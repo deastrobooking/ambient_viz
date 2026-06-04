@@ -4764,7 +4764,18 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       src.connect(micGain);
       micGain.connect(analyser);
       micGain.connect(transientAnalyser);
-      // do NOT connect mic to destination — would feedback
+      // Mic is NOT routed to output by default — an acoustic mic near speakers
+      // would feed back. But the Daisy is USB capture (no acoustic loop), so for
+      // debugging, ?monitor=1 (or window.__monitorOn() in the console) routes the
+      // RAW pre-gain capture to the audio output — plug headphones into the Pi to
+      // hear exactly what the browser is capturing, independent of the visuals.
+      window.__monitorOn = () => {
+        try { src.connect(audioCtx.destination); console.log('[ambient_viz] mic monitor ON'); } catch (_) {}
+      };
+      window.__monitorOff = () => {
+        try { src.disconnect(audioCtx.destination); console.log('[ambient_viz] mic monitor OFF'); } catch (_) {}
+      };
+      if (new URLSearchParams(location.search).get('monitor') === '1') window.__monitorOn();
       currentSource = src;
       statusEl.textContent = 'mic';
       playBtn.disabled = true;
