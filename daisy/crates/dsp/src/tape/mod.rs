@@ -118,7 +118,7 @@ const FAILURE_DESTROYED: FailureSnapshot = FailureSnapshot {
     speed_ips: 1.5,
     spacing_um: 18.0,
     hysteresis_drive: 0.95,
-    hiss_amount: 0.020, // slight hiss when failed
+    hiss_amount: 0.0020, // slight hiss when failed
 };
 
 #[inline]

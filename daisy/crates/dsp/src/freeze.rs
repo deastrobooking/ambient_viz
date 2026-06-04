@@ -44,7 +44,7 @@ const FADE_SECONDS: f32 = 0.01;
 /// Grain softener cutoff, Hz. A one-pole low-pass on the looped grain that
 /// rounds the sharp attacks which would otherwise repeat at the loop rate and
 /// read as a "chopped transient" / clippy bite. Lower = softer, duller ghost.
-const GRAIN_SOFTEN_HZ: f32 = 3000.0;
+const GRAIN_SOFTEN_HZ: f32 = 800.0;
 
 /// Below this level the freeze is considered inactive (record, skip glitch/sum).
 const EPS: f32 = 1.0e-4;
@@ -265,7 +265,10 @@ mod tests {
         // After the level fade settles, the constant grain holds ~1.0 — proving
         // the two triangular heads sum to 1.0 (constant amplitude, click-free).
         for &s in send.iter().skip(2 * 4000) {
-            assert!((s - 1.0).abs() < 1e-3, "frozen grain should hold ~1.0, got {s}");
+            assert!(
+                (s - 1.0).abs() < 1e-3,
+                "frozen grain should hold ~1.0, got {s}"
+            );
         }
 
         // Release → ring rolls again, send goes silent.
@@ -273,7 +276,10 @@ mod tests {
         let master = vec![0.2_f32; frames * 2];
         let mut send = vec![0.0_f32; frames * 2];
         f.process(&master, &mut send);
-        assert!(!f.active(), "freeze should be inactive after release settles");
+        assert!(
+            !f.active(),
+            "freeze should be inactive after release settles"
+        );
         assert!(
             send.iter().rev().take(8).all(|&x| x == 0.0),
             "released send must be silent"

@@ -11,6 +11,13 @@ edition = "2024"
 # build (`--no-default-features`) carries zero debug UART traffic or code.
 default = ["debug-uart"]
 debug-uart = []
+# `freeze` (OFF by default) compiles the master "freeze" parallel send: the grain
+# hold ring -> glitch tape -> return summed under the master. It's opt-in because
+# we don't currently like how it sounds; without it (the default) the ring
+# buffer, glitch tape, and the inbound CC24 -> freeze routing are all compiled
+# out, leaving the master chain as tape -> limiter. Add `--features freeze` to a
+# firmware build to bring it back.
+freeze = []
 
 [dependencies]
 dsp = { path = "../dsp" }

@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use daisy_embassy::audio::{AudioPeripherals, HALF_DMA_BUFFER_LENGTH};
 use daisy_embassy::led::UserLed;
 use daisy_embassy::{hal, new_daisy_board};
+#[cfg(feature = "freeze")]
 use dsp::freeze::{self, Freeze, GlitchTape};
 use dsp::limiter::Limiter;
 use dsp::tape::TapeProcessor;
@@ -393,11 +394,15 @@ async fn audio_task(
     };
     // Master FX chain applied to the SD stream. We run the effects standalone
     // (the synth Engine ignores external input), mirroring its master order:
-    // tape -> freeze send (glitch + return while active) -> limiter. Buffers
-    // (~155 KB) come from the SDRAM heap.
+    // tape -> [freeze send (glitch + return while active)] -> limiter. The
+    // freeze stage is compiled in only under the `freeze` feature (off by
+    // default); without it the chain is just tape -> limiter. Buffers come from
+    // the SDRAM heap.
     let mut tape = TapeProcessor::new(SAMPLE_RATE);
     tape.set_enabled(true);
+    #[cfg(feature = "freeze")]
     let mut freeze = Freeze::new(SAMPLE_RATE);
+    #[cfg(feature = "freeze")]
     let mut glitch = GlitchTape::new(SAMPLE_RATE);
     let mut limiter = Limiter::new(SAMPLE_RATE);
     // Prime tape's scratch (it resizes on first process()) so the RT callback
@@ -418,6 +423,7 @@ async fn audio_task(
                 let cb_t = embassy_time::Instant::now();
                 let n = output.len().min(HALF_DMA_BUFFER_LENGTH);
                 let mut buf = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+                #[cfg(feature = "freeze")]
                 let mut send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
 
                 // SD i16 -> f32 master block.
@@ -440,6 +446,7 @@ async fn audio_task(
                         if let Some((param, v)) = midi_map.map_cc(cc, value) {
                             match param {
                                 dsp::Param::TapeFailure => tape.set_failure(v),
+                                #[cfg(feature = "freeze")]
                                 dsp::Param::Freeze => freeze.set_amount(v),
                                 _ => {}
                             }
@@ -450,11 +457,14 @@ async fn audio_task(
                 // Master chain (mirrors Engine::process): tape -> freeze send
                 // (glitch + return while active) -> limiter.
                 tape.process(&mut buf[..n], sample_index);
-                freeze.process(&buf[..n], &mut send[..n]);
-                if freeze.active() {
-                    glitch.process(&mut send[..n]);
-                    for (o, &g) in buf[..n].iter_mut().zip(send[..n].iter()) {
-                        *o += g * freeze::FREEZE_RETURN_GAIN;
+                #[cfg(feature = "freeze")]
+                {
+                    freeze.process(&buf[..n], &mut send[..n]);
+                    if freeze.active() {
+                        glitch.process(&mut send[..n]);
+                        for (o, &g) in buf[..n].iter_mut().zip(send[..n].iter()) {
+                            *o += g * freeze::FREEZE_RETURN_GAIN;
+                        }
                     }
                 }
                 limiter.process(&mut buf[..n]);
