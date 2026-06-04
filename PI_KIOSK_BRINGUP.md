@@ -562,6 +562,60 @@ If the cursor reappears, check that the `udevmon` service is running
 (`systemctl status udevmon`) and that its config still routes the pointer
 device through `hideaway`.
 
+**Caveat — hideaway only covers a real mouse.** There are *three*
+independent cursor sources, and hideaway only handles one:
+
+1. **A physical evdev pointer** (USB mouse) → hideaway intercepts it. With
+   no mouse plugged in there is no device to intercept, so hideaway does
+   nothing here.
+2. **The page's own cursor** → `static/index.html` already sets
+   `body.lite-kiosk * { cursor: none !important; }` (active under
+   `?lite=1`). But CSS `cursor: none` only applies *once a pointer enters
+   the surface* — i.e. after a pointer device moves over the page. With no
+   mouse, that pointer-enter event never fires, so the rule never gets a
+   chance to run.
+3. **The compositor's default cursor** → with no mouse connected, the
+   Wayland compositor still parks its default pointer image on screen, and
+   neither hideaway (no device) nor the page CSS (no pointer-enter) touches
+   it. This is the stray static cursor you see over the kiosk; it only
+   disappears when Chromium quits and the compositor's idle-hide kicks in.
+
+**Fix for case 3 — a transparent cursor theme.** Make the compositor's
+default cursor image itself invisible. Both the compositor and
+Chromium-on-Wayland (Ozone) honor the same `XCURSOR_THEME`, so one blank
+theme covers both. First find which compositor is running:
+
+```bash
+echo "$XDG_CURRENT_DESKTOP"; ps -e | grep -E 'labwc|wayfire|cage|cog|sway|weston'
+```
+
+Then build a blank theme (compositor-agnostic):
+
+```bash
+sudo apt install x11-apps imagemagick      # xcursorgen + convert
+mkdir -p ~/.icons/blank/cursors
+convert -size 1x1 xc:none /tmp/blank.png
+printf '1 0 0 /tmp/blank.png\n' > /tmp/blank.cursor
+xcursorgen /tmp/blank.cursor ~/.icons/blank/cursors/left_ptr
+cd ~/.icons/blank/cursors
+for n in default arrow top_left_arrow hand1 hand2 xterm crosshair watch left_ptr_watch; do ln -sf left_ptr "$n"; done
+printf '[Icon Theme]\nName=blank\n' > ~/.icons/blank/index.theme
+```
+
+Set `XCURSOR_THEME=blank` in the session environment and restart the
+session. On recent Raspberry Pi OS (labwc) put it in
+`~/.config/labwc/environment`:
+
+```
+XCURSOR_THEME=blank
+```
+
+On older Pi OS (wayfire) you can instead enable the built-in `hide-cursor`
+/ idle plugin in `~/.config/wayfire.ini` rather than using a theme.
+
+(Steps written from the diagnosis above; not yet validated on the kiosk
+hardware — confirm during bring-up.)
+
 ---
 
 ## Troubleshooting quick reference
