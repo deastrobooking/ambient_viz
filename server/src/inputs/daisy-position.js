@@ -7,10 +7,11 @@
 //
 //  WRITE (Phase E): we tunnel sensor/freeze control to the Daisy as raw 3-byte
 //    MIDI CC frames `[0xB0, cc, value]` (the firmware frames + decodes them):
-//      - `distance_cm`  -> CC 23 (tape failure): near (≤75cm) = present =
+//      - `distance_cm`  -> CC 23 (tape failure): near (the onset) = present =
 //        pristine, far (≥ the sensor's reach) = absent = tape eaten.
-//      - `distance_far_cm` -> sets that far reach (sensor mode dependent); not
-//        forwarded to the Daisy, only shapes the distance_cm curve above.
+//      - `distance_near_cm` / `distance_far_cm` -> set the onset + far reach of
+//        that curve (config-driven / sensor-mode dependent); not forwarded to
+//        the Daisy, they only shape the distance_cm mapping above.
 //      - `freeze` (0..1, posted by the browser to /ingest) -> CC 24.
 //    On-change + rate-capped so the bulk-OUT pipe + param smoothers don't flood.
 //
@@ -29,13 +30,16 @@ const REOPEN_MS = 1000;
 const CC_TAPE_FAILURE = 23;
 const CC_FREEZE = 24;
 // Distance -> failure curve (cm). Mirror of the visualizer's presence shaping:
-// at/within NEAR_CM the tape sits at its subtle default (failure 0); past it
+// at/within the onset the tape sits at its subtle default (failure 0); past it
 // the deck falls apart with distance, fully destroyed at/beyond the far reach.
-// The far reach is NOT fixed — it tracks the sensor's distance mode (short
-// ~130 cm / long ~400 cm), published by the Python sidecar as `distance_far_cm`.
-// We default to the short-mode reach until the first value arrives.
-const NEAR_CM = 75;
+// NEITHER end is fixed — both track values published by the Python sidecar so
+// they're tunable on install day without rebuilding: `distance_near_cm` is the
+// onset (one knob in config.py, shared with the visualizer), `distance_far_cm`
+// the sensor's mode-derived reach (short ~130 cm / long ~400 cm). We default
+// until the first values arrive.
+const NEAR_DEFAULT_CM = 75;
 const FAR_DEFAULT_CM = 130;
+let nearCm = NEAR_DEFAULT_CM;
 let farCm = FAR_DEFAULT_CM;
 const MIN_WRITE_MS = 33; // cap each CC to ~30 Hz (complication #13)
 
@@ -59,11 +63,15 @@ function writeCc(cc, value) {
 
 function onChange(name, value) {
   if (typeof value !== 'number') return;
-  if (name === 'distance_far_cm') {
+  if (name === 'distance_near_cm') {
+    // Effect onset, shared with the visualizer; keep it below the far reach.
+    if (value >= 0 && value < farCm) nearCm = value;
+  } else if (name === 'distance_far_cm') {
     // Sensor's mode-derived reach; the far end of the failure ramp tracks it.
-    if (value > NEAR_CM) farCm = value;
+    if (value > nearCm) farCm = value;
   } else if (name === 'distance_cm') {
-    const failure = clamp((value - NEAR_CM) / (farCm - NEAR_CM), 0, 1);
+    const span = farCm - nearCm;
+    const failure = span > 0 ? clamp((value - nearCm) / span, 0, 1) : (value >= farCm ? 1 : 0);
     writeCc(CC_TAPE_FAILURE, failure * 127);
   } else if (name === 'freeze') {
     writeCc(CC_FREEZE, clamp(value, 0, 1) * 127);

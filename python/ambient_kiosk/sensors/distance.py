@@ -340,14 +340,15 @@ class DistanceDriver:
         # first one arrives, so initial published value is FAR (idle).
         last_valid_t = 0.0
 
-        # Re-publish the (static) far reach every ~2 s so a downstream restart
-        # (Node server / browser reconnect) re-learns it; the Node bridge dedups
-        # so the bus stays quiet between changes.
-        far_pub_every = max(1, int(config.VL53_PUBLISH_HZ * 2))
+        # Re-publish the (static) onset + far reach every ~2 s so a downstream
+        # restart (Node server / browser reconnect) re-learns them; the Node
+        # bridge dedups so the bus stays quiet between changes.
+        bounds_pub_every = max(1, int(config.VL53_PUBLISH_HZ * 2))
         loop_i = 0
 
         while not self._stop.wait(period):
-            if loop_i % far_pub_every == 0:
+            if loop_i % bounds_pub_every == 0:
+                self.ingest.publish("distance_near_cm", round(config.DISTANCE_NEAR_CM, 1))
                 self.ingest.publish("distance_far_cm", round(self._far_cm, 1))
             loop_i += 1
 

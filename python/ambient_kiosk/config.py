@@ -1,5 +1,7 @@
 """Pin assignments + tuning constants — authoritative copy of hardware-handoff.md."""
 
+import os
+
 # BCM pin numbers
 PIR_PIN = 4         # AM312 OUT
 BREATH_PIN = 17     # TLC555 pin 3 (OUTPUT) — frequency counter input
@@ -57,6 +59,16 @@ VL53_FAR_CM_SHORT = 130.0
 VL53_FAR_CM_LONG = 400.0
 VL53_FAR_CM = VL53_FAR_CM_SHORT
 VL53_NEAR_CM = 25.0
+
+# Distance→effect ONSET (cm) — the single install-day knob shared by every
+# consumer of the distance feed. At/within this distance there is no
+# distance-induced distortion (visual twist + bitmap) and the tape sits at its
+# subtle default; the effect grows from here out to the far reach. Published as
+# `distance_near_cm` so the browser and the Daisy tape bridge read one value
+# (no JS edits, no Rust rebuild). Env-overridable for tuning on the wall, e.g.
+#   DISTANCE_NEAR_CM=80 ./run_kiosk.sh
+# NOTE: distinct from VL53_NEAR_CM above (a legacy 25 cm "present" reference).
+DISTANCE_NEAR_CM = float(os.environ.get("DISTANCE_NEAR_CM", "75"))
 
 # --- VL53L5CX (multizone) ---------------------------------------------------
 # Used when VL53_SENSOR selects it. No short/long mode like the L1X — a single
