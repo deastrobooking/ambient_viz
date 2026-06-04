@@ -23,6 +23,12 @@ freeze = []
 # post-tape backing track. Struck by inbound MIDI note-on. Without it the voice,
 # its 0.25 s delay ring (~96 KB AXI heap), and the note-on routing compile out.
 bell = []
+# `voice` (OFF by default) compiles the "pain material" formant-speech utterance
+# + its own reverb, summed on top of the master before the limiter (same slot as
+# bell). Struck by an inbound ch2 MIDI note-on when the room empties. Without it
+# the SpeechSynth, reverb (~40-50 KB AXI heap), phoneme tables, and ch2 routing
+# compile out.
+voice = []
 
 [dependencies]
 dsp = { path = "../dsp" }

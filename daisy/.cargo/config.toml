@@ -35,13 +35,16 @@ bin = ["objcopy", "-p", "firmware", "--target", "thumbv7em-none-eabihf", "--rele
 # --- Production build ----------------------------------------------------
 # `--no-default-features` drops the `debug-uart` feature: no USART3 boot log,
 # health heartbeat, chip-temperature readout, or panic print — the shipping
-# kiosk firmware carries zero debug UART traffic. `--features bell` adds the
-# entry chime (the exhibit needs it). Use these instead of the plain
-# `flash` / `bin` aliases when building the exhibit image.
+# kiosk firmware carries zero debug UART traffic. `--features bell,voice` adds
+# the entry chime + the "pain material" speech voice (the exhibit needs both).
+# Use these instead of the plain `flash` / `bin` aliases when building the
+# exhibit image. NOTE: debug-uart + bell + voice together overflow the 128 KB
+# flash; the bell+voice exhibit image only fits WITHOUT debug-uart (these prod
+# aliases) — ~112 KB, ~19 KB free. See PLAN_QSPI_BOOTLOADER.md for the lift.
 #
 # INVARIANT: flash-prod and bin-prod MUST stay in parity — same crate, target,
 # profile, and feature flags. They differ ONLY in the action (probe-flash vs
 # emit a .bin); both produce the identical shipping image. If you change the
 # feature set or flags on one, change the other in the same edit.
-flash-prod = "run -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell"
-bin-prod = "objcopy -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell -- -O binary target/firmware-prod.bin"
+flash-prod = "run -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell,voice"
+bin-prod = "objcopy -p firmware --target thumbv7em-none-eabihf --release --no-default-features --features bell,voice -- -O binary target/firmware-prod.bin"

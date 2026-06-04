@@ -74,9 +74,30 @@ const BELL_REARM_EMPTY_S = envNum('BELL_REARM_EMPTY_S', 10); // hold empty this 
 const BELL_APPROACH_CM_S = envNum('BELL_APPROACH_CM_S', 2.0); // min inward speed to count as entering
 const BELL_TICK_MS = 500; // re-evaluate arming even when distance_cm is static
 
+// --- Voice-on-leave ---------------------------------------------------------
+// Speak "pain material" (the firmware's formant speech voice + reverb, struck
+// by a ch2 MIDI note-on) once when the room returns to empty after a genuine
+// visit. Mirrors the bell's dwell mechanics so a rapid in-and-out doesn't fire:
+//   - count someone as PRESENT (hysteretic) using the same near/far thresholds
+//     as the bell; only a stay of VOICE_PRESENCE_MIN_S arms a pending leave —
+//     darting through the cone never arms it.
+//   - SPEAK when the armed-pending room has then read empty continuously for
+//     VOICE_CONFIRM_EMPTY_S (a quick re-entry inside that window resets it, so
+//     boundary flicker / pacing in and out won't trigger).
+//   - one utterance per visit: speaking clears the pending flag until the room
+//     is genuinely re-occupied.
+// The voice knows several phrases; we pick one at random and send its index as
+// the ch2 note number (pitch is internal to the speech synth, so the note is
+// free to carry the phrase). Must match dsp::pain_voice::PHRASE_COUNT/_LABELS;
+// firmware wraps an out-of-range index, so drift only mis-labels logs.
+const VOICE_VELOCITY = clamp(Math.round(envNum('VOICE_VELOCITY', 100)), 1, 127);
+const VOICE_PRESENCE_MIN_S = envNum('VOICE_PRESENCE_MIN_S', 3.0); // min dwell to count as a visit
+const VOICE_CONFIRM_EMPTY_S = envNum('VOICE_CONFIRM_EMPTY_S', 2.0); // empty this long after leaving to speak
+const VOICE_PHRASES = ['pain material', 'you are alone', 'i see you', 'you do not belong here'];
+
 let port = null;
 let reopenTimer = null;
-let bellTimer = null;
+let triggerTimer = null;
 const lastCc = {}; // cc# -> last value sent (dedupe)
 const lastWriteAt = {}; // cc# -> last write time (throttle)
 
@@ -85,6 +106,12 @@ let lastDistanceCm = null; // most recent distance_cm
 let lastVelocityCmS = 0; // most recent distance_velocity_cm_s (approach negative)
 let bellArmed = false; // ready to ring on the next entry
 let emptySinceMs = null; // when the room first read empty in the current empty run
+
+// Voice-on-leave state.
+let roomOccupied = false; // hysteretic occupancy (near -> true, far -> false)
+let occupiedSinceMs = null; // when the current occupancy began
+let voicePending = false; // a genuine visit happened, awaiting a confirmed leave
+let voiceEmptySinceMs = null; // when the room first read empty after that visit
 
 function writeCc(cc, value) {
   const v = clamp(Math.round(value), 0, 127);
@@ -144,6 +171,47 @@ function updateBellTrigger(nowMs) {
   }
 }
 
+// Edge-detect "the room emptied after a real visit" and speak "pain material"
+// once. Same call cadence as the bell (distance_cm updates + the slow tick).
+function updateVoiceTrigger(nowMs) {
+  if (lastDistanceCm === null || !(farCm > 0)) return;
+  const enterThresh = farCm * (1 - BELL_ENTER_FRACTION); // near -> occupied
+  const emptyThresh = farCm * (1 - BELL_EMPTY_FRACTION); // far -> empty
+
+  // Hysteretic occupancy: flip on a clear near/far reading, hold in the band so
+  // someone walking out doesn't chatter between states.
+  if (lastDistanceCm <= enterThresh) roomOccupied = true;
+  else if (lastDistanceCm >= emptyThresh) roomOccupied = false;
+
+  if (roomOccupied) {
+    if (occupiedSinceMs === null) occupiedSinceMs = nowMs;
+    voiceEmptySinceMs = null;
+    // Only a dwelt-in presence arms the leave; darting through never does.
+    if (nowMs - occupiedSinceMs >= VOICE_PRESENCE_MIN_S * 1000) voicePending = true;
+    return;
+  }
+
+  // Room reads empty.
+  occupiedSinceMs = null;
+  if (!voicePending) return;
+  if (voiceEmptySinceMs === null) voiceEmptySinceMs = nowMs;
+  if (nowMs - voiceEmptySinceMs >= VOICE_CONFIRM_EMPTY_S * 1000) {
+    const phrase = Math.floor(Math.random() * VOICE_PHRASES.length);
+    writeNoteOn(phrase, VOICE_VELOCITY, 2); // ch2 = speech voice; note = phrase index
+    voicePending = false;
+    voiceEmptySinceMs = null;
+    console.log(
+      `daisy-position: voice "${VOICE_PHRASES[phrase]}" (room emptied, far=${farCm.toFixed(0)}cm)`,
+    );
+  }
+}
+
+// Both distance-driven triggers, evaluated together.
+function updateTriggers(nowMs) {
+  updateBellTrigger(nowMs);
+  updateVoiceTrigger(nowMs);
+}
+
 function onChange(name, value) {
   if (typeof value !== 'number') return;
   if (name === 'distance_near_cm') {
@@ -157,7 +225,7 @@ function onChange(name, value) {
     const failure = span > 0 ? clamp((value - nearCm) / span, 0, 1) : (value >= farCm ? 1 : 0);
     writeCc(CC_TAPE_FAILURE, failure * 127);
     lastDistanceCm = value;
-    updateBellTrigger(Date.now());
+    updateTriggers(Date.now());
   } else if (name === 'distance_velocity_cm_s') {
     lastVelocityCmS = value;
   } else if (name === 'freeze') {
@@ -200,20 +268,21 @@ module.exports = ({ publish, bus }) => {
     port.on('close', scheduleReopen);
   };
 
-  // Tunnel distance_cm / freeze back to the Daisy as CC; ring the bell on entry.
+  // Tunnel distance_cm / freeze back to the Daisy as CC; ring the bell on entry
+  // and speak on leave.
   if (bus) bus.on('change', (e) => onChange(e.name, e.value));
 
-  // Keep the re-arm timer advancing even while a dead-still empty room emits no
-  // distance_cm changes (it's deduped on-change upstream).
-  bellTimer = setInterval(() => updateBellTrigger(Date.now()), BELL_TICK_MS);
-  if (typeof bellTimer.unref === 'function') bellTimer.unref();
+  // Keep the entry re-arm + leave-confirm timers advancing even while a dead-
+  // still empty room emits no distance_cm changes (it's deduped on-change).
+  triggerTimer = setInterval(() => updateTriggers(Date.now()), BELL_TICK_MS);
+  if (typeof triggerTimer.unref === 'function') triggerTimer.unref();
 
   open();
 };
 
 module.exports.stop = () => {
   if (reopenTimer) { clearTimeout(reopenTimer); reopenTimer = null; }
-  if (bellTimer) { clearInterval(bellTimer); bellTimer = null; }
+  if (triggerTimer) { clearInterval(triggerTimer); triggerTimer = null; }
   if (port) {
     try { port.close(); } catch { /* */ }
     port = null;

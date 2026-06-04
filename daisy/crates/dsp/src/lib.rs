@@ -30,6 +30,7 @@ pub mod hihat;
 pub mod limiter;
 pub mod midi;
 pub mod midi_map;
+pub mod pain_voice;
 pub mod sequencer;
 pub mod svf;
 pub mod tape;
@@ -41,6 +42,7 @@ pub use fm_stab::{FmPatch, FmStab, Shaper};
 pub use hihat::HiHat;
 pub use midi::{MidiByteParser, MidiMessage};
 pub use midi_map::{MidiMap, Param, install_kiosk_bindings};
+pub use pain_voice::PainMaterialVoice;
 pub use svf::Svf;
 
 pub struct Engine {

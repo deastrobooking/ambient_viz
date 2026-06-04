@@ -24,6 +24,8 @@ use dsp::limiter::Limiter;
 use dsp::tape::TapeProcessor;
 #[cfg(feature = "bell")]
 use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _, PingPongDelay};
+#[cfg(feature = "voice")]
+use dsp::PainMaterialVoice;
 use defmt::info;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::join::join;
@@ -444,6 +446,13 @@ async fn audio_task(
         d
     };
 
+    // "Pain material" speech voice — a formant utterance through its own reverb,
+    // struck once when the room empties (Pi sends a ch2 note-on). Constructed
+    // once here; its SpeechSynth + reverb buffers allocate on the AXI heap now,
+    // never in the callback. Idle (silent, skipped) until triggered.
+    #[cfg(feature = "voice")]
+    let mut voice = PainMaterialVoice::new(SAMPLE_RATE, HALF_DMA_BUFFER_LENGTH);
+
     let mut sample_index: u64 = 0;
     // CC routing for inbound MIDI (Pi -> tape failure / freeze), shared with the
     // host via install_kiosk_bindings so a CC means the same thing in both.
@@ -463,6 +472,8 @@ async fn audio_task(
                 let mut send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
                 #[cfg(feature = "bell")]
                 let mut bell_send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+                #[cfg(feature = "voice")]
+                let mut voice_send = [0.0f32; HALF_DMA_BUFFER_LENGTH];
 
                 // SD i16 -> f32 master block.
                 for s in buf[..n].iter_mut() {
@@ -491,21 +502,34 @@ async fn audio_task(
                                 }
                             }
                         }
-                        // A note-on strikes the FM bank (the Pi/timeline decides
-                        // when, at what pitch, and which timbre). The MIDI channel
-                        // selects the patch on the shared bank: ch0 = bell, ch1 =
-                        // industrial stab. The patch is snapshotted per-voice at
-                        // strike, so swapping it here colours only this new note —
-                        // any ringing tails keep their own timbre. Same render +
-                        // delay path either way, so both mix identically.
-                        #[cfg(feature = "bell")]
+                        // A note-on strikes a foreground voice, routed by MIDI
+                        // channel (the Pi/timeline decides when + which):
+                        //   ch0 = FM bell, ch1 = industrial stab (shared FmStab
+                        //         bank; patch is snapshotted per-voice at strike,
+                        //         so swapping it colours only this new note —
+                        //         here `note` is the pitch),
+                        //   ch2 = speech voice struck on room-empty; here `note`
+                        //         selects WHICH phrase (the Pi picks at random),
+                        //         pitch is internal to the formant synth.
+                        // All mix on top, pre-limiter.
+                        #[cfg(any(feature = "bell", feature = "voice"))]
                         dsp::MidiMessage::NoteOn { channel, note, velocity } => {
-                            bell.load_patch(if channel == 1 {
-                                FmPatch::industrial()
-                            } else {
-                                FmPatch::bell()
-                            });
-                            bell.note_on(note, velocity as f32 / 127.0);
+                            let v = velocity as f32 / 127.0;
+                            match channel {
+                                #[cfg(feature = "voice")]
+                                2 => voice.trigger_phrase(note as usize, v),
+                                #[cfg(feature = "bell")]
+                                c => {
+                                    bell.load_patch(if c == 1 {
+                                        FmPatch::industrial()
+                                    } else {
+                                        FmPatch::bell()
+                                    });
+                                    bell.note_on(note, v);
+                                }
+                                #[cfg(not(feature = "bell"))]
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }
@@ -543,6 +567,18 @@ async fn audio_task(
                     bell_delay.process(&mut bell_send[..n], sample_index);
                     for (o, &w) in buf[..n].iter_mut().zip(bell_send[..n].iter()) {
                         *o += w * BELL_DELAY_WET;
+                    }
+                }
+
+                // "Pain material" speech (its own reverb) summed on top, same
+                // post-fx / pre-limiter slot as the bell. Renders only while
+                // sounding — idle blocks are skipped so the reverb costs nothing
+                // between utterances.
+                #[cfg(feature = "voice")]
+                if voice.is_active() {
+                    voice.process(&mut voice_send[..n], sample_index);
+                    for (o, &w) in buf[..n].iter_mut().zip(voice_send[..n].iter()) {
+                        *o += w;
                     }
                 }
 
