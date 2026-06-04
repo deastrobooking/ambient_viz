@@ -1387,6 +1387,27 @@ let energyAvg = 0, prevLevel = 0, onsetCool = 0;
 let flashCool = 0, pendingFlash = null;
 let pendingFreeze = false, pendingShuffle = false;
 let ditherPhaseX = 0, ditherPhaseY = 0;
+// This worker is created from a Blob URL, so its base URL is `blob:<origin>/…`.
+// A bare relative fetch('/ingest') throws "Invalid URL" against a blob: base
+// (and the .catch swallows it), so the freeze→Daisy CC never gets sent. A blob
+// URL's .origin is still the page origin, so build an absolute URL from it.
+const INGEST_URL = (self.location && self.location.origin && self.location.origin !== 'null'
+  ? self.location.origin : '') + '/ingest';
+let _ingestWarned = false;
+// Couple a visual freeze to the Daisy's audio freeze: POST {freeze:0|1} which
+// the Node bridge turns into MIDI CC24. Warns once (not per event) if the POST
+// ever fails, so a regression can't go silent the way the blob-URL bug did.
+function postFreeze(value) {
+  fetch(INGEST_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'freeze', value }),
+  }).catch((e) => {
+    if (_ingestWarned) return;
+    _ingestWarned = true;
+    console.warn('[ambient_viz/worker] freeze POST failed (url=' + INGEST_URL + '):', e && e.message);
+  });
+}
 let colorIndex = 0, kickCount = 0;
 // beatClock accumulates total elapsed beats at the authored BPM (set by
 // the `bpm` lane via CURRENT_BPM). The twist is driven by a *signed*
@@ -3481,11 +3502,7 @@ function frame(now) {
     freezeFrames -= dt;
     if (freezeFrames <= 0) {
       // Visual freeze just released — release the audio freeze (CC24 -> 0).
-      fetch('/ingest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'freeze', value: 0 }),
-      }).catch(() => {});
+      postFreeze(0);
     }
     // Twist is now applied inside the merged dither pass downstream
     // (uTwist/uPinch uniforms). Previously had an explicit applyTwist
@@ -3860,11 +3877,7 @@ function frame(now) {
       // Couple the audio freeze to this visual freeze: browser -> bridge (/ingest
       // 'freeze') -> Daisy CC24. The bridge dedupes, so re-triggers while already
       // frozen are cheap. Audio trails by the round trip (accepted flam).
-      fetch('/ingest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'freeze', value: 1 }),
-      }).catch(() => {});
+      postFreeze(1);
     }
     if (pendingShuffle) {
       if (_lattUseGL) applyBlockShuffleGL(W, H);
@@ -4726,6 +4739,17 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     }
   });
 
+  // Mic/line-in capture is typically far quieter than full-scale file
+  // playback, but the flyout/mesh3d visibility gates (visThresh vs smoothLevel)
+  // were tuned against file levels — so without a boost the 3D shapes only
+  // flicker on transient peaks. `?micgain=N` scales the analysed signal (NOT
+  // routed to output, so no feedback) to match. Live-tunable in the console via
+  // `window.__micGain.gain.value` while watching `window.__level`.
+  const MIC_GAIN = (() => {
+    const g = parseFloat(new URLSearchParams(location.search).get('micgain'));
+    return (isFinite(g) && g > 0) ? g : 1;
+  })();
+
   async function startMic() {
     ensureCtx();
     teardownSource();
@@ -4734,8 +4758,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       });
       const src = audioCtx.createMediaStreamSource(micStream);
-      src.connect(analyser);
-      src.connect(transientAnalyser);
+      const micGain = audioCtx.createGain();
+      micGain.gain.value = MIC_GAIN;
+      window.__micGain = micGain; // live calibration handle
+      src.connect(micGain);
+      micGain.connect(analyser);
+      micGain.connect(transientAnalyser);
       // do NOT connect mic to destination — would feedback
       currentSource = src;
       statusEl.textContent = 'mic';
@@ -5111,11 +5139,20 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   // Python sidecar auto-selects at boot (short ~130 cm / long ~400 cm). The
   // sidecar publishes that reach as `distance_far_cm`; we read it live below
   // and fall back to the short-mode value until the first value arrives.
-  const DISTANCE_NEAR_CM = 75;
+  // Onset (NEAR) and far reach (FAR) both come live from the Python sidecar
+  // (distance_near_cm / distance_far_cm topics) so they're tunable on install
+  // day without rebuilding anything — edit config.py once and both the visual
+  // mappings here and the Daisy tape bridge pick it up. Fall back to defaults
+  // until the first published value arrives.
+  const DISTANCE_NEAR_DEFAULT_CM = 75;
   const DISTANCE_FAR_DEFAULT_CM = 130;
+  function distanceNearCm() {
+    const n = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_near_cm;
+    return (typeof n === 'number' && n >= 0) ? n : DISTANCE_NEAR_DEFAULT_CM;
+  }
   function distanceFarCm() {
     const f = window.AMBIENT_INPUTS && window.AMBIENT_INPUTS.distance_far_cm;
-    return (typeof f === 'number' && f > DISTANCE_NEAR_CM) ? f : DISTANCE_FAR_DEFAULT_CM;
+    return (typeof f === 'number' && f > distanceNearCm()) ? f : DISTANCE_FAR_DEFAULT_CM;
   }
 
   // Distance→maxTwistDeg: distortion grows WITH distance. At/within NEAR the
@@ -5124,12 +5161,17 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
   //
   // Distance→bitmapHeight (opt-in via the distanceToBitmap toggle): resolution
   // drops WITH distance. At/within NEAR the effective bitmap equals the authored
-  // ceiling (full res); at/beyond FAR it is locked to MIN (lowest res). Eases-in
-  // so the low-res "dissociation" state builds as someone walks away, snapping
-  // back to full res when they approach. QUANTIZE rounds the effective value so
-  // we don't trigger a GPU buffer realloc on every micro-change.
+  // ceiling (full res); at/beyond FAR it is locked to MIN (lowest res). The
+  // interpolation is HARMONIC (linear in 1/height), not linear in height: the
+  // perceived pixelation scales with pixel size ∝ 1/height, so lerping height
+  // directly leaves the image near-full-res for most of the range then collapses
+  // to MIN in the last few cm — reads as an abrupt min↔max switch, not a
+  // gradient. Interpolating 1/height makes the coarsening grow evenly with
+  // distance. QUANTIZE rounds the effective value so we don't trigger a GPU
+  // buffer realloc on every micro-change (finer than the old 20 px so the
+  // low-height end, where each step is a big relative jump, stays smooth).
   const DISTANCE_BITMAP_MIN = 64;
-  const DISTANCE_BITMAP_QUANTIZE = 20;
+  const DISTANCE_BITMAP_QUANTIZE = 12;
   let _lastEffectiveBitmap = null;
 
   // Browser-side EMA on the SSE distance value. Python smoothes valid
@@ -5190,14 +5232,15 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       }
     }
     const d = _smoothedDistance;
+    const nearCm = distanceNearCm();
     const farCm = distanceFarCm();
     if (typeof d === 'number') {
-      if (d <= DISTANCE_NEAR_CM) {
+      if (d <= nearCm) {
         twistGain = 0;
       } else if (d >= farCm) {
         twistGain = 1;
       } else {
-        const x = (d - DISTANCE_NEAR_CM) / (farCm - DISTANCE_NEAR_CM);
+        const x = (d - nearCm) / (farCm - nearCm);
         twistGain = x * x;
       }
     }
@@ -5224,13 +5267,16 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     let _dbgEffective = null;
     if (manual.distanceToBitmap === 'on' && resolvedBitmap !== null) {
       let effective = resolvedBitmap;
-      if (typeof d === 'number') {
+      if (typeof d === 'number' && resolvedBitmap > DISTANCE_BITMAP_MIN) {
         let x;
-        if (d <= DISTANCE_NEAR_CM) x = 0;
+        if (d <= nearCm) x = 0;
         else if (d >= farCm) x = 1;
-        else x = (d - DISTANCE_NEAR_CM) / (farCm - DISTANCE_NEAR_CM);
-        const ease = x * x;
-        effective = resolvedBitmap - (resolvedBitmap - DISTANCE_BITMAP_MIN) * ease;
+        else x = (d - nearCm) / (farCm - nearCm);
+        // Harmonic interp: lerp 1/height so perceived pixelation (∝ 1/height)
+        // grows evenly with distance instead of collapsing at the far end.
+        const invFull = 1 / resolvedBitmap;
+        const invMin = 1 / DISTANCE_BITMAP_MIN;
+        effective = 1 / (invFull + (invMin - invFull) * x);
       }
       effective = Math.round(effective / DISTANCE_BITMAP_QUANTIZE) * DISTANCE_BITMAP_QUANTIZE;
       _dbgEffective = effective;
@@ -5248,6 +5294,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       lastApplied: _lastEffectiveBitmap,
       bitmapHeightVar: bitmapHeight,
       twistGain: twistGain,
+      nearCm: nearCm,
       farCm: farCm,
     };
     // Visible overlay when ?debug=1. Survives lite mode (which hides
@@ -5262,8 +5309,10 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
         ' ceil=' + (resolvedBitmap !== null ? resolvedBitmap : '-') +
         ' eff=' + (_dbgEffective !== null ? _dbgEffective : '-') +
         ' bh=' + bitmapHeight +
+        ' near=' + nearCm.toFixed(0) +
         ' far=' + farCm.toFixed(0) +
-        ' tg=' + twistGain.toFixed(2);
+        ' tg=' + twistGain.toFixed(2) +
+        ' lvl=' + ((window.__level || 0).toFixed(3));
     }
   }
 
@@ -5485,6 +5534,11 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       // legacy keys may lack `curve` — default to linear
       lanes[name] = arr.map(k => ({ t: k.t, v: k.v, curve: k.curve || 'linear' }));
     }
+    // Definitive "did the timeline apply" signal — count non-empty lanes and
+    // total keypoints so a kiosk run can confirm load without devtools digging.
+    const _laneCount = PARAM_NAMES.filter(n => lanes[n] && lanes[n].length).length;
+    const _kpCount = PARAM_NAMES.reduce((s, n) => s + (lanes[n] ? lanes[n].length : 0), 0);
+    console.log('[ambient_viz] timeline loaded: ' + _laneCount + ' lanes, ' + _kpCount + ' keypoints');
     renderKeys();
     return true;
   }
@@ -6510,6 +6564,7 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       applyAutomation(songT);
     }
     const b = bands();
+    window.__level = b.level; // mic-gain calibration readout (see ?micgain)
     if (renderWorker) {
       renderWorker.postMessage({
         type: 'audio',

@@ -54,11 +54,14 @@ depends on the distance mode the Python sidecar auto-selects at boot
 and falls back to 130 cm until the first value arrives. See
 [Distance mode & reach](#distance-mode--reach) below.
 
-Constants at top of the `applyAutomation` block in
-`static/index.html`:
+Both the onset (NEAR) and far reach (FAR) come **live from the sidecar**
+— `distanceNearCm()` / `distanceFarCm()` read the `distance_near_cm` /
+`distance_far_cm` topics — so they're tunable without editing JS (see
+[Tuning the onset + reach](#tuning-the-onset--reach)). Fallback constants
+at the top of the `applyAutomation` block in `static/index.html`:
 
-- `DISTANCE_NEAR_CM` = 75 (shared onset for twist + bitmap)
-- `DISTANCE_FAR_DEFAULT_CM` = 130 (fallback until `distance_far_cm` arrives)
+- `DISTANCE_NEAR_DEFAULT_CM` = 75 (until `distance_near_cm` arrives)
+- `DISTANCE_FAR_DEFAULT_CM` = 130 (until `distance_far_cm` arrives)
 
 ### `distance_cm` → `bitmapHeight` (opt-in)
 
@@ -68,12 +71,13 @@ distance.
 
 | Distance | Effective `bitmapHeight` |
 |---|---|
-| ≤ 75 cm | authored ceiling |
+| ≤ NEAR | authored ceiling |
 | ≥ FAR | 64 |
-| 75-FAR cm | `ceiling - (ceiling - 64) · x²` where `x = (d-75)/(FAR-75)` |
+| NEAR-FAR | `1 / (1/ceiling + (1/64 − 1/ceiling)·x)`, `x = (d−NEAR)/(FAR−NEAR)` |
 
-`FAR` is the same mode-derived reach as the twist mapping (≈130 cm short
-/ ≈400 cm long, from `distance_far_cm`).
+`NEAR` and `FAR` are the shared onset / mode-derived reach (NEAR default
+75 cm; FAR ≈130 cm short / ≈400 cm long, from `distance_near_cm` /
+`distance_far_cm`). The interpolation is harmonic — see below.
 
 Curve is *ease-in toward MIN* — full res within 75 cm, then the low-res
 "dissociation" state builds as someone leaves, hitting the floor at the
@@ -94,12 +98,16 @@ Enable mechanisms (in precedence order):
 3. **Default**: `off`. The visualizer behaves exactly as before
    without the mapping.
 
-Onset (`DISTANCE_NEAR_CM` = 75) and FAR (`distanceFarCm()`) are shared
-with the twist mapping. Bitmap-specific constants at the top of the
-`applyAutomation` block in `static/index.html`:
+Onset (`distanceNearCm()`) and FAR (`distanceFarCm()`) are shared with
+the twist mapping. The height is interpolated **harmonically** (linear in
+`1/height`), not linearly: perceived pixelation scales with pixel size
+∝ `1/height`, so a linear height ramp (or worse, a quadratic ease) looks
+near-full-res for most of the range then collapses to MIN at the far end —
+an abrupt switch, not a gradient. Bitmap-specific constants at the top of
+the `applyAutomation` block in `static/index.html`:
 
 - `DISTANCE_BITMAP_MIN` = 64 (pixel floor)
-- `DISTANCE_BITMAP_QUANTIZE` = 20 (px step)
+- `DISTANCE_BITMAP_QUANTIZE` = 12 (px step)
 
 ## Which sensor (VL53L1X or VL53L5CX)
 
@@ -149,6 +157,26 @@ the Python sidecar from an ambient-IR sample (`VL53_AUTO_MODE`,
   read `None` somewhere around 2.5–3.6 m → which snaps to the far value →
   max effect anyway. So the smooth ramp covers the trackable range and
   "very far / absent" lands on full destruction regardless.
+
+## Tuning the onset + reach
+
+The two endpoints of every distance→effect mapping — the **onset** (NEAR,
+where distortion begins) and the **far reach** (FAR, where it saturates) —
+are published by the Python sidecar and read by *both* the browser
+(twist + bitmap) and the Daisy tape bridge. So there is **one knob each**,
+no JS edits, and no Rust rebuild (the firmware only ever receives a
+normalised 0..1 tape-failure over MIDI; all distance math is in JS):
+
+| Endpoint | Topic | Source of truth | Tune by |
+|---|---|---|---|
+| onset | `distance_near_cm` | `config.py` `DISTANCE_NEAR_CM` (default 75) | edit config, or `DISTANCE_NEAR_CM=80 ./run_kiosk.sh` |
+| far reach | `distance_far_cm` | `config.py` `VL53_FAR_CM_SHORT`/`_LONG` (sensor-mode derived) | edit config |
+
+Both are re-published every ~2 s, so a Node/browser restart re-learns
+them; the browser falls back to `DISTANCE_NEAR_DEFAULT_CM` / 
+`DISTANCE_FAR_DEFAULT_CM` and the tape bridge to its own defaults until the
+first value arrives. Install-day flow: change the value, restart the
+sidecar, confirm via the `near=` / `far=` fields in the `?debug=1` overlay.
 
 ## Smoothing
 
@@ -231,7 +259,7 @@ overlay showing live mapping state. Works in lite mode (where the
 dev panel is hidden):
 
 ```
-toggle=on raw=119.0 d=120.0 ceil=1080 eff=400 bh=400 far=130 tg=0.67
+toggle=on raw=119.0 d=120.0 ceil=1080 eff=72 bh=72 near=75 far=130 tg=0.67
 ```
 
 | Field | Meaning |
@@ -242,6 +270,7 @@ toggle=on raw=119.0 d=120.0 ceil=1080 eff=400 bh=400 far=130 tg=0.67
 | `ceil` | Authored bitmap ceiling (slider/lane value) |
 | `eff` | Computed effective bitmap (post quantization) |
 | `bh` | Actual `bitmapHeight` runtime variable in computeDpr() |
+| `near` | Active onset (`distance_near_cm`; default 75) |
 | `far` | Active FAR reach (`distance_far_cm`; 130 short / 400 long mode) |
 | `tg` | `twistGain` factor multiplying `maxTwistDeg` |
 
@@ -257,10 +286,11 @@ inspection, regardless of `?debug=1`.
 
 | Knob | Where | Default | Effect of increase |
 |---|---|---|---|
-| `DISTANCE_NEAR_CM` | static/index.html | 75 | Onset distance — no distortion out to here (shared twist + bitmap) |
+| `DISTANCE_NEAR_CM` | config.py (env-overridable) | 75 | **Onset** — no distortion out to here. Single source of truth, published as `distance_near_cm` to browser + tape bridge |
+| `DISTANCE_NEAR_DEFAULT_CM` | static/index.html | 75 | Browser onset fallback until `distance_near_cm` arrives |
 | `DISTANCE_FAR_DEFAULT_CM` | static/index.html | 130 | FAR fallback until `distance_far_cm` arrives |
 | `DISTANCE_BITMAP_MIN` | static/index.html | 64 | Lower = more aggressive low-res floor when far |
-| `DISTANCE_BITMAP_QUANTIZE` | static/index.html | 20 | Fewer resize events, but visibly coarser steps |
+| `DISTANCE_BITMAP_QUANTIZE` | static/index.html | 12 | Fewer resize events, but visibly coarser steps |
 | `DISTANCE_SMOOTH_TAU_S` | static/index.html | 0.25 | Slower response, less noise |
 | `NO_TARGET_TIMEOUT_S` | distance.py | 0.6 | Rides out longer dropouts at cost of slower "walked away" |
 | `VL53_SMOOTH_ALPHA` | config.py | 0.25 | Higher = more responsive (more noise) |
