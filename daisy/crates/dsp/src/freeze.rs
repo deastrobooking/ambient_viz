@@ -14,10 +14,13 @@
 //!   layer from popping in/out.
 //!
 //! Click-free looping uses **two read heads half a loop apart**, each
-//! triangular-windowed; the windows sum to exactly `1.0`. The read index is
-//! offset by the frozen `write` position so each window's zero-gain point lands
-//! on the **ring seam** (the wrap between newest and oldest captured sample) —
-//! that masks the seam and blends the grain's end into its start.
+//! smootherstep-windowed (a raised-cosine-equivalent crossfade); the windows
+//! sum to exactly `1.0` and have zero derivative at the seam and peak. The read
+//! index is offset by the frozen `write` position so each window's zero-gain
+//! point lands on the **ring seam** (the wrap between newest and oldest captured
+//! sample) — that masks the seam and blends the grain's end into its start. The
+//! looped grain is then run through a gentle one-pole softener that rounds the
+//! repeated transients (the "clippy" bite) before the level fade.
 //!
 //! The producer is cheap (records the ring, or reads the loop); the expensive
 //! glitch-tape + sum are gated by [`Freeze::active`] so they run only while a
@@ -26,6 +29,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::f32::consts::TAU;
 use libm::expf;
 
 use crate::tape::{Chew, WowFlutter};
@@ -36,6 +40,11 @@ pub const LOOP_SECONDS: f32 = 0.3;
 
 /// Level fade time, seconds — ramps the ghost in/out so it doesn't pop.
 const FADE_SECONDS: f32 = 0.01;
+
+/// Grain softener cutoff, Hz. A one-pole low-pass on the looped grain that
+/// rounds the sharp attacks which would otherwise repeat at the loop rate and
+/// read as a "chopped transient" / clippy bite. Lower = softer, duller ghost.
+const GRAIN_SOFTEN_HZ: f32 = 3000.0;
 
 /// Below this level the freeze is considered inactive (record, skip glitch/sum).
 const EPS: f32 = 1.0e-4;
@@ -62,6 +71,11 @@ pub struct Freeze {
     level: f32,
     /// Per-sample one-pole fade coefficient.
     fade: f32,
+    /// Per-channel one-pole LPF state for the grain softener.
+    lpf_l: f32,
+    lpf_r: f32,
+    /// Per-sample one-pole coefficient for the grain softener.
+    soften: f32,
 }
 
 impl Freeze {
@@ -76,6 +90,9 @@ impl Freeze {
             amount: 0.0,
             level: 0.0,
             fade: 1.0 - expf(-1.0 / (FADE_SECONDS * sample_rate)),
+            lpf_l: 0.0,
+            lpf_r: 0.0,
+            soften: 1.0 - expf(-TAU * GRAIN_SOFTEN_HZ / sample_rate),
         }
     }
 
@@ -86,6 +103,8 @@ impl Freeze {
         let a = amount.clamp(0.0, 1.0);
         if a > 0.0 && self.amount == 0.0 {
             self.read = 0.0; // rising edge: start the loop from the seam
+            self.lpf_l = 0.0; // clear softener memory so the grain eases in clean
+            self.lpf_r = 0.0;
         }
         self.amount = a;
     }
@@ -133,13 +152,27 @@ impl Freeze {
             }
             let pb = (base + rb as usize) % self.frames;
 
+            // Triangular crossfade weight for head A; head B is its complement.
             let va = 2.0 * (self.read / n) - 1.0;
-            let ga = 1.0 - if va < 0.0 { -va } else { va };
-            let vb = 2.0 * (rb / n) - 1.0;
-            let gb = 1.0 - if vb < 0.0 { -vb } else { vb };
+            let tri_a = 1.0 - if va < 0.0 { -va } else { va };
+            // Raised-cosine-equivalent smoothing: smootherstep the triangle.
+            // S(t)+S(1-t)=1, so the pair still sums to exactly 1.0, but the
+            // derivative is flattened to zero at both the loop seam and the
+            // window peak (C2) — softer than the bare triangular corner, with
+            // no per-sample cosf (cf. the tape's fast-cos cost note).
+            let ga = tri_a * tri_a * tri_a * (tri_a * (tri_a * 6.0 - 15.0) + 10.0);
+            let gb = 1.0 - ga;
 
-            s[0] = (self.buf[2 * pa] * ga + self.buf[2 * pb] * gb) * self.level;
-            s[1] = (self.buf[2 * pa + 1] * ga + self.buf[2 * pb + 1] * gb) * self.level;
+            // Pre-soften the grain: a one-pole LPF rounds the sharp attacks that
+            // otherwise repeat twice per loop (~6.7 Hz here) — the source of the
+            // "chopped transient" bite.
+            let dry_l = self.buf[2 * pa] * ga + self.buf[2 * pb] * gb;
+            let dry_r = self.buf[2 * pa + 1] * ga + self.buf[2 * pb + 1] * gb;
+            self.lpf_l += self.soften * (dry_l - self.lpf_l);
+            self.lpf_r += self.soften * (dry_r - self.lpf_r);
+
+            s[0] = self.lpf_l * self.level;
+            s[1] = self.lpf_r * self.level;
 
             self.read += 1.0;
             if self.read >= n {
