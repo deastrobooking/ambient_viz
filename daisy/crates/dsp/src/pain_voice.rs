@@ -28,7 +28,9 @@ use infinitedsp_core::synthesis::speech::{Phoneme, SpeechSynth};
 /// silence between words). These are rough formant approximations.
 const PHRASES: &[&[&str]] = &[
     // "pain material" (ma-TEE-ree-a-l)
-    &["P", "AI", "N", "GAP", "GAP", "M", "A", "T", "EE", "R", "I", "A", "L"],
+    &[
+        "P", "AI", "N", "GAP", "GAP", "M", "A", "T", "EE", "R", "I", "A", "L",
+    ],
     // "you are alone" ("u r alone")
     &["Y", "U", "GAP", "A", "R", "GAP", "GAP", "U", "L", "O", "N"],
     // "i see you"
@@ -43,13 +45,15 @@ const PHRASES: &[&[&str]] = &[
         "H", "A", "GAP", "H", "A", "GAP", "H", "A", "GAP", //
         "H", "A", "GAP", "H", "A",
     ],
-    // "eins zwei drei vier" (German "ains tsvai drai feer")
+    // "eins zwei drei vier" (German "ains svai drai feer")
     &[
-        "AI", "N", "S", "GAP", "T", "S", "V", "AI", "GAP", //
+        "AI", "N", "S", "GAP", "S", "V", "AI", "GAP", //
         "D", "R", "AI", "GAP", "F", "EE", "R",
     ],
-    // "don't come back"
-    &["D", "O", "N", "T", "GAP", "K", "U", "M", "GAP", "B", "A", "K"],
+    // "do not come back"
+    &[
+        "D", "U", "GAP", "N", "O", "T", "GAP", "K", "U", "M", "GAP", "B", "A", "K",
+    ],
     // "you are not welcome"
     &[
         "Y", "U", "GAP", "A", "R", "GAP", "N", "O", "T", "GAP", //
@@ -74,6 +78,16 @@ const PHRASES: &[&[&str]] = &[
     ],
     // "you are weak"
     &["Y", "U", "GAP", "A", "R", "GAP", "W", "EE", "K"],
+    // "time space transmat"
+    &[
+        "T", "AI", "M", "GAP", "S", "P", "AI", "S", "GAP", //
+        "T", "R", "A", "N", "S", "M", "A", "T",
+    ],
+    // "avoid eye contact"
+    &[
+        "U", "V", "O", "I", "D", "GAP", "AI", "GAP", //
+        "K", "O", "N", "T", "A", "K", "T",
+    ],
 ];
 
 /// Human-readable labels, parallel to [`PHRASES`] (for logs / auditioning).
@@ -91,6 +105,8 @@ pub const PHRASE_LABELS: &[&str] = &[
     "you are fake",
     "everybody sees through you",
     "you are weak",
+    "time space transmat",
+    "avoid eye contact",
 ];
 
 /// Number of phrases the voice can speak. The trigger index wraps modulo this.
@@ -257,7 +273,11 @@ mod tests {
 
     #[test]
     fn every_phrase_speaks_then_falls_silent_and_deactivates() {
-        assert_eq!(PHRASE_COUNT, PHRASE_LABELS.len(), "labels parallel to phrases");
+        assert_eq!(
+            PHRASE_COUNT,
+            PHRASE_LABELS.len(),
+            "labels parallel to phrases"
+        );
 
         let sr = 48_000.0;
         let block = 64; // interleaved stereo samples
@@ -288,8 +308,14 @@ mod tests {
                 idx += (buf.len() / 2) as u64;
                 blocks += 1;
             }
-            assert!(max_abs > 1e-4, "phrase {phrase} produced audible output (peak {max_abs})");
-            assert!(!v.is_active(), "phrase {phrase} deactivated after tail (blocks={blocks})");
+            assert!(
+                max_abs > 1e-4,
+                "phrase {phrase} produced audible output (peak {max_abs})"
+            );
+            assert!(
+                !v.is_active(),
+                "phrase {phrase} deactivated after tail (blocks={blocks})"
+            );
         }
     }
 

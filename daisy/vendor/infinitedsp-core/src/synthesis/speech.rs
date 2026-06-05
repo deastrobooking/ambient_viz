@@ -167,11 +167,13 @@ static PHONEME_S: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::S.1,
     VowelFilter::S.2,
     0.0,
-    // PATCH (vendored): de-essed. Noise drive 4.5 -> 2.6 and amp 1.3 -> 1.1 —
-    // the S formants sit at 6.5-9.8 kHz, so the original level was too sibilant.
-    2.6,
+    // PATCH (vendored): de-essed twice. Noise drive 4.5 -> 2.6 -> 2.2 and amp
+    // 1.3 -> 1.1 -> 0.85 — the S formants sit at 6.5-9.8 kHz, so even the first
+    // pass was still too sibilant. Kept noise > 2.0 to preserve the broad-band
+    // hiss (the q-select at the exciter flips to a narrow whistle below 2.0).
+    2.2,
     1.0,
-    1.1,
+    0.85,
     true,
 )];
 static PHONEME_Z: [Phoneme; 1] = [Phoneme::new(
@@ -180,9 +182,9 @@ static PHONEME_Z: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::Z.1,
     VowelFilter::Z.2,
     0.6,
-    2.5, // PATCH (vendored): de-essed, noise 3.5 -> 2.5.
+    2.1, // PATCH (vendored): de-essed twice, noise 3.5 -> 2.5 -> 2.1.
     0.9,
-    1.2,
+    0.95, // amp 1.2 -> 0.95.
     true,
 )];
 static PHONEME_F: [Phoneme; 1] = [Phoneme::new(
@@ -235,10 +237,10 @@ static PHONEME_SH: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::SH.1,
     VowelFilter::SH.2,
     0.0,
-    // PATCH (vendored): de-essed, noise 4.0 -> 2.8, amp 1.3 -> 1.1.
-    2.8,
+    // PATCH (vendored): de-essed twice, noise 4.0 -> 2.8 -> 2.3, amp 1.3 -> 1.1 -> 0.85.
+    2.3,
     1.0,
-    1.1,
+    0.85,
     true,
 )];
 static PHONEME_R: [Phoneme; 1] = [Phoneme::new(
@@ -332,15 +334,16 @@ static PHONEME_CH: [Phoneme; 2] = [
         VowelFilter::SH.1,
         VowelFilter::SH.2,
         0.0,
-        2.8, // PATCH (vendored): de-essed, noise 3.8 -> 2.8.
+        2.3, // PATCH (vendored): de-essed twice, noise 3.8 -> 2.8 -> 2.3.
         1.0,
-        1.2,
+        0.95, // amp 1.2 -> 0.95.
         true,
     ),
 ];
 static PHONEME_J: [Phoneme; 2] = [
     Phoneme::new(40.0, 250.0, 1000.0, 2000.0, 0.5, 0.0, 0.9, 0.6, true),
-    Phoneme::new(150.0, 2000.0, 3200.0, 5000.0, 0.4, 3.2, 0.9, 1.1, true),
+    // PATCH (vendored): de-essed twice, noise 3.2 -> 2.6, amp 1.1 -> 0.9.
+    Phoneme::new(150.0, 2000.0, 3200.0, 5000.0, 0.4, 2.6, 0.9, 0.9, true),
 ];
 static PHONEME_D: [Phoneme; 2] = [
     Phoneme::new(40.0, 200.0, 1000.0, 2000.0, 0.5, 0.0, 1.0, 0.6, true),
@@ -391,6 +394,15 @@ static PHONEME_AI: [Phoneme; 2] = [
     ),
 ];
 
+// PATCH (vendored): de-harsh. The noise exciter is flat white noise (energy to
+// Nyquist), so every fricative/plosive burst carries a bright >8 kHz "air" shelf
+// the formant band-passes leak through — that, not loudness, is the harshness
+// the per-phoneme amp cuts couldn't reach. A one-pole low-pass on the noise path
+// (shared by F/S/Z/SH/CH/J and the T/K/P/etc. release bursts) tilts that top
+// down for all of them at once. Lower NOISE_LP_HZ = darker/duller; raise toward
+// Nyquist = back toward the original brightness. RC one-pole — no transcendental.
+const NOISE_LP_HZ: f32 = 5500.0;
+
 /// A complete Speech Synthesizer component.
 ///
 /// Implements a formant-based vocal synthesizer that can play back sequences of phonemes.
@@ -412,8 +424,19 @@ pub struct SpeechSynth<'a> {
     voice_stack: Stack,
     sub_osc: Oscillator,
     noise_gen: Oscillator,
+    // PATCH (vendored): one-pole low-pass state + coeff for the noise exciter,
+    // de-harshing all fricatives/plosive bursts. See NOISE_LP_HZ.
+    noise_lp_state: f32,
+    noise_lp_coeff: f32,
     just_entered_phoneme: bool,
     is_finished: bool,
+}
+
+// PATCH (vendored): RC one-pole coefficient a = 2πfc / (fs + 2πfc) for the noise
+// low-pass — computed once per sample-rate change, no expf needed.
+fn noise_lp_coeff(sample_rate: f32) -> f32 {
+    let w = 2.0 * core::f32::consts::PI * NOISE_LP_HZ;
+    w / (sample_rate + w)
 }
 
 impl<'a> SpeechSynth<'a> {
@@ -463,6 +486,8 @@ impl<'a> SpeechSynth<'a> {
             voice_stack,
             sub_osc,
             noise_gen,
+            noise_lp_state: 0.0,
+            noise_lp_coeff: noise_lp_coeff(sample_rate),
             just_entered_phoneme: false,
             is_finished: true,
         }
@@ -574,7 +599,11 @@ impl<'a> FrameProcessor<Mono> for SpeechSynth<'a> {
                 * 0.25;
 
             let sub_out = self.sub_osc.tick(p * 0.5);
-            let noise_out = self.noise_gen.tick(0.0);
+            // PATCH (vendored): de-harsh. One-pole low-pass the white noise before
+            // it excites the formants, taming the bright >NOISE_LP_HZ hiss shared
+            // by all fricatives/plosive bursts.
+            self.noise_lp_state += self.noise_lp_coeff * (self.noise_gen.tick(0.0) - self.noise_lp_state);
+            let noise_out = self.noise_lp_state;
 
             let voiced = voiced_stack * 1.0 + sub_out * 0.6;
             let exciter = voiced * self.cur_voice + noise_out * self.cur_noise;
@@ -602,6 +631,7 @@ impl<'a> FrameProcessor<Mono> for SpeechSynth<'a> {
 
     fn set_sample_rate(&mut self, sr: f32) {
         self.sample_rate = sr;
+        self.noise_lp_coeff = noise_lp_coeff(sr); // PATCH (vendored): de-harsh.
         self.vowel_filter.set_sample_rate(sr);
         self.stutter.set_sample_rate(sr);
         self.voice_stack.set_sample_rate(sr);
@@ -612,6 +642,7 @@ impl<'a> FrameProcessor<Mono> for SpeechSynth<'a> {
     fn reset(&mut self) {
         self.current_idx = 0;
         self.time_in_phoneme = 0.0;
+        self.noise_lp_state = 0.0; // PATCH (vendored): de-harsh.
         self.vowel_filter.reset();
         self.stutter.reset();
         self.voice_stack.reset();
