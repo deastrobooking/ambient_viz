@@ -167,9 +167,11 @@ static PHONEME_S: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::S.1,
     VowelFilter::S.2,
     0.0,
-    4.5,
+    // PATCH (vendored): de-essed. Noise drive 4.5 -> 2.6 and amp 1.3 -> 1.1 —
+    // the S formants sit at 6.5-9.8 kHz, so the original level was too sibilant.
+    2.6,
     1.0,
-    1.3,
+    1.1,
     true,
 )];
 static PHONEME_Z: [Phoneme; 1] = [Phoneme::new(
@@ -178,7 +180,7 @@ static PHONEME_Z: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::Z.1,
     VowelFilter::Z.2,
     0.6,
-    3.5,
+    2.5, // PATCH (vendored): de-essed, noise 3.5 -> 2.5.
     0.9,
     1.2,
     true,
@@ -233,9 +235,10 @@ static PHONEME_SH: [Phoneme; 1] = [Phoneme::new(
     VowelFilter::SH.1,
     VowelFilter::SH.2,
     0.0,
-    4.0,
+    // PATCH (vendored): de-essed, noise 4.0 -> 2.8, amp 1.3 -> 1.1.
+    2.8,
     1.0,
-    1.3,
+    1.1,
     true,
 )];
 static PHONEME_R: [Phoneme; 1] = [Phoneme::new(
@@ -329,7 +332,7 @@ static PHONEME_CH: [Phoneme; 2] = [
         VowelFilter::SH.1,
         VowelFilter::SH.2,
         0.0,
-        3.8,
+        2.8, // PATCH (vendored): de-essed, noise 3.8 -> 2.8.
         1.0,
         1.2,
         true,
