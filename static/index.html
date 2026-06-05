@@ -1788,10 +1788,16 @@ function setupNoiseRing() {
 
 function spawnSliceBurst(intensity) {
   const base = SLICE_BURST_MIN + Math.floor(Math.random() * (SLICE_BURST_MAX - SLICE_BURST_MIN + 1));
-  const count = Math.max(0, Math.round(base * SLICE_BURST_SCALE));
+  // sliceBurstScale is deliberately gentle (1/4 strength): even low values
+  // were producing too many bars, so the knob scales the count at 0.25×.
+  const count = Math.max(0, Math.round(base * SLICE_BURST_SCALE * 0.25));
+  // Spread the bars across the full height: one per band of H/count, jittered
+  // within its band, so a burst spans the screen instead of clumping at random
+  // y's (which leaves dense clusters and large gaps).
+  const band = count > 0 ? H / count : H;
   for (let i = 0; i < count; i++) {
     slices.push({
-      y: Math.random() * H,
+      y: (i + Math.random()) * band,
       h: 6 + Math.random() * 110,
       dx: (Math.random() - 0.5) * W * (0.20 + intensity * 0.55),
       life: 5 + Math.floor(Math.random() * 16),
