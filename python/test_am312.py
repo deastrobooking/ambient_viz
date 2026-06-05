@@ -29,7 +29,9 @@ production defaults MOTION_PRESENCE OFF. Override per run with `--motion off`
 (falls back to distance-only, same as the kiosk without the flag). Env knobs
 honored (match the JS): MOTION_HOLD_S, BELL_ENTER_FRACTION, BELL_EMPTY_FRACTION,
 BELL_REARM_RECEDE_S, BELL_COOLDOWN_S, BELL_APPROACH_CM_S, BELL_APPROACH_SUSTAIN,
-VOICE_PRESENCE_MIN_S, VOICE_CONFIRM_EMPTY_S.
+VOICE_PRESENCE_MIN_S, VOICE_CONFIRM_EMPTY_S, and the periodic-voice knobs
+VOICE_TOLL, VOICE_TOLL_MIN_S, VOICE_TOLL_MAX_S, VOICE_TOLL_SKIP_PROB,
+VOICE_TOLL_ACTIVE_S, VOICE_MIN_GAP_S.
 
 NOTE: this tool does NOT apply the AM312's 60 s boot suppression — you want to
 see the sensors toggle immediately during bringup. The kiosk suppresses motion
@@ -40,6 +42,7 @@ import argparse
 import collections
 import logging
 import os
+import random
 import sys
 import time
 
@@ -89,6 +92,14 @@ class CombinedTriggerMonitor:
         self.motion_presence = motion_presence
         self.hold_s = _env_num("MOTION_HOLD_S", 20) if hold_s is None else hold_s
 
+        # Periodic "active room" voice config.
+        self.voice_toll = _env_bool("VOICE_TOLL", True)
+        self.voice_toll_min_s = max(0.0, _env_num("VOICE_TOLL_MIN_S", 300))
+        self.voice_toll_max_s = max(self.voice_toll_min_s, _env_num("VOICE_TOLL_MAX_S", 600))
+        self.voice_toll_skip = _env_num("VOICE_TOLL_SKIP_PROB", 0.25)
+        self.voice_toll_active_s = max(0.0, _env_num("VOICE_TOLL_ACTIVE_S", 30))
+        self.voice_min_gap_s = max(0.0, _env_num("VOICE_MIN_GAP_S", 20))
+
         # Live inputs.
         self.dist = None
         self.vel = 0.0
@@ -105,6 +116,8 @@ class CombinedTriggerMonitor:
         self.occupied_since = None
         self.voice_pending = False
         self.voice_empty_since = None
+        self.next_murmur_t = None
+        self.last_voice_t = float("-inf")  # shared by exit voice + murmur (min-gap)
 
         # Derived display values.
         self.enter = None
@@ -156,11 +169,17 @@ class CombinedTriggerMonitor:
             self._t0 = now
         self._run(now, fresh=False)
 
-    # --- the JS updateTriggers (computeOccupancy -> bell -> voice) ---------
+    # --- the JS updateTriggers (computeOccupancy -> bell -> voice -> murmur) -
     def _run(self, now, fresh):
         self._compute_occupancy(now)
         self._update_bell(now, fresh)
         self._update_voice(now)
+        self._update_voice_murmur(now)
+
+    def _speak(self, now, reason):
+        # Mirrors speakPhrase(): stamps the shared min-gap timestamp + logs.
+        self.last_voice_t = now
+        self._log(now, f"** VOICE ** {reason}")
 
     def _compute_occupancy(self, now):
         prev = self.room_occupied
@@ -245,9 +264,39 @@ class CombinedTriggerMonitor:
         if self.voice_empty_since is None:
             self.voice_empty_since = now
         if (now - self.voice_empty_since) >= self.voice_confirm_s:
-            self._log(now, "** VOICE ** room emptied after a visit")
+            self._speak(now, "room emptied after a visit")
             self.voice_pending = False
             self.voice_empty_since = None
+
+    def _schedule_next_murmur(self, now):
+        self.next_murmur_t = now + random.uniform(self.voice_toll_min_s, self.voice_toll_max_s)
+
+    def _update_voice_murmur(self, now):
+        # Mirrors updateVoiceMurmur(): periodic phrase while occupied AND recently
+        # active, skipping some. Holds "due" through a lull and speaks at the next
+        # motion. (5–10 min by default — won't appear in the short scenario; use
+        # --mock/--live with small VOICE_TOLL_MIN_S/MAX_S to watch the cadence.)
+        if not self.voice_toll:
+            return
+        if not self.room_occupied:
+            self.next_murmur_t = None  # reset; re-rolls on re-entry
+            return
+        if self.next_murmur_t is None:
+            self._schedule_next_murmur(now)
+            return
+        if now < self.next_murmur_t:
+            return
+        active = self.motion_active or (now - self.last_motion_t) <= self.voice_toll_active_s
+        if not active:
+            return  # stay due; fire at the next motion
+        if (now - self.last_voice_t) < self.voice_min_gap_s:
+            return
+        if random.random() < self.voice_toll_skip:
+            self._schedule_next_murmur(now)
+            self._log(now, "voice murmur skipped")
+            return
+        self._speak(now, "active room (periodic)")
+        self._schedule_next_murmur(now)
 
     # --- display -----------------------------------------------------------
     def status_lines(self):

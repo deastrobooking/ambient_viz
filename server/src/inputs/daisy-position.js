@@ -155,6 +155,21 @@ const VOICE_PHRASES = [
   'you are weak',
 ];
 
+// --- Periodic voice ("active room") -----------------------------------------
+// While the room is occupied AND there's RECENT MOTION (an active room, not a
+// still one), murmur a random phrase at a slow random interval, skipping some —
+// the "I'm watching the crowd" surveillance layer, distinct from the once-per-
+// visit exit voice. Once the interval elapses it holds "due" and waits for the
+// next motion, so it speaks *at* activity rather than into a lull. Shares the
+// speech path + a min-gap with the exit voice so two utterances never stack.
+// Self-disabling: with no AM312 motion (sensor absent/quiet) it never fires.
+const VOICE_TOLL = envBool('VOICE_TOLL', true); // master switch
+const VOICE_TOLL_MIN_S = Math.max(0, envNum('VOICE_TOLL_MIN_S', 300)); // shortest gap (5 min)
+const VOICE_TOLL_MAX_S = Math.max(VOICE_TOLL_MIN_S, envNum('VOICE_TOLL_MAX_S', 600)); // longest (10 min)
+const VOICE_TOLL_SKIP_PROB = clamp(envNum('VOICE_TOLL_SKIP_PROB', 0.25), 0, 1); // chance a due murmur is skipped
+const VOICE_TOLL_ACTIVE_S = Math.max(0, envNum('VOICE_TOLL_ACTIVE_S', 30)); // "recent motion" window to count as active
+const VOICE_MIN_GAP_S = Math.max(0, envNum('VOICE_MIN_GAP_S', 20)); // min gap between ANY two spoken phrases (murmur or exit)
+
 let port = null;
 let reopenTimer = null;
 let triggerTimer = null;
@@ -175,6 +190,10 @@ let roomOccupied = false; // hysteretic occupancy (near -> true, far -> false)
 let occupiedSinceMs = null; // when the current occupancy began
 let voicePending = false; // a genuine visit happened, awaiting a confirmed leave
 let voiceEmptySinceMs = null; // when the room first read empty after that visit
+
+// Periodic "active room" voice state + the shared utterance timestamp.
+let nextMurmurMs = null; // scheduled next murmur (null when room empty/disabled)
+let lastVoiceMs = -Infinity; // last spoken phrase (murmur OR exit) — shared min-gap
 
 // AM312 motion-presence state (only consulted when MOTION_PRESENCE is on).
 let motionActive = false; // latest OR'd AM312 state (true = a cone sees motion)
@@ -312,6 +331,20 @@ function computeOccupancy(nowMs) {
   if (motionPresent(nowMs)) roomOccupied = true;
 }
 
+// Roll the next murmur to a random point in [VOICE_TOLL_MIN_S, VOICE_TOLL_MAX_S].
+function scheduleNextMurmur(nowMs) {
+  nextMurmurMs = nowMs + (VOICE_TOLL_MIN_S + Math.random() * (VOICE_TOLL_MAX_S - VOICE_TOLL_MIN_S)) * 1000;
+}
+
+// One spoken phrase (ch2 note-on; the note IS the phrase index). Shared by the
+// exit voice and the periodic murmur; stamps the shared min-gap timestamp.
+function speakPhrase(nowMs, reason) {
+  const phrase = Math.floor(Math.random() * VOICE_PHRASES.length);
+  writeNoteOn(phrase, VOICE_VELOCITY, 2); // ch2 = speech voice; note = phrase index
+  lastVoiceMs = nowMs;
+  console.log(`daisy-position: voice "${VOICE_PHRASES[phrase]}" (${reason})`);
+}
+
 // Edge-detect "the room emptied after a real visit" and speak "pain material"
 // once. Reads the occupancy that computeOccupancy() has already set.
 function updateVoiceTrigger(nowMs) {
@@ -328,14 +361,33 @@ function updateVoiceTrigger(nowMs) {
   if (!voicePending) return;
   if (voiceEmptySinceMs === null) voiceEmptySinceMs = nowMs;
   if (nowMs - voiceEmptySinceMs >= VOICE_CONFIRM_EMPTY_S * 1000) {
-    const phrase = Math.floor(Math.random() * VOICE_PHRASES.length);
-    writeNoteOn(phrase, VOICE_VELOCITY, 2); // ch2 = speech voice; note = phrase index
+    speakPhrase(nowMs, `room emptied, far=${farCm.toFixed(0)}cm`);
     voicePending = false;
     voiceEmptySinceMs = null;
-    console.log(
-      `daisy-position: voice "${VOICE_PHRASES[phrase]}" (room emptied, far=${farCm.toFixed(0)}cm)`,
-    );
   }
+}
+
+// While the room is occupied, murmur a random phrase every VOICE_TOLL_MIN..MAX
+// seconds — but ONLY when there's recent motion (an active room, not a still
+// one), skipping ~VOICE_TOLL_SKIP_PROB of them. Once the interval elapses it
+// holds "due" and waits for the next motion, so it speaks at activity, not into
+// a lull. Shares the speech min-gap so it can't stack on the exit voice.
+function updateVoiceMurmur(nowMs) {
+  if (!VOICE_TOLL) return;
+  if (!roomOccupied) { nextMurmurMs = null; return; } // reset; re-rolls on re-entry
+  if (nextMurmurMs === null) { scheduleNextMurmur(nowMs); return; }
+  if (nowMs < nextMurmurMs) return; // interval not up yet
+  // Due — only speak to an ACTIVE room (motion now, or within the recent window).
+  const active = motionActive || (nowMs - lastMotionMs) <= VOICE_TOLL_ACTIVE_S * 1000;
+  if (!active) return; // stay due; fire at the next motion
+  if (nowMs - lastVoiceMs < VOICE_MIN_GAP_S * 1000) return; // don't stack on a recent utterance
+  if (Math.random() < VOICE_TOLL_SKIP_PROB) {
+    scheduleNextMurmur(nowMs);
+    console.log('daisy-position: voice murmur skipped');
+    return;
+  }
+  speakPhrase(nowMs, 'active room');
+  scheduleNextMurmur(nowMs);
 }
 
 // While the room stays occupied, strike a toll at a random interval, sometimes
@@ -363,6 +415,7 @@ function updateTriggers(nowMs, fresh) {
   updateBellTrigger(nowMs, fresh);
   updateVoiceTrigger(nowMs);
   updateToll(nowMs);
+  updateVoiceMurmur(nowMs);
 }
 
 function onChange(name, value) {
@@ -440,6 +493,11 @@ module.exports = ({ publish, bus }) => {
     MOTION_PRESENCE
       ? `daisy-position: AM312 motion presence ON (hold ${MOTION_HOLD_S}s; augments distance occupancy)`
       : 'daisy-position: AM312 motion presence OFF (occupancy is distance-only)',
+  );
+  console.log(
+    VOICE_TOLL
+      ? `daisy-position: periodic voice ON (every ${VOICE_TOLL_MIN_S}-${VOICE_TOLL_MAX_S}s when active, skip ${Math.round(VOICE_TOLL_SKIP_PROB * 100)}%)`
+      : 'daisy-position: periodic voice OFF',
   );
 
   // Keep the entry re-arm + leave-confirm + toll timers advancing even while a

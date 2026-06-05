@@ -67,6 +67,53 @@ cd ~/ambient_viz && ./run_kiosk.sh
 
 ---
 
+## Tuning the experience
+
+The handful of knobs that actually shape the interaction for the **current setup**
+(VL53L5CX distance + optional AM312 motion; no MPR121 touch). Everything else can
+stay default. Two locations:
+
+- **Distance** — `python/ambient_kiosk/config.py` (those marked *env* can instead
+  be set on the **sensors** service, e.g. `Environment=DISTANCE_NEAR_CM=80`).
+- **Motion / voice** — environment on the **Node server** service (easiest via the
+  `kiosk_motion_on` drop-in, or `Environment=` lines in `ambient-viz-server.service`).
+
+**Distance (VL53L5CX):**
+
+- **`DISTANCE_NEAR_CM`** (75, *env*) — the effect *onset*: within this distance the
+  visuals/tape sit clean, and the distortion grows from here out to the far reach.
+  Lower → effects only kick in up close; raise → they start from farther away.
+- **`VL53L5CX_FAR_CM`** (400) — the far reach: the "fully destroyed" saturation point
+  and the no-target "empty" snap (the empty-room learner refines it live from here).
+  Set it near the real empty-room depth so the ramp spans the room's actual usable distance.
+- **`VL53L5CX_CONE_ZONES`** (None = all zones) — which grid zones count toward the
+  closest-target distance. Leave None for max coverage; set a tuple to drop zones that
+  graze the floor/ceiling/walls and cause phantom "someone's here" reads — find the
+  bad zones by watching the live grid in `python test_tof.py l5cx`.
+- **`NO_TARGET_TIMEOUT_S`** (1.5, *env*) — seconds of no-target before the room reads
+  empty. Higher rides out flicker (dark clothing, oblique torso) but a real walk-away
+  takes longer to register; lower is snappier but twitchier.
+- **`EMPTY_ROOM_MIN_CM`** (200, *env*) — the nearest distance that can be *learned* as
+  the empty-room baseline; a still reading closer than this is treated as a motionless
+  visitor, not the room. Raise if near clutter/wall gets learned as "empty"; lower for a tight install.
+
+**Motion (AM312) — server env:**
+
+- **`MOTION_PRESENCE`** (off) — master switch for the AM312s. On → motion adds room-wide
+  presence (entry bell fires on room-entry, occupancy held by motion); off → distance-only.
+  Leave off until the sensors are trusted; toggle with `kiosk_motion_on` / `kiosk_motion_off`.
+- **`MOTION_HOLD_S`** (20) — how long the room stays "occupied" after the last motion.
+  This sets how promptly the **exit voice** fires when people leave and how reliably the
+  room empties; ~5 s gives a prompt parting message, too low fires at a lingering still visitor.
+
+**Voice cadence — server env:**
+
+- **`VOICE_TOLL_MIN_S` / `VOICE_TOLL_MAX_S`** (300 / 600) — the random interval for the
+  periodic "active room" murmur (only speaks when there's recent motion). Widen for rarer,
+  narrow for more frequent surveillance whispers; set `VOICE_TOLL=0` to disable entirely.
+
+---
+
 **Ping back if:** ambient reads near `long_max` in both modes (effect feels unreliable),
 the sensor can't see past ~1 m even in long mode, or the projector shadow can't be hidden
 acceptably. Capture the sidecar log either way.
