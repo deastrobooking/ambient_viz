@@ -359,6 +359,15 @@ class DistanceDriver:
         self._last_vel_published: Optional[float] = None
 
     def start(self) -> None:
+        # Build the sensor on the CALLER's thread (the main thread — __main__
+        # calls start() directly), NOT the worker. The vl53l5cx_ctypes driver
+        # segfaults in its constructor (VL53L5CX.__init__ -> is_alive) when built
+        # off the main thread; test_tof never hit this because it builds the
+        # backend on the main thread. Only the polling loop runs in the worker.
+        # Mock mode has no hardware to build.
+        if not self.mock and not self._init_sensor():
+            log.error("distance: sensor init failed; driver not started")
+            return
         self._thread = threading.Thread(target=self._run, name="distance", daemon=True)
         self._thread.start()
 
@@ -383,11 +392,10 @@ class DistanceDriver:
         return True
 
     def _run(self) -> None:
+        # The non-mock backend was already built in start() on the main thread;
+        # this worker only polls it. See start() for why init can't move here.
         period = 1.0 / config.VL53_PUBLISH_HZ
-        if not self.mock:
-            if not self._init_sensor():
-                return
-        else:
+        if self.mock:
             log.info("distance: mock mode")
 
         # Mock state
