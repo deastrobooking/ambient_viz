@@ -138,7 +138,22 @@ const TOLL_SKIP_PROB = clamp(envNum('TOLL_SKIP_PROB', 0.25), 0, 1); // chance a 
 const VOICE_VELOCITY = clamp(Math.round(envNum('VOICE_VELOCITY', 100)), 1, 127);
 const VOICE_PRESENCE_MIN_S = envNum('VOICE_PRESENCE_MIN_S', 3.0); // min dwell to count as a visit
 const VOICE_CONFIRM_EMPTY_S = envNum('VOICE_CONFIRM_EMPTY_S', 2.0); // empty this long after leaving to speak
-const VOICE_PHRASES = ['pain material', 'you are alone', 'i see you', 'you do not belong here'];
+// Order MUST match dsp::pain_voice::PHRASE_LABELS — the index is the ch2 note.
+const VOICE_PHRASES = [
+  'pain material',
+  'you are alone',
+  'i see you',
+  'you do not belong here',
+  'ha ha ha ha ha',
+  'eins zwei drei vier',
+  "don't come back",
+  'you are not welcome',
+  'you are not happy',
+  'you can not feel joy',
+  'you are fake',
+  'everybody sees through you',
+  'you are weak',
+];
 
 let port = null;
 let reopenTimer = null;
