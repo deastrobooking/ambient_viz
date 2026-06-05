@@ -645,6 +645,16 @@ let ROW_CORRUPT_AMOUNT = 2.6;
 let ONSET_THRESHOLD = 0.07;
 let MID_SLICE_TRIGGER = 0.09;
 let FLASH_TRIGGER = 0.18;
+// Spark/particle-burst tunables (all multipliers on the original hardcoded
+// behaviour, so 1.0 == legacy). SPARK_BURST_SCALE scales particle count per
+// burst; SPARK_TRIGGER scales the bass/treble onset thresholds (higher =
+// needs a bigger spike = fewer bursts); SPARK_DECAY scales the per-particle
+// fade rate (higher = shorter-lived); SPARK_COOLDOWN scales the min frames
+// between bursts (higher = sparser).
+let SPARK_BURST_SCALE = 1.0;
+let SPARK_TRIGGER = 1.0;
+let SPARK_DECAY = 1.0;
+let SPARK_COOLDOWN = 1.0;
 let COLOR_LERP = 0.01;
 let KICKS_PER_COLOR_CYCLE = 64;
 let KICKS_PER_SHAPE_CYCLE = 16;
@@ -662,6 +672,14 @@ let TWIST_PINCH = 0.3;
 // kick because velocity jumped from 0 to high.
 let TWIST_SPRING_HZ = 1.0;
 let LATTICE_SPACING = 24;
+// Subtle tempo-synced "breathing" of the lattice spacing, driven by beatClock
+// (i.e. the authored bpm lane). The spacing oscillates ±LATTICE_BREATHE_AMOUNT
+// over LATTICE_BREATHE_BEATS beats, then is clamped to the latticeSpacing
+// param's [min,max] so the modulation can never push it past its limits.
+const LATTICE_SPACING_MIN = 8;       // matches PARAMS.latticeSpacing.min
+const LATTICE_SPACING_MAX = 64;      // matches PARAMS.latticeSpacing.max
+const LATTICE_BREATHE_AMOUNT = 0.05; // ±5%
+const LATTICE_BREATHE_BEATS = 8;     // beats per full oscillation cycle
 let FREEZE_MONO_CHANCE = 1 / 8;
 let SLICE_BURST_SCALE = 1.0;
 let FREEZE_FRAMES_MAX = 12;
@@ -1673,8 +1691,14 @@ function initFlyout() {
   }
 }
 function spawnSpark(intensity, kind) {
-  const cx = W * 0.5, cy = H * 0.5;
-  const count = kind === 'bass' ? Math.floor(intensity * 28) : Math.floor(intensity * 14);
+  // Per-burst cluster center. Previously pinned to the screen middle, which
+  // made every bass burst pile up dead-center; now pick a random point inset
+  // from the edges (the sparks still fly outward ±40px + velocity, so the
+  // inset keeps the cluster mostly on-screen) so bursts roam around.
+  const SPARK_CENTER_INSET = 0.15;
+  const cx = rand(W * SPARK_CENTER_INSET, W * (1 - SPARK_CENTER_INSET));
+  const cy = rand(H * SPARK_CENTER_INSET, H * (1 - SPARK_CENTER_INSET));
+  const count = Math.floor((kind === 'bass' ? intensity * 28 : intensity * 14) * SPARK_BURST_SCALE);
   for (let i = 0; i < count; i++) {
     const angle = Math.random() * Math.PI * 2;
     const speed = kind === 'bass' ? rand(0.6, 2.2) * (0.6 + intensity) : rand(1.5, 4.5) * (0.6 + intensity);
@@ -1686,7 +1710,7 @@ function spawnSpark(intensity, kind) {
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
       life: 1,
-      decay: kind === 'bass' ? rand(0.004, 0.010) : rand(0.012, 0.025),
+      decay: (kind === 'bass' ? rand(0.004, 0.010) : rand(0.012, 0.025)) * SPARK_DECAY,
       r,
       kind,
     });
@@ -1725,10 +1749,9 @@ function spawnMesh3d(s) {
   s.size = rand(180, 700);              // CSS px at z=1 (longest axis); ~4× range so meshes read as varied in scale
   s.rotY = rand(0, Math.PI * 2);        // initial Y-axis rotation phase
   // Per-mesh multiplier on the global rotation rate so coexisting meshes
-  // don't appear to spin in lockstep. Range straddles 1.0 with a slight
-  // chance of sign flip so two of the same global rate can read as one
-  // turning forward and one drifting backward.
-  s.rotSpeedMult = rand(0.55, 1.45) * (Math.random() < 0.18 ? -1 : 1);
+  // don't appear to spin in lockstep. Range straddles 1.0, and each mesh
+  // has a 50% chance of spinning in the opposite direction (sign flip).
+  s.rotSpeedMult = rand(0.55, 1.45) * (Math.random() < 0.5 ? -1 : 1);
   s.visThresh = rand(0, 0.05);          // low threshold so the mesh is reliably visible
   return s;
 }
@@ -1807,9 +1830,15 @@ function spawnSliceBurst(intensity) {
   }
 }
 
-function pushFilledRectPoints(out, cx, cy, width, height, spacing, rowCorrupt) {
+// posScale (default 1) uniformly scales each point's offset from (cx,cy)
+// AFTER the grid topology (row/col counts) is computed from the unscaled
+// spacing. This lets callers breathe the lattice in/out smoothly without
+// changing the point count — modulating `spacing` directly would cross
+// Math.floor() thresholds and pop whole rows/cols in and out (steppy).
+function pushFilledRectPoints(out, cx, cy, width, height, spacing, rowCorrupt, posScale) {
   const halfW = width / 2;
   const halfH = height / 2;
+  const scale = posScale || 1;
   const rowH = spacing * Math.sqrt(3) / 2;
   const rows = Math.floor(height / rowH);
   const yStart = -rows * rowH / 2;
@@ -1824,7 +1853,7 @@ function pushFilledRectPoints(out, cx, cy, width, height, spacing, rowCorrupt) {
     for (let c = 0; c <= cols; c++) {
       const lx = xStart + c * spacing + rowShift;
       if (lx < -halfW * 1.6 || lx > halfW * 1.6) continue;
-      out.push(cx + lx, cy + ly);
+      out.push(cx + lx * scale, cy + ly * scale);
     }
   }
 }
@@ -3483,13 +3512,13 @@ function frame(now) {
   bassCool = Math.max(0, bassCool - dt);
   trebleCool = Math.max(0, trebleCool - dt);
 
-  if (b.bass > bassAvg * 1.35 + 0.05 && bassCool <= 0) {
+  if (b.bass > bassAvg * 1.35 * SPARK_TRIGGER + 0.05 && bassCool <= 0) {
     spawnSpark(Math.min(1, b.bass), 'bass');
-    bassCool = 6;
+    bassCool = 6 * SPARK_COOLDOWN;
   }
-  if (b.treble > trebleAvg * 1.4 + 0.04 && trebleCool <= 0) {
+  if (b.treble > trebleAvg * 1.4 * SPARK_TRIGGER + 0.04 && trebleCool <= 0) {
     spawnSpark(Math.min(1, b.treble), 'treble');
-    trebleCool = 4;
+    trebleCool = 4 * SPARK_COOLDOWN;
   }
 
   if (freezeFrames > 0) {
@@ -3775,9 +3804,27 @@ function frame(now) {
     const pulseR = (PARTICLE_BASE_R + bassPulse * PARTICLE_PULSE_AMOUNT) * viewportScale;
     const jitter = JITTER_PX * smoothTreble * viewportScale;
     const rowCorrupt = bassPulse * rectW * ROW_CORRUPT_AMOUNT;
-    const spacing = LATTICE_SPACING * viewportScale;
+    // Tempo-synced ±5% lattice "breathing", locked to the bpm lane via
+    // beatClock. Applied as a smooth position scale (posScale below), NOT to
+    // the grid spacing — modulating spacing popped whole rows/cols in and out
+    // as it crossed Math.floor() thresholds (steppy). The point count stays
+    // fixed and the grid expands/contracts continuously instead.
+    const _latticeBreathe = 1 + LATTICE_BREATHE_AMOUNT *
+      Math.sin(beatClock * (Math.PI * 2 / LATTICE_BREATHE_BEATS));
+    // Effective visual spacing = LATTICE_SPACING * breathe; clamp THAT to the
+    // param's [min,max] (honouring the no-over/underflow requirement) and turn
+    // the clamped result back into a smooth scale factor.
+    const _latticeSpacing = Math.max(LATTICE_SPACING_MIN,
+      Math.min(LATTICE_SPACING_MAX, LATTICE_SPACING * _latticeBreathe));
+    const _latticeScale = _latticeSpacing / LATTICE_SPACING;
+    const spacing = LATTICE_SPACING * viewportScale;   // fixed topology
     lattPts.length = 0;
-    pushFilledRectPoints(lattPts, W * 0.5, H * 0.5, rectW, rectH, spacing, rowCorrupt);
+    // Overscan the generated grid so that at peak contraction the scaled
+    // lattice still reaches the screen edges (no breathing margin).
+    const _latticeOverscan = 1 / (1 - LATTICE_BREATHE_AMOUNT);
+    pushFilledRectPoints(lattPts, W * 0.5, H * 0.5,
+      rectW * _latticeOverscan, rectH * _latticeOverscan, spacing, rowCorrupt,
+      _latticeScale);
     const pts = lattPts;
     const sFrom = SHAPES[shapeIndex];
     const sTo = SHAPES[(shapeIndex + 1) % SHAPES.length];
@@ -4040,6 +4087,10 @@ function applyParam(name, v) {
     case 'onsetThreshold': ONSET_THRESHOLD = v; break;
     case 'midSliceTrigger': MID_SLICE_TRIGGER = v; break;
     case 'sliceBurstScale': SLICE_BURST_SCALE = v; break;
+    case 'sparkBurstScale': SPARK_BURST_SCALE = Math.max(0, v); break;
+    case 'sparkTrigger': SPARK_TRIGGER = Math.max(0.01, v); break;
+    case 'sparkDecay': SPARK_DECAY = Math.max(0.01, v); break;
+    case 'sparkCooldown': SPARK_COOLDOWN = Math.max(0, v); break;
     case 'freezeFramesMax': FREEZE_FRAMES_MAX = Math.max(FREEZE_FRAMES_MIN, Math.round(v)); break;
     case 'colorLerp': COLOR_LERP = v; break;
     case 'freezeMonoChance': FREEZE_MONO_CHANCE = v; break;
@@ -5034,6 +5085,33 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
       min: 0, max: 3, step: 0.05,
       fmt: v => v.toFixed(2), editor: true,
       setLive: v => setParam('sliceBurstScale', v),
+    },
+    // Spark/particle-burst knobs. All are multipliers on the legacy hardcoded
+    // behaviour (1.0 == original look), so they layer over the bass/treble
+    // onset spawner without changing its character at the default.
+    sparkBurstScale: {
+      type: 'continuous', def: 1.0,
+      min: 0, max: 4, step: 0.05,
+      fmt: v => v.toFixed(2), editor: true,
+      setLive: v => setParam('sparkBurstScale', v),
+    },
+    sparkTrigger: {
+      type: 'continuous', def: 1.0,
+      min: 0.5, max: 2.5, step: 0.05,
+      fmt: v => v.toFixed(2), editor: true,
+      setLive: v => setParam('sparkTrigger', v),
+    },
+    sparkDecay: {
+      type: 'continuous', def: 1.0,
+      min: 0.2, max: 3.0, step: 0.05,
+      fmt: v => v.toFixed(2), editor: true,
+      setLive: v => setParam('sparkDecay', v),
+    },
+    sparkCooldown: {
+      type: 'continuous', def: 1.0,
+      min: 0, max: 4, step: 0.1,
+      fmt: v => v.toFixed(1), editor: true,
+      setLive: v => setParam('sparkCooldown', v),
     },
     freezeFramesMax: {
       type: 'continuous', def: 12,
