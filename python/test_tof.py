@@ -121,31 +121,43 @@ def _loop_l1x(backend) -> int:
     last_print = 0.0
     last_d = None
     last_amb = None
+    last_status = None
     sys.stdout.write("\033[2J")  # clear once; the loop repaints in place
     while True:
         if sensor.data_ready:
             d = sensor.distance  # cm, or None when no valid target in cone
-            # Ambient must be read after the measurement and before clearing
-            # the interrupt, same ordering the driver uses.
+            # Ambient + range status must be read after the measurement and
+            # before clearing the interrupt, same ordering the driver uses.
             last_amb = backend._read_ambient_rate()
+            last_status = getattr(sensor, "range_status", 0)
             sensor.clear_interrupt()
-            last_d = d
-            # Feed every reading (including None = no-target) into the live
-            # smoothing + velocity + empty-room learner.
-            drv._process_sample(d, time.monotonic())
-            if d is not None:
-                window.append(d)
+            last_d = d  # raw measured value, shown even when rejected below
+            # Mirror _L1XBackend.read_raw: a read the sensor flags as unreliable
+            # (status not in _VALID_STATUS — sigma/signal/wraparound) is dropped
+            # to no-target so the learner sees the same filtered stream the kiosk
+            # does. last_d still displays the raw number for tuning visibility.
+            d_ok = d if (d is not None and last_status in backend._VALID_STATUS) else None
+            drv._process_sample(d_ok, time.monotonic())
+            if d_ok is not None:
+                window.append(d_ok)
         now = time.monotonic()
         if now - last_print >= 0.1:
             raw_s = f"{last_d:.1f} cm" if last_d is not None else "--"
             amb_s = f"{last_amb}" if last_amb is not None else "--"
+            if last_status is None:
+                st_s = "--"
+            elif last_status in backend._VALID_STATUS:
+                st_s = f"{last_status} ok"
+            else:
+                st_s = f"{last_status} REJECT"
             mu_s = f"{statistics.mean(window):.1f} cm" if len(window) >= 2 else "--"
             sd_s = f"{statistics.stdev(window):.2f}" if len(window) >= 2 else "--"
             # Repaint in place: home cursor + clear below (same trick as L5CX).
             sys.stdout.write("\033[H\033[J")
             print(f"[VL53L1X]  far ceiling = {backend.far_cm:.0f} cm    "
                   f"ambient = {amb_s} (tune VL53_AMBIENT_LONG_MAX, projector ON, real wall)")
-            print(f"  raw {raw_s:>11}   mean(1s) {mu_s:>11}   sd {sd_s:>6}   n={len(window)}")
+            print(f"  raw {raw_s:>11}   mean(1s) {mu_s:>11}   sd {sd_s:>6}   "
+                  f"status {st_s:>9}   n={len(window)}")
             print()
             for ln in _empty_room_lines(drv, now):
                 print(ln)
@@ -170,8 +182,10 @@ def _loop_l5cx(backend) -> int:
     while True:
         if sensor.data_ready():
             data = sensor.get_data()
-            dists = data.distance_mm
-            stats = data.target_status
+            # 2D ctypes arrays: [target][zone]; target 0 = closest per zone (see
+            # _L5CXBackend.read_raw). Inner dim is the full 64-zone buffer.
+            dists = data.distance_mm[0]
+            stats = data.target_status[0]
             m = min(n, len(dists), len(stats))
             cells = []
             valid_cm = []

@@ -44,6 +44,16 @@ class _L1XBackend:
     # Only valid after a completed measurement (data_ready).
     _REG_AMBIENT_RATE = 0x0090
 
+    # ST ULD range-status values we treat as a usable read. 0 = range valid (no
+    # error). Everything else is the sensor flagging the distance as unreliable:
+    # 1 sigma fail (noisy), 2 signal fail (return too weak), 4 out of bounds,
+    # 7 wraparound (a far/specular target aliased to a phantom, usually a
+    # too-close ghost). These dominate in long mode under projector IR and are
+    # exactly the spurious "valid-looking" reads that poison the empty-room
+    # learner, so we drop them to no-target. Widen this set if strict 0-only
+    # ends up rejecting good reads on the real wall.
+    _VALID_STATUS = (0,)
+
     def __init__(self, sensor):
         self._sensor = sensor
         self.far_cm: float = config.VL53_FAR_CM  # resolved in configure()
@@ -156,13 +166,25 @@ class _L1XBackend:
         return chosen
 
     def read_raw(self) -> Optional[float]:
-        """Returns distance in cm, or None for no-target / invalid."""
+        """Returns distance in cm, or None for no-target / invalid.
+
+        A read the sensor flags as unreliable (range_status not in
+        _VALID_STATUS) is treated as no-target: in long mode under ambient IR
+        the VL53L1X emits sigma/signal/wraparound phantoms that look like valid
+        large distances and would otherwise poison the empty-room learner.
+        """
         try:
             if not self._sensor.data_ready:
                 return None
             d = self._sensor.distance  # cm; None if no valid target
+            # Range status is per-measurement; read it before clearing the
+            # interrupt (same ordering as the ambient read). getattr guards
+            # older lib versions that don't surface it (treated as valid=0).
+            status = getattr(self._sensor, "range_status", 0)
             self._sensor.clear_interrupt()
-            return float(d) if d is not None else None
+            if d is None or status not in self._VALID_STATUS:
+                return None
+            return float(d)
         except Exception as e:
             log.debug("distance: read error: %s", e)
             return None
@@ -235,8 +257,13 @@ class _L5CXBackend:
             if not self._sensor.data_ready():
                 return None
             data = self._sensor.get_data()
-            dists = data.distance_mm     # per-zone, mm
-            stats = data.target_status   # per-zone status
+            # Pimoroni's results are 2D ctypes arrays indexed [target][zone]:
+            # the outer dim is nb_target_per_zone (1 in our config), the inner is
+            # the full 64-zone (8x8) buffer of which the first `_grid_n` are
+            # populated at the set resolution. Take target 0 — the closest /
+            # strongest per zone — then reduce to the nearest valid zone below.
+            dists = data.distance_mm[0]    # 64 per-zone mm (target 0)
+            stats = data.target_status[0]  # 64 per-zone status (target 0)
             n = min(self._grid_n, len(dists), len(stats))
             zones = config.VL53L5CX_CONE_ZONES
             if not zones:
