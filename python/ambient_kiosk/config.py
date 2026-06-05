@@ -27,7 +27,7 @@ PIR_BOOT_SUPPRESS_S = 60.0  # ignore output for the first 60s post-process-start
 # it probes the L1X first (a cheap, non-destructive model-ID read) and only
 # falls through to the L5CX (which uploads an ~84 KB firmware blob) when the
 # L1X isn't wired. Pin it explicitly for a deterministic install boot.
-VL53_SENSOR = "auto"       # "auto" | "l1x" | "l5cx"
+VL53_SENSOR = os.environ.get("VL53_SENSOR", "auto").strip().lower()  # "auto" | "l1x" | "l5cx"
 
 # --- VL53L1X (single-point) -------------------------------------------------
 VL53_DISTANCE_MODE = 1     # 1 = short, 2 = long. Fallback when auto-select
