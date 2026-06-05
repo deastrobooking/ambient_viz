@@ -128,12 +128,27 @@ mod imp {
 pub use imp::{init, write_fmt};
 
 // ---------------------------------------------------------------------------
-// `debug-uart` OFF (production): no UART, minimal halting panic handler.
+// `debug-uart` OFF (production): no UART, and in the field no probe either, so
+// make panics VISIBLE on the user LED. We STROBE PC7 (active-high) fast and
+// forever — clearly distinct from the 500 ms boot heartbeat and the 1/2/3 SD
+// blink codes, so "fast strobe" unambiguously means *the firmware panicked*
+// (vs a HardFault/hang, which leaves the LED frozen/dark since this handler
+// never runs). Raw GPIOC BSRR is used because a panic handler can't own the
+// UserLed; PC7 is configured as output very early in main (board init) before
+// anything that can panic here, so the port is clocked and the writes land.
+// A defmt marker is also emitted for the case a probe IS attached (cargo
+// flash-prod); it's a fixed string interned in the non-loaded `.defmt` section,
+// so it costs ~0 flash and avoids the ~25 KB `info.location()` retention.
 // ---------------------------------------------------------------------------
 #[cfg(not(feature = "debug-uart"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("*** PANIC (prod) — LED strobe on PC7 ***");
+    use embassy_stm32::pac::GPIOC;
     loop {
-        cortex_m::asm::udf();
+        GPIOC.bsrr().write(|w| w.set_bs(7, true)); // PC7 high → LED on
+        cortex_m::asm::delay(40_000_000); // ~80 ms @ 480 MHz
+        GPIOC.bsrr().write(|w| w.set_br(7, true)); // PC7 low → LED off
+        cortex_m::asm::delay(40_000_000);
     }
 }

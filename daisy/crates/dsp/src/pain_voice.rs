@@ -13,7 +13,12 @@
 use alloc::vec::Vec;
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::audio_param::AudioParam;
-use infinitedsp_core::effects::time::reverb::Reverb;
+// Embedded reverb: i16 storage + 2x downsampling → ~half the per-sample CPU of
+// the full Schroeder `Reverb`. The Daisy's M7 has no hardware SIMD (the comb
+// filters' `wide::f32x4` runs scalar), so the full-rate reverb overran the audio
+// callback and underran the SAI (audible crackle). Aliased as `Reverb` so the
+// rest of this file is unchanged. Same API (new_with_params / FrameProcessor).
+use infinitedsp_core::low_mem::effects::time::reverb_low_mem::ReverbLowMem as Reverb;
 use infinitedsp_core::synthesis::speech::{Phoneme, SpeechSynth};
 
 /// The speakable phrases, each spelled in the synth's fixed token vocabulary.
@@ -33,6 +38,42 @@ const PHRASES: &[&[&str]] = &[
         "Y", "U", "GAP", "D", "U", "GAP", "N", "O", "T", "GAP", //
         "B", "I", "L", "O", "NG", "GAP", "H", "EE", "R",
     ],
+    // "ha ha ha ha ha"
+    &[
+        "H", "A", "GAP", "H", "A", "GAP", "H", "A", "GAP", //
+        "H", "A", "GAP", "H", "A",
+    ],
+    // "eins zwei drei vier" (German "ains tsvai drai feer")
+    &[
+        "AI", "N", "S", "GAP", "T", "S", "V", "AI", "GAP", //
+        "D", "R", "AI", "GAP", "F", "EE", "R",
+    ],
+    // "don't come back"
+    &["D", "O", "N", "T", "GAP", "K", "U", "M", "GAP", "B", "A", "K"],
+    // "you are not welcome"
+    &[
+        "Y", "U", "GAP", "A", "R", "GAP", "N", "O", "T", "GAP", //
+        "W", "E", "L", "K", "U", "M",
+    ],
+    // "you are not happy"
+    &[
+        "Y", "U", "GAP", "A", "R", "GAP", "N", "O", "T", "GAP", //
+        "H", "A", "P", "EE",
+    ],
+    // "you can not feel joy"
+    &[
+        "Y", "U", "GAP", "K", "A", "N", "GAP", "N", "O", "T", "GAP", //
+        "F", "EE", "L", "GAP", "J", "O", "I",
+    ],
+    // "you are fake"
+    &["Y", "U", "GAP", "A", "R", "GAP", "F", "AI", "K"],
+    // "everybody sees through you"
+    &[
+        "E", "V", "R", "EE", "GAP", "B", "O", "D", "EE", "GAP", //
+        "S", "EE", "Z", "GAP", "TH", "R", "U", "GAP", "Y", "U",
+    ],
+    // "you are weak"
+    &["Y", "U", "GAP", "A", "R", "GAP", "W", "EE", "K"],
 ];
 
 /// Human-readable labels, parallel to [`PHRASES`] (for logs / auditioning).
@@ -41,6 +82,15 @@ pub const PHRASE_LABELS: &[&str] = &[
     "you are alone",
     "i see you",
     "you do not belong here",
+    "ha ha ha ha ha",
+    "eins zwei drei vier",
+    "don't come back",
+    "you are not welcome",
+    "you are not happy",
+    "you can not feel joy",
+    "you are fake",
+    "everybody sees through you",
+    "you are weak",
 ];
 
 /// Number of phrases the voice can speak. The trigger index wraps modulo this.

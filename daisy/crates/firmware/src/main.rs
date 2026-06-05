@@ -46,10 +46,28 @@ use defmt_rtt as _;
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 // Heap in on-chip AXI SRAM (cached, fast) — NOT external SDRAM. The DSP delay
-// lines (tape ~22 KB + freeze ring ~115 KB) thrash the 16 KB D-cache, so they
-// must sit in fast on-chip memory (an AXI miss is ~12x cheaper than an SDRAM
-// miss). 256 KB fits the FX with headroom; `.axisram_bss` maps to AXI SRAM.
-const HEAP_SIZE: usize = 256 * 1024;
+// lines must sit in fast on-chip memory (an AXI miss is ~12x cheaper than an
+// SDRAM miss), and `.axisram_bss` maps to the 512 KB AXI SRAM, of which the
+// heap is the SOLE occupant (stack + .bss/.data live in DTCM via the RAM alias,
+// SAI DMA buffers in D2 SRAM, SDRAM separate). NOLOAD .bss → zero flash cost.
+//
+// Footprint of the full prod FX chain, MEASURED by the host probe
+// `cargo run -p host --bin heap_probe` (allocation sizes are identical on host
+// and Daisy — f32 = 4 B, same Vec growth; the probe's "198 KB before voice"
+// matched the on-device heap log exactly):
+//   tape + limiter                              25 KB
+//   bell (FmStab + ping-pong ring)             172 KB   ← bigger than it looks
+//   voice @ 48 kHz (Stutter + low-mem reverb)  204 KB
+//   ---------------------------------------------------
+//   bell + voice peak                         ~403 KB   (no transient now)
+//
+// History: this used to need 44.1 kHz + a 640 KB transient dance, because
+// SpeechSynth::new triggered a Stutter `Vec::resize` that DOUBLED the ring while
+// holding the old buffer. The vendored infinitedsp-core patch makes that resize
+// a no-op, so 48 kHz fits with no spike (peak == steady). 504 KB leaves ~100 KB
+// of margin (and room toward `freeze`), using the whole 512 KB AXI region minus
+// an 8 KB linker slack. 448 KB would also fit; 504 is just conservative.
+const HEAP_SIZE: usize = 504 * 1024;
 #[unsafe(link_section = ".axisram_bss")]
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
 
@@ -58,6 +76,16 @@ const SAMPLE_RATE: f32 = 48_000.0;
 /// How much of the bell's wet ping-pong to fold on top of the dry chime.
 #[cfg(feature = "bell")]
 const BELL_DELAY_WET: f32 = 0.6;
+
+/// Master level for the FM bell (dry + its ping-pong), summed onto the bed.
+/// 0.1 ≈ −20 dB ≈ 1/4 the perceived loudness of unity (the old level).
+#[cfg(feature = "bell")]
+const BELL_GAIN: f32 = 0.1;
+
+/// Master level for the pain-material voice, summed onto the bed.
+/// 0.1 ≈ −20 dB ≈ 1/4 the perceived loudness of unity (the old level).
+#[cfg(feature = "voice")]
+const VOICE_GAIN: f32 = 0.1;
 
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
@@ -114,7 +142,7 @@ async fn main(spawner: Spawner) {
     }
 
     let p = hal::init(daisy_embassy::default_rcc());
-    info!("ambient-viz-daisy firmware: SD stream + DSP (SDRAM heap)");
+    info!("ambient-viz-daisy firmware: SD stream + DSP (AXI heap)");
 
     let board = new_daisy_board!(p);
     let mut led = board.user_led;
@@ -132,8 +160,9 @@ async fn main(spawner: Spawner) {
     }
     dbg_uart!("=== ambient-viz-daisy boot ===");
 
-    // Bring up external SDRAM and relocate the global heap into it — the DSP FX
-    // buffers don't fit the 64 KB internal RAM. Must precede any allocation.
+    // Bring up external SDRAM (mapped for the future Engine; not the heap) and
+    // init the global heap in AXI SRAM. The heap is on-chip AXI, NOT SDRAM —
+    // see HEAP_MEM above. Must precede any allocation.
     let mut cm = cortex_m::Peripherals::take().unwrap();
     let mut sdram = board.sdram.build(&mut cm.MPU, &mut cm.SCB);
     let mut sdram_delay = Delay;
@@ -340,10 +369,18 @@ async fn main(spawner: Spawner) {
     // no longer glitch the audio — the interrupt executor preempts them.
     let heartbeat = async {
         loop {
+            // TEMP DIAG: real-time-health readout on the LED (prod has no UART).
+            // PER-INTERVAL, not latching: we read-and-RESET SAI_ERR each beat, so
+            // a one-off startup underrun shows fast for a single beat then calms.
+            // Fast (150 ms) = the audio callback underran in the LAST interval.
+            // Reading: at idle (just the bed) it should settle to the calm 1 s
+            // pulse; if it stays fast at idle, even tape+bell overruns. Trigger
+            // the voice — if it goes fast only then, the voice is the CPU hog.
+            let period = if SAI_ERR.swap(0, Ordering::Relaxed) > 0 { 150 } else { 1000 };
             led.on();
-            Timer::after_millis(500).await;
+            Timer::after_millis(period).await;
             led.off();
-            Timer::after_millis(500).await;
+            Timer::after_millis(period).await;
             // Safe now that dbg_uart writes per-byte (≤87 µs CS, not ~6 ms).
             // cb_full spikes ~730 us on loss-FIR rebuild blocks but they're
             // isolated; sai_err (SAI underruns) is the real health metric.
@@ -450,6 +487,14 @@ async fn audio_task(
     // struck once when the room empties (Pi sends a ch2 note-on). Constructed
     // once here; its SpeechSynth + reverb buffers allocate on the AXI heap now,
     // never in the callback. Idle (silent, skipped) until triggered.
+    //
+    // Built at the true SAMPLE_RATE (48 kHz) for correct pitch. This used to be
+    // forced to 44.1 kHz because `SpeechSynth::new` calls `Stutter::set_sample_rate`,
+    // which `Vec::resize`d the Stutter ring — and Vec doubles on grow, so the old
+    // 176 KB + new 353 KB coexisted: a ~640 KB transient no AXI heap could hold.
+    // The vendored infinitedsp-core patch makes that set_sample_rate a no-op for
+    // the ring (see vendor/infinitedsp-core), so 48 kHz now fits and the ~9%
+    // pitch hack is gone.
     #[cfg(feature = "voice")]
     let mut voice = PainMaterialVoice::new(SAMPLE_RATE, HALF_DMA_BUFFER_LENGTH);
 
@@ -458,7 +503,16 @@ async fn audio_task(
     // host via install_kiosk_bindings so a CC means the same thing in both.
     let mut midi_map = dsp::MidiMap::new();
     dsp::install_kiosk_bindings(&mut midi_map);
-    dbg_uart!("audio: interface started, FX chain ready");
+    // Heap high-water: all FX are constructed by now (tape + bell ring + voice
+    // reverb), so this is peak allocation. Confirms the 448 KB heap has margin
+    // and lets us right-size later. `used`/`free` aren't evaluated in the prod
+    // build (dbg_uart! is a no-op without `debug-uart`), so no cost there.
+    dbg_uart!(
+        "audio: interface started, FX chain ready | heap used {} KB, free {} KB of {} KB",
+        HEAP.used() / 1024,
+        HEAP.free() / 1024,
+        HEAP_SIZE / 1024
+    );
 
     loop {
         // start_callback returns only on a SAI error; on its own executor that
@@ -558,7 +612,8 @@ async fn audio_task(
                 {
                     let frames = n / 2;
                     for i in 0..frames {
-                        let s = bell.tick();
+                        // Scale at the source so dry + ping-pong drop together.
+                        let s = bell.tick() * BELL_GAIN;
                         buf[2 * i] += s;
                         buf[2 * i + 1] += s;
                         bell_send[2 * i] = s;
@@ -578,7 +633,7 @@ async fn audio_task(
                 if voice.is_active() {
                     voice.process(&mut voice_send[..n], sample_index);
                     for (o, &w) in buf[..n].iter_mut().zip(voice_send[..n].iter()) {
-                        *o += w;
+                        *o += w * VOICE_GAIN;
                     }
                 }
 
