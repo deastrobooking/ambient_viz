@@ -367,20 +367,29 @@ class _CaptureIngest:
 
 def _open_am312_sensors():
     """Live per-sensor AM312 read (direct gpiozero, for bringup visibility).
-    Returns a list of (pin, sensor); a pin that fails to init is skipped."""
+    Returns (sensors, errors): sensors = list of (pin, MotionSensor); errors =
+    list of human-readable reasons for any pin that failed (shown in the
+    dashboard so the cause isn't lost to the screen repaint)."""
+    errors = []
     try:
         from gpiozero import MotionSensor  # lazy: Pi-only
-    except ImportError as e:
-        print(f"  gpiozero unavailable ({e}) — --live needs a Pi; try --mock or "
-              "--scenario on this machine", file=sys.stderr)
-        return []
+    except Exception as e:  # ImportError, or BadPinFactory at import time
+        return [], [f"gpiozero import failed: {type(e).__name__}: {e}"]
     out = []
     for pin in config.PIR_PINS:
         try:
-            out.append((pin, MotionSensor(pin)))
+            # pull_down: AM312 OUT idles LOW and is driven HIGH on motion. An
+            # unconnected pin floats — explicit pull-down makes a missing/loose
+            # signal read a steady LOW rather than a random toggle.
+            out.append((pin, MotionSensor(pin, pull_up=False)))
         except Exception as e:
-            print(f"  AM312 BCM{pin}: init FAILED ({e}) — skipping")
-    return out
+            msg = f"BCM{pin}: {type(e).__name__}: {e}"
+            # 'GPIO busy' = another process owns the line (lgpio cdev). The usual
+            # culprit is the running kiosk sidecar, which claims these same pins.
+            if "busy" in str(e).lower():
+                msg += "  -> pin already in use; stop the kiosk (pkill -f ambient_kiosk)"
+            errors.append(msg)
+    return out, errors
 
 
 def _live_main(args):
@@ -397,16 +406,18 @@ def _live_main(args):
     # per-sensor GPIO reads so you can see each unit toggle.
     pir_drv = None
     sensors = []
+    pir_errors = []
     if mock:
         from ambient_kiosk.sensors.pir import PirDriver
         config.PIR_BOOT_SUPPRESS_S = 0.0  # no 60 s wait for a demo
         pir_drv = PirDriver(cap, mock=True)
         pir_drv.start()
     else:
-        sensors = _open_am312_sensors()
+        sensors, pir_errors = _open_am312_sensors()
         if not sensors:
-            print("no AM312 sensors initialised — check PIR_PINS / wiring "
-                  "(distance-only will still run)", file=sys.stderr)
+            print("no AM312 sensors initialised — check PIR_PINS / wiring:", file=sys.stderr)
+            for err in (pir_errors or ["(no pins configured in PIR_PINS)"]):
+                print(f"  {err}", file=sys.stderr)
 
     print(f"\n[test_am312] {'MOCK' if mock else 'LIVE'}  "
           f"motion fusion {'ON' if args.motion else 'OFF (distance-only)'}  "
@@ -454,10 +465,14 @@ def _live_main(args):
                 hold_left = max(0.0, mon.hold_s - (now - mon.last_motion_t)) if mon.last_motion_t != float("-inf") else 0.0
                 if mock:
                     am = f"OR={'MOTION' if motion_or else 'quiet '} (mock)"
-                else:
+                elif sensors:
                     am = "  ".join(f"BCM{p}={'#' if st else '.'}"
-                                   for (p, _s), st in zip(sensors, per)) if sensors else "(none)"
+                                   for (p, _s), st in zip(sensors, per))
                     am += f"   OR={'MOTION' if motion_or else 'quiet '}"
+                else:
+                    # No sensors opened — keep the reason on screen (it would
+                    # otherwise be wiped by the repaint).
+                    am = "(none) " + (" | ".join(pir_errors) if pir_errors else "no PIR_PINS")
                 print(f"  AM312   {am}   hold_left={hold_left:4.1f}s")
                 print()
                 for ln in mon.status_lines():

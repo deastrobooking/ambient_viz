@@ -26,6 +26,13 @@ cd "$ROOT"
 # to the Node server below. Requires `npm install` in server/ (serialport dep).
 export DAISY="${DAISY:-1}"
 
+# Stream child logs live. Each child's output is piped through prefix() below —
+# a pipe, not a TTY — so Python block-buffers stdout/stderr by default and
+# low-volume startup logs sit in the buffer, never appearing. Force line-flushing
+# (this env var + `python -u` on the sidecar exec are the same lever; both set
+# for belt-and-braces). Node's console.* already flushes to pipes on its own.
+export PYTHONUNBUFFERED=1
+
 if [ "$#" -gt 0 ]; then
   SIDECAR_ARGS=("$@")
 else
@@ -50,8 +57,18 @@ else
   PY="python3"
 fi
 
+# Prefix each line of a child's output with [tag] and stream it LIVE. A bash
+# read-loop, NOT awk — the Pi's mawk block-buffers piped input, swallowing
+# low-volume logs until a buffer fills; `read` returns the moment a newline
+# arrives. printf goes to the script's TTY (line-buffered), so it shows at once.
 prefix() {
-  awk -v tag="$1" '{ print "[" tag "] " $0; fflush(); }'
+  local tag="$1" line
+  while IFS= read -r line; do
+    printf '[%s] %s\n' "$tag" "$line"
+  done
+  # Flush a trailing partial line with no newline (e.g. a crash mid-write).
+  [ -n "${line:-}" ] && printf '[%s] %s\n' "$tag" "$line"
+  return 0  # match awk's old behavior: don't let an empty trailing line set $? (pipefail)
 }
 
 PIDS=()
@@ -69,7 +86,7 @@ echo "[run] open: $KIOSK_URL"
 (cd "$ROOT/server" && exec node src/index.js 2>&1) | prefix "node" &
 PIDS+=($!)
 
-(cd "$ROOT/python" && exec "$PY" -m ambient_kiosk "${SIDECAR_ARGS[@]}" 2>&1) | prefix "py  " &
+(cd "$ROOT/python" && exec "$PY" -u -m ambient_kiosk "${SIDECAR_ARGS[@]}" 2>&1) | prefix "py  " &
 PIDS+=($!)
 
 # Block until either pipeline ends; cleanup trap kills the survivor.
