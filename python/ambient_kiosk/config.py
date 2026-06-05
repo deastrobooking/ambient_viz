@@ -3,7 +3,14 @@
 import os
 
 # BCM pin numbers
-PIR_PIN = 4         # AM312 OUT
+# AM312 PIR OUT lines. Two units are fanned outward from the wall for wide room
+# coverage and OR'd into a single `motion` channel (see hardware-handoff.md).
+# Env-overridable as a comma list so a partial install (one AM312, or none) is a
+# config change, not a code edit — e.g. PIR_PINS=4 for a single sensor, or
+# PIR_PINS= (empty) to skip them entirely:
+#   PIR_PINS=4 ./run_kiosk.sh
+PIR_PINS = [int(p) for p in os.environ.get("PIR_PINS", "4,23").split(",") if p.strip()]
+PIR_PIN = PIR_PINS[0] if PIR_PINS else 4  # back-compat: first sensor
 BREATH_PIN = 17     # TLC555 pin 3 (OUTPUT) — frequency counter input
 TOUCH_IRQ_PIN = 27  # MPR121 IRQ
 
@@ -59,6 +66,15 @@ VL53_FAR_CM_SHORT = 130.0
 VL53_FAR_CM_LONG = 400.0
 VL53_FAR_CM = VL53_FAR_CM_SHORT
 VL53_NEAR_CM = 25.0
+
+# Seconds of continuous no-target (None) reads before the smoothed distance
+# snaps to the far reach (reads "empty"). Longer rides out the multi-frame
+# dropouts that flicker a present visitor to "empty" — dark clothing, an oblique
+# torso, projector IR — at the cost of a genuine walk-away taking this long to
+# register as idle. Presence detection favours ride-out over snappiness, so the
+# default sits above the old 0.6 s. Env-overridable for install-day tuning, e.g.
+#   NO_TARGET_TIMEOUT_S=2.0 ./run_kiosk.sh
+NO_TARGET_TIMEOUT_S = float(os.environ.get("NO_TARGET_TIMEOUT_S", "1.5"))
 
 # Distance→effect ONSET (cm) — the single install-day knob shared by every
 # consumer of the distance feed. At/within this distance there is no

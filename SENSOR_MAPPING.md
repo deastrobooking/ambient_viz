@@ -192,12 +192,15 @@ arrived/left" transitions.
   than decaying. Without this, every dropped frame would yank the
   published value toward the far reach, biasing the SSE feed upward
   even with a target consistently present.
-- After `NO_TARGET_TIMEOUT_S = 0.6` seconds of continuous `None`
-  reads, the smoothed value **snaps** to the mode-derived far reach
-  (`_far_cm`; 130 cm short / 400 cm long). Snap
+- After `NO_TARGET_TIMEOUT_S = 1.5` seconds (env-overridable) of
+  continuous `None` reads, the smoothed value **snaps** to the
+  mode-derived far reach (`_far_cm`; 130 cm short / 400 cm long). Snap
   (not gradual decay) is intentional — gradual decay leaves the
   visualizer thinking "user still close" for an extra ~150 ms after
-  the hold expires.
+  the hold expires. The default sits above the old 0.6 s to ride out
+  dropouts (dark clothing, oblique torso, projector IR) that would
+  otherwise flicker a present visitor to "empty"; the cost is a
+  genuine walk-away taking ~1.5 s to register as idle.
 
 The history of these knobs is in the commit log; the short version
 is that the original 2 s hold + EMA decay produced ~3 s of "kiosk
@@ -292,7 +295,7 @@ inspection, regardless of `?debug=1`.
 | `DISTANCE_BITMAP_MIN` | static/index.html | 64 | Lower = more aggressive low-res floor when far |
 | `DISTANCE_BITMAP_QUANTIZE` | static/index.html | 12 | Fewer resize events, but visibly coarser steps |
 | `DISTANCE_SMOOTH_TAU_S` | static/index.html | 0.25 | Slower response, less noise |
-| `NO_TARGET_TIMEOUT_S` | distance.py | 0.6 | Rides out longer dropouts at cost of slower "walked away" |
+| `NO_TARGET_TIMEOUT_S` | config.py (env) | 1.5 | Rides out longer dropouts at cost of slower "walked away" |
 | `VL53_SMOOTH_ALPHA` | config.py | 0.25 | Higher = more responsive (more noise) |
 | `VL53_FAR_CM_SHORT` | config.py | 130 | Short-mode reach + FAR end of the mappings (snap target) |
 | `VL53_FAR_CM_LONG` | config.py | 400 | Long-mode reach + FAR end of the mappings (snap target) |

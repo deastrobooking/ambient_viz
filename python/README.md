@@ -46,7 +46,7 @@ The Node server must be running first (`cd ../server && npm start`).
 
 | Module | Hardware | Pin / Bus | Publishes |
 |---|---|---|---|
-| `sensors.pir` | AM312 PIR | GPIO4 | `motion` (bool) |
+| `sensors.pir` | AM312 PIR ×2 | GPIO4 + GPIO23 (`PIR_PINS`) | `motion` (bool, OR'd) |
 | `sensors.distance` | VL53L1X ToF | I²C 0x29 | `distance_cm` (number, 0.1 cm step) |
 | `sensors.breath` | HR202 + TLC555 | GPIO17 (edge count) | `breath_detected` (ms timestamp) |
 | `sensors.touch` | MPR121 | I²C 0x5A + IRQ GPIO27 | `touch_mask` (12-bit int) |
@@ -59,6 +59,13 @@ All values land on the SSE bus and become available in the browser as
 - **AM312 startup suppression**: `PirDriver` ignores the sensor for the
   first 60 s after process start. This is mandatory per the handoff doc
   — the AM312's output is unreliable during settling.
+- **Two AM312s, OR'd**: `PirDriver` drives the sensors in `PIR_PINS`
+  (default `4,23`) and publishes their logical OR as `motion`. A sensor
+  that fails to init is skipped with a warning, so a partial install
+  still publishes whatever coverage it has. Override for fewer units,
+  e.g. `PIR_PINS=4` (one) or `PIR_PINS=` (none). The `motion` channel is
+  only *acted on* if the server's `MOTION_PRESENCE` flag is set;
+  otherwise presence is distance-only.
 - **TLC555 callback pattern**: `BreathDriver` registers the pigpio
   rising-edge callback **once** at startup and samples a running
   counter every 200 ms. Do not rewrite this to the per-window
@@ -68,11 +75,12 @@ All values land on the SSE bus and become available in the browser as
 - **VL53L1X invalid reads**: `None` from the sensor is treated as a
   dropout, not as "target at FAR." The smoothed value is **held**
   during brief dropouts (which happen constantly on real targets) and
-  **snaps** to `VL53_FAR_CM` after `NO_TARGET_TIMEOUT_S = 0.6` seconds
-  of continuous silence. This avoids the upward bias the original
-  decay-toward-FAR design introduced into the published `distance_cm`
-  feed. Idle visualizer state is "nobody here," and is reached within
-  ~0.6 s of departure (not 2-3 s as in earlier versions).
+  **snaps** to `VL53_FAR_CM` after `NO_TARGET_TIMEOUT_S = 1.5` seconds
+  (env-overridable) of continuous silence. This avoids the upward bias
+  the original decay-toward-FAR design introduced into the published
+  `distance_cm` feed. Idle visualizer state is "nobody here," reached
+  within ~1.5 s of departure — the default favours riding out dropouts
+  (dark clothing, oblique torso, projector IR) over snappiness.
 - **ToF bringup**: `python test_tof.py` is a standalone sanity-check
   script (talks straight to the sensor library, no sidecar / Node /
   browser). Auto-detects L1X vs L5CX (override with the first arg or

@@ -29,6 +29,8 @@ No npm dependencies — pure Node stdlib.
 | `HOST` | `0.0.0.0` | Bind address |
 | `MOCK` | `0` | Set to `1` to enable the in-process mock source (fake sensor data, no Python needed). Useful for Mac-side SSE plumbing tests. |
 | `INGEST_TOKEN` | (none) | If set, `POST /ingest` requires header `X-Ingest-Token: <value>`. Without this var, `/ingest` accepts any localhost request unauthenticated. |
+| `MOTION_PRESENCE` | `0` (off) | **Feature flag for the AM312 motion sensors.** Off → room occupancy is derived purely from the ToF distance feed, exactly as without any PIR (the reliable fallback). Set `1`/`true` to let the OR'd `motion` channel **augment** occupancy: motion forces the room "occupied" and holds it for `MOTION_HOLD_S` after motion stops, so a still visitor the ToF cone misses still counts as present. Augment-only — motion never *clears* occupancy, so distance still owns the "empty" baseline. Drives all three presence triggers: the entry bell fires on the empty→occupied edge (motion onset or ToF approach), voice-on-leave on the confirmed-empty edge, the toll while occupied. With the flag off, each reverts to its pure-distance path (the bell to its sustained-approach gate). Even when on, if no `motion` events arrive (AM312 absent/miswired) occupancy silently reverts to distance. |
+| `MOTION_HOLD_S` | `20` | How long (s) after motion stops the room still counts as occupied. Bridges the AM312's ~2 s internal drop and its blindness to a perfectly still person. Only consulted when `MOTION_PRESENCE` is on. |
 
 ## Architecture
 
@@ -79,7 +81,7 @@ Event names emitted by the Python drivers (and by `MOCK=1`) per
 
 | Name | Type | Source | Meaning |
 |---|---|---|---|
-| `motion` | boolean | AM312 (GPIO4) | True while PIR holds detection; suppressed for 60 s post-boot |
+| `motion` | boolean | AM312 ×2 (GPIO4 + GPIO23), OR'd | True while *either* PIR cone holds detection; suppressed for 60 s post-boot. Ignored unless `MOTION_PRESENCE` is on |
 | `distance_cm` | number | VL53L1X (I²C 0x29) | Smoothed distance to closest target in cone; `null` ≈ no target |
 | `breath_detected` | timestamp (ms) | HR202 + TLC555 (GPIO17) | Most-recent breath puff; bumps monotonically. Visualizer compares to `Date.now()` for recency. |
 | `touch_mask` | int (0..4095) | MPR121 (I²C 0x5A, IRQ GPIO27) | 12-bit channel state; bit `n` set ⇒ channel `n` touched |

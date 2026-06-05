@@ -33,7 +33,7 @@ The ADS1115 is on the bus but no analog sensors are currently attached. It is av
 
 | Component | Part | Qty | Notes |
 |---|---|---|---|
-| Motion sensor | AM312 PIR module | 1 | 3.3V native, Fresnel lens included |
+| Motion sensor | AM312 PIR module | 2 | 3.3V native, Fresnel lens included. Two units fanned outward from the wall for wide room coverage, OR'd in software |
 | Distance sensor | VL53L1X breakout (GY-VL53L1X / TOF400C, or Adafruit #3967) | 1 | Time-of-flight, I2C |
 | Capacitive touch | MPR121 breakout (Adafruit #1982 or clone) | 1 | I2C, 12 touch channels |
 | ADC | ADS1115 breakout | 1 | I2C, 4 single-ended channels (currently unused) |
@@ -41,7 +41,7 @@ The ADS1115 is on the bus but no analog sensors are currently attached. It is av
 | Timer IC | TLC555CP (DIP-8) | 1 | CMOS 555, runs at 3.3V |
 | Timing capacitor | 4.7nF / 100V / 5% ceramic (C0G) | 1 | For 555 timing network |
 | Timing resistor | 10kΩ | 1 | For 555 R1 |
-| Decoupling cap | 0.1µF ceramic | 2-3 | Pin 8 of 555, sensor Vcc rails |
+| Decoupling cap | 0.1µF ceramic | 4-5 | Pin 8 of 555, sensor Vcc rails, one per AM312 across VCC↔GND |
 | Bypass cap | 10nF ceramic (or 0.1µF acceptable) | 1 | Pin 5 of 555 |
 | I2C pull-ups | 4.7kΩ resistor | 2 | One on SDA, one on SCL, to 3.3V |
 | Board | Pad-per-hole perfboard | 1 | Sensor board (Board B). Soldered, not breadboard — see Physical Build note |
@@ -77,52 +77,65 @@ All I2C devices share the Pi's hardware I2C bus on GPIO2 (SDA) and GPIO3 (SCL).
 |---|---|---|---|
 | GPIO2 | 3 | I2C SDA | VL53L1X, ADS1115, MPR121 (shared) |
 | GPIO3 | 5 | I2C SCL | VL53L1X, ADS1115, MPR121 (shared) |
-| GPIO4 | 7 | Digital input | AM312 OUT |
+| GPIO4 | 7 | Digital input | AM312 #1 OUT |
+| GPIO23 | 16 | Digital input | AM312 #2 OUT |
 | GPIO17 | 11 | Digital input (frequency counter) | TLC555 pin 3 (OUTPUT) |
 | GPIO27 | 13 | Digital input (interrupt) | MPR121 IRQ |
 | 3.3V | 1, 17 | Power | All sensors + TLC555 + I2C pull-ups |
 | GND | 6, 9, 14, 20, etc. | Ground | All sensors common ground |
 
-GPIO4, GPIO17, and GPIO27 are arbitrary choices — any free GPIO works. Update the backend config if reassigned. The MPR121 IRQ is optional but strongly preferred over polling.
+GPIO4, GPIO23, GPIO17, and GPIO27 are arbitrary choices — any free GPIO works. Update the backend config if reassigned. The MPR121 IRQ is optional but strongly preferred over polling.
 
 ---
 
 ## Per-Sensor Detail
 
-### AM312 PIR Motion Sensor
+### AM312 PIR Motion Sensors (×2)
 
-**Purpose:** Detect that a person has entered the kiosk's vicinity. Used as a coarse presence signal (e.g., wake the display from idle, start sampling other sensors more aggressively).
+**Purpose:** Detect that a person has entered the kiosk's vicinity. Used as a coarse presence signal (e.g., wake the display from idle, start sampling other sensors more aggressively). **Two units** are mounted on the kiosk near a wall and **fanned outward** to maximize coverage of the room in front — they form one wide presence array, not two semantic zones. Combine them with a logical **OR** in software: motion in *either* cone means "someone is in the room." Each still reports on its own GPIO (so you can tell which fired, useful for diagnostics and the optional crude left/right hint), but the primary signal is the OR.
 
-**Wiring:**
+**Wiring:** Each AM312 is a self-contained 3-pin module — no external circuitry required. Both share the 3.3V and GND buses; only the OUT lines are individual (each must land on its own GPIO — never tie two driven OUT pins together).
 
-| AM312 Pin | Connect To |
-|---|---|
-| VCC | Pi 3.3V |
-| OUT | Pi GPIO4 |
-| GND | Pi GND |
+| AM312 Pin | Sensor #1 | Sensor #2 |
+|---|---|---|
+| VCC | Pi 3.3V (shared bus) | Pi 3.3V (shared bus) |
+| OUT | Pi GPIO4 | Pi GPIO23 |
+| GND | Pi GND (shared bus) | Pi GND (shared bus) |
+
+**Decoupling:** Fit a **0.1µF ceramic cap across VCC↔GND at each sensor's pins** (as close to the module as possible). The AM312's pyroelectric front-end makes its OUT comparator sensitive to supply ripple — local decoupling suppresses noise-induced false triggers from the shared rail (I²C device switching, the TLC555 oscillator). Add a 10µF bulk cap in parallel only if the 3.3V run to a sensor is long; on this compact board the 0.1µF alone is sufficient. Note this is *separate* from the power-up false triggers — those are the settling window below, not supply noise, and are handled in software.
+
+> **This cap is noise-margin insurance, not a mandatory part.** The AM312 module already carries minimal onboard decoupling (a small SMD ceramic or two on its supply), so unlike the VL53L5CX reservoir cap — which prevents an outright brown-out over 2 m of Cat5 — the sensor will *function* without this external 0.1µF. It's cheap belt-and-suspenders specifically because the AM312 shares a noisy rail with the TLC555 oscillator and switching I²C devices, and its onboard decoupling is sized for the chip, not for that environment. Fit it (low cost, no downside); but if you're short a part, it's the AM312, not the L5CX, that can tolerate going without.
 
 **Behavior:**
 
 - Output goes HIGH (3.3V) when motion is detected, LOW after a hold period (~2 seconds, fixed; not adjustable on AM312).
 - **Power-up settling time: 30-60 seconds.** During this window the output is unreliable and will false-trigger. The backend must suppress all events for the first 60 seconds after boot.
 - Detection range with included Fresnel lens: ~3-5m, ~100° FOV.
-- Blind to motion *directly toward* the sensor; responds best to lateral motion across zones.
+- Blind to motion *directly toward* the sensor; responds best to motion crossing the cone laterally (see the fan-outward placement guidance).
 - Sees only changes in IR — a person standing perfectly still becomes invisible after a few seconds.
 
 **Software interface (gpiozero):**
 
 ```python
 from gpiozero import MotionSensor
-pir = MotionSensor(4)
-pir.when_motion = on_motion_callback
-pir.when_no_motion = on_no_motion_callback
+pir_left  = MotionSensor(4)   # left-fanned cone
+pir_right = MotionSensor(23)  # right-fanned cone
+
+# OR'd presence: someone is in the room if EITHER cone sees motion.
+def room_occupied():
+    return pir_left.motion_detected or pir_right.motion_detected
+
+for pir in (pir_left, pir_right):
+    pir.when_motion = on_motion_callback      # re-evaluate room_occupied()
+    pir.when_no_motion = on_no_motion_callback
 ```
 
 **Backend behavior notes:**
 
-- Treat as edge-triggered: emit `motion_started` event on rising edge, `motion_ended` on falling edge (after the AM312's internal hold time elapses).
+- Treat as edge-triggered on the **combined OR**: emit `motion_started` when the room goes from unoccupied→occupied (either cone rises while both were low), `motion_ended` when *both* cones have fallen (after each AM312's internal hold time elapses). Don't emit a `motion_ended` just because one of the two dropped while the other is still HIGH — that would flap as a person crosses the overlap between cones.
 - Do not emit events during the first 60 seconds post-boot.
-- Debounce is handled by the AM312 itself; no software debouncing needed.
+- Debounce is handled by the AM312 itself; no software debouncing needed. The OR combination further smooths the seam between the two cones.
+- **Feature-flagged, fallback-safe.** The Python `PirDriver` always publishes the OR'd `motion` channel, but it only *affects behaviour* when the server's `MOTION_PRESENCE` flag is on (default **off**). With it off — or if the AM312s aren't wired/working — room occupancy is derived purely from the VL53L1X distance feed, exactly as it is without any PIR. This is deliberate: the AM312 bring-up is uncertain, so motion is an opt-in augmentation over a reliable distance-only baseline, never a dependency. When on, motion can only *add* presence (forces "occupied", held `MOTION_HOLD_S` after motion stops); distance still owns the "empty" transition, so the AM312's blindness to a perfectly still person can't falsely empty a room. All three presence triggers follow the fused occupancy: the **entry bell** rings on the empty→occupied edge (motion onset, or a ToF approach), **voice-on-leave** on the confirmed-empty edge, and the **toll** while occupied. With the flag off, each falls back to its pure-distance path (the bell to its sustained inward-approach gate). Pins come from `PIR_PINS` (default `4,23`); see `server/README.md` for the flag, `python/README.md` for the driver.
 
 ---
 
@@ -408,7 +421,13 @@ The backend code should initialize the ADS1115 but not require any channels to b
 3. **Decoupling.** 0.1µF ceramic from Vcc to GND at each sensor module (most have one onboard; adding one doesn't hurt). One on the TLC555 pin 8 is mandatory.
 4. **TLC555 circuit.** Build per the schematic above (socket the DIP-8). Verify with a multimeter or scope that pin 3 is oscillating before connecting to the Pi GPIO. With the HR202 in normal room air, expect ~1-2 kHz at pin 3.
 5. **I²C wire length.** On-board runs: keep short, no special handling. The **remote VL53L1X at 2 m goes over Cat5 twisted pairs** — see "Remote VL53L1X over Cat5" above for the pair assignment and grounding. Don't run 2 m of loose hookup wire.
-6. **AM312 placement.** Mount where motion crosses laterally, not toward the sensor. For a kiosk this typically means perpendicular to the approach path.
+6. **AM312 placement (two units, wall-backed, fanned outward).** Mount both on the kiosk near the wall, pointed out into the room to cover as much of it as possible. Each lens is ~100° FOV / ~3–5 m range, so:
+   - **Splay them ~80–90° apart** — i.e. each aimed ~40–45° off the wall-normal, one to the left, one to the right. Two ~100° cones at that splay span roughly the full ~180° half-space in front of the wall with only modest overlap down the center. Wider splay leaves a center gap; narrower wastes coverage on redundant overlap.
+   - **Mind the radial blind spot.** An AM312 is weakest at motion heading *straight at it*; it responds best to motion crossing its cone laterally. Fanning outward turns most room traffic into lateral motion relative to at least one sensor — but a person walking dead-on toward the kiosk (down the center seam) is the worst case. The OR combination and the center overlap help cover that seam; don't leave a hard gap there.
+   - **Clear the kiosk body and wall.** Set the lenses proud of the enclosure so the kiosk shell and the wall don't clip the inner edge of each cone. Being right against the wall is fine — it just bounds coverage to the ~180° in front, which is the intent.
+   - **Slight downward tilt** (a few degrees) helps catch people at a range of distances rather than aiming over near visitors' heads; aim the cones across the room at roughly torso height.
+   - **Keep them off heat sources.** PIRs false-trigger on moving thermal gradients — avoid pointing either cone at an HVAC vent, a sunlit window/doorway, or the kiosk's own display/PSU exhaust. The 0.1 µF decoupling caps handle *electrical* noise, not these thermal sources.
+   - **Range, not just angle, bounds coverage.** ~3–5 m means a large room won't be fully covered in depth — the far end past ~5 m won't register. If the room is deep, accept that motion presence only fires once visitors are within range, or supplement with a sensor placed deeper in the room.
 7. **VL53L1X placement.** Aim at adult chest height, horizontally, with nothing stationary in the 15° cone within 1 m. (Mounted remotely on the Cat5 run.)
 8. **HR202 placement.** Exposed, on a short standoff, oriented toward where the user's face will be. Protect from physical contact but keep airflow unrestricted.
 
@@ -422,7 +441,7 @@ the bus distribution, and the connectors.
 ```
    ↑ top edge — Pi-entry header (F-F jumpers from Pi GPIO) ↑
   ┌──────────────────────────────────────────────────────────┐
-  │ [Pi entry 7p: 3V3 GND SDA SCL G4 G17 G27]                 │
+  │ [Pi entry 8p: 3V3 GND SDA SCL G4 G23 G17 G27]             │
   │  3V3 bus ═══════════════════════════════════════════      │
   │  SDA bus ───────────────────────────────────────────      │
   │  SCL bus ───────────────────────────────────────────      │
@@ -433,7 +452,8 @@ the bus distribution, and the connectors.
   │  │  socket  │  (C0G)     │ +IRQ→G27 │   │          │       │
   │  └──────────┘  pin5 10nF └──────────┘   └──────────┘       │
   │   HR202 on leads →   ▤0.1µF                                │
-  │  [AM312 3p: VCC OUT→G4 GND]   [Cat5 landing → VL53L1X]     │
+  │  [AM312#1 VCC OUT→G4 GND ▤0.1µF][AM312#2 OUT→G23 ▤0.1µF]   │
+  │                               [Cat5 landing → VL53L1X]     │
   │  GND bus ═══════════════════════════════════════════      │
   └──────────────────────────────────────────────────────────┘
 ```
@@ -446,9 +466,10 @@ the bus distribution, and the connectors.
 | 2 | 6 | GND → GND bus |
 | 3 | 3 | SDA → SDA bus |
 | 4 | 5 | SCL → SCL bus |
-| 5 | 7 | GPIO4 ← AM312 OUT |
-| 6 | 11 | GPIO17 ← TLC555 pin 3 |
-| 7 | 13 | GPIO27 ← MPR121 IRQ |
+| 5 | 7 | GPIO4 ← AM312 #1 OUT |
+| 6 | 16 | GPIO23 ← AM312 #2 OUT |
+| 7 | 11 | GPIO17 ← TLC555 pin 3 |
+| 8 | 13 | GPIO27 ← MPR121 IRQ |
 
 **Buses → loads:** 3V3 bus to every module VCC/VDD/VIN + both pull-up tops +
 TLC555 pin 8. GND bus to every module GND + TLC555 pin 1 + pull-down legs +
@@ -468,7 +489,7 @@ For the **first board to build**, use only the two I²C devices: **MPR121**
 - **TLC555 + HR202** (breath trigger) — the entire oscillator circuit, R1, C1,
   the two timing caps, and GPIO17.
 - **ADS1115** (unused ADC) — and its bus tap.
-- **AM312** (PIR motion) — and GPIO4.
+- **AM312 ×2** (PIR motion) — and GPIO4 / GPIO23.
 
 Both remaining devices are I²C, so the board reduces to: bus distribution +
 the two pull-ups + one MPR121 socket + the Cat5 landing. It fits on a much
@@ -519,7 +540,9 @@ and **0x5A** (MPR121) — not 0x48, and no GPIO-based sensors. The 4.7 kΩ
 pull-ups stay (still need them for the bus; the VL53L1X breakout's are weak).
 
 **Adding the rest later** is non-destructive — each omitted device just taps
-the existing buses: AM312 = 3 wires (VCC/OUT→a free GPIO/GND, no circuitry);
+the existing buses: each AM312 = 3 wires (VCC/OUT→a free GPIO/GND) + a 0.1µF
+cap across its VCC↔GND — two units (GPIO4, GPIO23) share the 3V3/GND buses, so
+4 wires total for the pair plus the two caps;
 ADS1115 = 4 wires onto the I²C bus (0x48); TLC555 breath = the oscillator
 circuit + GPIO17 per the full layout above.
 
@@ -530,7 +553,7 @@ and `touch_changed(channel, state)` — no `motion_started`/`motion_ended` or
 **Sanity check sequence after wiring:**
 
 1. `sudo i2cdetect -y 1` — should show 0x29, 0x48, 0x5A reliably.
-2. Read GPIO4 in a loop and wave a hand — should toggle HIGH/LOW.
+2. Read GPIO4 and GPIO23 in a loop and wave a hand at each AM312 — both should toggle HIGH/LOW independently.
 3. Frequency-count GPIO17 — should read ~1-2 kHz at room humidity; blow gently on the HR202 and watch it spike.
 4. Read VL53L1X — should return a sensible distance to a hand held in front of the sensor.
 5. Touch MPR121 electrodes — `mpr[n].value` should reflect touch state per channel.

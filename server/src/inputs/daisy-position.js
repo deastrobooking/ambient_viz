@@ -45,22 +45,54 @@ const MIN_WRITE_MS = 33; // cap each CC to ~30 Hz (complication #13)
 
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const envNum = (k, d) => { const v = parseFloat(process.env[k]); return Number.isFinite(v) ? v : d; };
+const envBool = (k, d) => { const v = process.env[k]; return v == null ? d : /^(1|true|yes|on)$/i.test(v.trim()); };
+
+// --- AM312 motion presence (opt-in) -----------------------------------------
+// FEATURE FLAG, default OFF. When off, room occupancy is derived purely from
+// the ToF distance feed exactly as it always has been — the AM312s are ignored
+// even if the Python sidecar is publishing `motion`. This is the deliberate,
+// reliable fallback: if the AM312 wiring isn't done or doesn't work, leave this
+// off and nothing changes.
+//
+// When ON, the OR'd AM312 `motion` channel AUGMENTS occupancy: a motion hit
+// forces the room "occupied" and holds it for MOTION_HOLD_S after motion stops.
+// Motion can only ADD presence, never remove it — so the distance logic still
+// governs the "empty" baseline, and the AM312's blindness to a perfectly still
+// person can never *falsely* empty a room the ToF still sees. The hold bridges
+// both the AM312's ~2 s internal drop and its stillness-blindness (a visitor
+// who stops moving keeps counting as present until the hold lapses). All three
+// presence triggers key off this fused occupancy: the entry bell fires on the
+// empty->occupied edge (motion onset, or a ToF approach), voice-on-leave on the
+// confirmed empty edge, and the toll while occupied. With the flag OFF each
+// reverts to its pure-distance path — the entry bell to its sustained-approach
+// gate, voice/toll to distance hysteresis.
+//
+// Safety backstop: even with the flag ON, if no `motion` events ever arrive
+// (AM312 dead / miswired), occupancy silently reverts to the distance path —
+// the bell then fires on the distance occupancy edge rather than the richer
+// sustained-approach gate, so prefer the flag OFF if the AM312s aren't trusted.
+const MOTION_PRESENCE = envBool('MOTION_PRESENCE', false);
+const MOTION_HOLD_S = Math.max(0, envNum('MOTION_HOLD_S', 20)); // hold occupied this long after last motion
+const MOTION_HOLD_MS = MOTION_HOLD_S * 1000;
 
 // --- Bell-on-entry ----------------------------------------------------------
 // Ring the firmware's FM bell (a MIDI note-on; FmStab strikes it on top of the
-// mix, just before the limiter) the moment someone enters the space.
+// mix, just before the limiter) when someone arrives at the kiosk.
 //
-// "Empty room" = the learned far reach (distance_far_cm, the empty-room
-// distance the Python sidecar learns). The trigger is edge-detected by a small
-// state machine so it fires exactly once per arrival:
-//   - ARM only after the room has read empty for BELL_REARM_EMPTY_S, so a
-//     fresh trigger always follows a genuine "the room went quiet" stretch.
-//   - FIRE when an armed room is penetrated by BELL_ENTER_FRACTION of its depth
-//     AND the visitor is actively moving inward (distance_velocity_cm_s, which
-//     is negative on approach). The depth gate rejects someone hovering at the
-//     edge; the velocity gate rejects a slow furniture shuffle or a drifting
-//     empty-room estimate.
-//   - then DISARM until the room returns to empty for the full re-arm window.
+// Thresholds key off the learned far reach (distance_far_cm). The trigger is a
+// small state machine that fires once per arrival:
+//   - ARM once the nearest target has receded past the empty band for
+//     BELL_REARM_RECEDE_S — LOCAL turnover ("whoever was here stepped back"),
+//     not a whole-room empty. A single-point ToF in a continuously-occupied
+//     room rarely reads empty for long, which starved the old empty-room arming.
+//   - FIRE when an armed scene is penetrated by BELL_ENTER_FRACTION of its depth
+//     AND the visitor moves inward (distance_velocity_cm_s, negative on
+//     approach) for BELL_APPROACH_SUSTAIN consecutive samples. The depth gate
+//     rejects edge-hoverers; the sustained-velocity gate rejects a furniture
+//     shuffle, a drifting estimate, or a one-frame occlusion spike (e.g. a
+//     second visitor cutting in front of the tracked one).
+//   - DISARM after firing, and refuse any strike within BELL_COOLDOWN_S of the
+//     last (a refractory cooldown shared with the toll below).
 const BELL_NOTE = clamp(Math.round(envNum('BELL_NOTE', 81)), 0, 127); // A5 ~880 Hz
 const BELL_VELOCITY = clamp(Math.round(envNum('BELL_VELOCITY', 100)), 1, 127);
 // 1-in-N entries strike the harsher "industrial" FmStab patch instead of the
@@ -70,9 +102,22 @@ const BELL_INDUSTRIAL_PROB = clamp(envNum('BELL_INDUSTRIAL_PROB', 0.1), 0, 1);
 const BELL_INDUSTRIAL_NOTE = clamp(Math.round(envNum('BELL_INDUSTRIAL_NOTE', BELL_NOTE)), 0, 127);
 const BELL_ENTER_FRACTION = envNum('BELL_ENTER_FRACTION', 0.15); // come in 15% of the depth
 const BELL_EMPTY_FRACTION = envNum('BELL_EMPTY_FRACTION', 0.08); // within 8% of far = "empty"
-const BELL_REARM_EMPTY_S = envNum('BELL_REARM_EMPTY_S', 10); // hold empty this long to re-arm
+const BELL_REARM_RECEDE_S = envNum('BELL_REARM_RECEDE_S', 2.5); // nearest target receded past empty this long -> re-arm
+const BELL_COOLDOWN_S = envNum('BELL_COOLDOWN_S', 30); // min gap between ANY two strikes (entry or toll)
 const BELL_APPROACH_CM_S = envNum('BELL_APPROACH_CM_S', 2.0); // min inward speed to count as entering
-const BELL_TICK_MS = 500; // re-evaluate arming even when distance_cm is static
+const BELL_APPROACH_SUSTAIN = Math.max(1, Math.round(envNum('BELL_APPROACH_SUSTAIN', 3))); // consecutive inward samples to fire
+const BELL_TICK_MS = 500; // re-evaluate arming + toll even when distance_cm is static
+
+// --- Periodic toll ----------------------------------------------------------
+// A room that stays occupied gives the entry bell no fresh "empty -> approach"
+// edge, so it would fall silent for the whole visit. Instead, while occupied,
+// strike a toll at a random interval in [TOLL_MIN_S, TOLL_MAX_S] and sometimes
+// skip one entirely (TOLL_SKIP_PROB) — a slow, irregular recurrence, not a
+// metronome. Shares the bell's strike path + cooldown; the clock resets after
+// any strike so a toll never treads on a fresh entry bell.
+const TOLL_MIN_S = Math.max(0, envNum('TOLL_MIN_S', 120)); // shortest gap between tolls
+const TOLL_MAX_S = Math.max(TOLL_MIN_S, envNum('TOLL_MAX_S', 180)); // longest gap
+const TOLL_SKIP_PROB = clamp(envNum('TOLL_SKIP_PROB', 0.25), 0, 1); // chance a due toll is skipped
 
 // --- Voice-on-leave ---------------------------------------------------------
 // Speak "pain material" (the firmware's formant speech voice + reverb, struck
@@ -105,13 +150,28 @@ const lastWriteAt = {}; // cc# -> last write time (throttle)
 let lastDistanceCm = null; // most recent distance_cm
 let lastVelocityCmS = 0; // most recent distance_velocity_cm_s (approach negative)
 let bellArmed = false; // ready to ring on the next entry
-let emptySinceMs = null; // when the room first read empty in the current empty run
+let emptySinceMs = null; // when the nearest target first receded past the empty band
+let approachFrames = 0; // consecutive fresh samples satisfying the inward-approach gate
+let lastBellMs = 0; // last strike (entry OR toll) — drives the shared refractory cooldown
+let nextTollMs = null; // scheduled time of the next occupied-room toll (null when empty)
 
 // Voice-on-leave state.
 let roomOccupied = false; // hysteretic occupancy (near -> true, far -> false)
 let occupiedSinceMs = null; // when the current occupancy began
 let voicePending = false; // a genuine visit happened, awaiting a confirmed leave
 let voiceEmptySinceMs = null; // when the room first read empty after that visit
+
+// AM312 motion-presence state (only consulted when MOTION_PRESENCE is on).
+let motionActive = false; // latest OR'd AM312 state (true = a cone sees motion)
+let lastMotionMs = -Infinity; // when motion last fell low; -inf = never seen
+
+// Whether the AM312 array counts the room as occupied right now: motion is held
+// high, OR motion fell low within the hold window. Always false when the flag
+// is off, so callers collapse to the pure-distance path.
+function motionPresent(nowMs) {
+  if (!MOTION_PRESENCE) return false;
+  return motionActive || (nowMs - lastMotionMs) <= MOTION_HOLD_MS;
+}
 
 function writeCc(cc, value) {
   const v = clamp(Math.round(value), 0, 127);
@@ -133,56 +193,113 @@ function writeNoteOn(note, velocity, channel = 0) {
   port.write(Buffer.from([0x90 | (clamp(Math.round(channel), 0, 15)), n, v]));
 }
 
-// Edge-detect "someone entered the space" against the learned empty-room reach
-// and ring the bell once. Called both on distance_cm updates (snappy trigger)
-// and on a slow timer (so arming still progresses when the empty room is so
-// still that distance_cm stops changing).
-function updateBellTrigger(nowMs) {
-  if (lastDistanceCm === null || !(farCm > 0)) return;
-  const enterThresh = farCm * (1 - BELL_ENTER_FRACTION); // cross BELOW to trigger
-  const emptyThresh = farCm * (1 - BELL_EMPTY_FRACTION); // stay ABOVE to count as empty
+// Roll the next toll to a random point in [TOLL_MIN_S, TOLL_MAX_S].
+function scheduleNextToll(nowMs) {
+  nextTollMs = nowMs + (TOLL_MIN_S + Math.random() * (TOLL_MAX_S - TOLL_MIN_S)) * 1000;
+}
 
-  if (lastDistanceCm >= emptyThresh) {
-    // Room reads empty — run the re-arm timer.
+// One bell/industrial strike, shared by the entry trigger and the toll. Picks
+// the timbre, stamps the shared cooldown, and (while occupied) re-rolls the
+// toll so it never lands right on top of a just-rung strike.
+function strikeBell(nowMs, reason) {
+  const industrial = Math.random() < BELL_INDUSTRIAL_PROB;
+  if (industrial) writeNoteOn(BELL_INDUSTRIAL_NOTE, BELL_VELOCITY, 1);
+  else writeNoteOn(BELL_NOTE, BELL_VELOCITY, 0);
+  lastBellMs = nowMs;
+  if (roomOccupied) scheduleNextToll(nowMs);
+  console.log(`daisy-position: ${industrial ? 'industrial' : 'bell'} (${reason})`);
+}
+
+// Motion-mode entry bell (MOTION_PRESENCE on). With the AM312s covering the
+// room, "someone arrived" is simply the occupancy rising edge — fire once when
+// the room flips empty->occupied. Reuses the same arm/cooldown machinery as the
+// distance path: the room must first read empty for BELL_REARM_RECEDE_S (so a
+// person already present at boot doesn't ring), then the next time occupancy
+// goes true (motion onset, or the ToF crossing the enter band) strikes the bell.
+// roomOccupied is computed by computeOccupancy() before this runs.
+function updateBellTriggerMotion(nowMs) {
+  if (!roomOccupied) {
+    // Room empty — arm after a short hold so we ring on the NEXT arrival.
     if (emptySinceMs === null) emptySinceMs = nowMs;
-    if (!bellArmed && nowMs - emptySinceMs >= BELL_REARM_EMPTY_S * 1000) {
-      bellArmed = true;
-    }
+    if (!bellArmed && nowMs - emptySinceMs >= BELL_REARM_RECEDE_S * 1000) bellArmed = true;
     return;
   }
-
-  // Someone/something is nearer than empty — the empty run is broken.
+  // Room occupied — the empty run is broken.
   emptySinceMs = null;
-
-  // Fire once: armed, penetrated the entry depth, and actively moving inward.
-  const inwardSpeed = -lastVelocityCmS; // approach is negative
-  if (bellArmed && lastDistanceCm <= enterThresh && inwardSpeed >= BELL_APPROACH_CM_S) {
-    const industrial = Math.random() < BELL_INDUSTRIAL_PROB;
-    if (industrial) {
-      writeNoteOn(BELL_INDUSTRIAL_NOTE, BELL_VELOCITY, 1);
-    } else {
-      writeNoteOn(BELL_NOTE, BELL_VELOCITY, 0);
-    }
-    bellArmed = false; // locked until the room returns to empty for the re-arm window
-    console.log(
-      `daisy-position: ${industrial ? 'industrial' : 'bell'} (entry at `
-      + `${lastDistanceCm.toFixed(0)}cm, ${inwardSpeed.toFixed(1)}cm/s in, far=${farCm.toFixed(0)}cm)`,
-    );
+  if (bellArmed && nowMs - lastBellMs >= BELL_COOLDOWN_S * 1000) {
+    strikeBell(nowMs, motionActive ? 'entry (motion)' : 'entry (motion-mode, ToF)');
+    bellArmed = false; // locked until the room empties again + the cooldown
   }
 }
 
-// Edge-detect "the room emptied after a real visit" and speak "pain material"
-// once. Same call cadence as the bell (distance_cm updates + the slow tick).
-function updateVoiceTrigger(nowMs) {
+// Edge-detect "someone arrived at the kiosk" and ring the bell once. Called on
+// distance_cm updates (the snappy path, `fresh` true) and on a slow timer
+// (`fresh` false), so arming still progresses when a still scene stops emitting
+// distance_cm changes. The sustained-approach counter only advances on fresh
+// samples — the tick carries no new reading.
+function updateBellTrigger(nowMs, fresh) {
+  // Motion mode: occupancy-edge bell (above). Off mode falls through to the
+  // distance approach logic below — the reliable, unchanged fallback.
+  if (MOTION_PRESENCE) { updateBellTriggerMotion(nowMs); return; }
   if (lastDistanceCm === null || !(farCm > 0)) return;
-  const enterThresh = farCm * (1 - BELL_ENTER_FRACTION); // near -> occupied
-  const emptyThresh = farCm * (1 - BELL_EMPTY_FRACTION); // far -> empty
+  const enterThresh = farCm * (1 - BELL_ENTER_FRACTION); // cross BELOW to trigger
+  const emptyThresh = farCm * (1 - BELL_EMPTY_FRACTION); // recede ABOVE to re-arm
 
-  // Hysteretic occupancy: flip on a clear near/far reading, hold in the band so
-  // someone walking out doesn't chatter between states.
-  if (lastDistanceCm <= enterThresh) roomOccupied = true;
-  else if (lastDistanceCm >= emptyThresh) roomOccupied = false;
+  if (lastDistanceCm >= emptyThresh) {
+    // Nearest target has receded past the empty band — local turnover. Arm after
+    // a short hold so a brief step-back re-arms without needing a full room clear.
+    if (emptySinceMs === null) emptySinceMs = nowMs;
+    if (!bellArmed && nowMs - emptySinceMs >= BELL_REARM_RECEDE_S * 1000) bellArmed = true;
+    approachFrames = 0;
+    return;
+  }
 
+  // Someone/something is nearer than the empty band — the recede run is broken.
+  emptySinceMs = null;
+
+  // Count sustained inward approach on fresh samples only, so a single-frame
+  // occlusion spike (a second visitor cutting in front) can't reach the gate.
+  if (fresh) {
+    const inwardSpeed = -lastVelocityCmS; // approach is negative
+    if (lastDistanceCm <= enterThresh && inwardSpeed >= BELL_APPROACH_CM_S) approachFrames += 1;
+    else approachFrames = 0;
+  }
+
+  // Fire once: armed, sustained approach, and clear of the shared cooldown.
+  if (bellArmed && approachFrames >= BELL_APPROACH_SUSTAIN
+      && nowMs - lastBellMs >= BELL_COOLDOWN_S * 1000) {
+    strikeBell(
+      nowMs,
+      `entry at ${lastDistanceCm.toFixed(0)}cm, ${(-lastVelocityCmS).toFixed(1)}cm/s in, far=${farCm.toFixed(0)}cm`,
+    );
+    bellArmed = false; // locked until the nearest target recedes again + the cooldown
+    approachFrames = 0;
+  }
+}
+
+// Single owner of `roomOccupied`, evaluated before every trigger so the bell,
+// voice, and toll all read one consistent occupancy. Distance hysteresis is the
+// always-on baseline; motion (opt-in) augments it.
+function computeOccupancy(nowMs) {
+  // Hysteretic occupancy from distance: flip on a clear near/far reading, hold
+  // in the band so someone walking out doesn't chatter between states.
+  if (lastDistanceCm !== null && farCm > 0) {
+    const enterThresh = farCm * (1 - BELL_ENTER_FRACTION); // near -> occupied
+    const emptyThresh = farCm * (1 - BELL_EMPTY_FRACTION); // far -> empty
+    if (lastDistanceCm <= enterThresh) roomOccupied = true;
+    else if (lastDistanceCm >= emptyThresh) roomOccupied = false;
+  }
+
+  // Motion fusion (opt-in): an AM312 hit forces occupancy and suppresses the
+  // empty transition. Augment-only — motion never *clears* occupancy, so the
+  // distance path above remains the sole owner of "empty." No-ops when the flag
+  // is off (motionPresent() is always false), preserving the distance fallback.
+  if (motionPresent(nowMs)) roomOccupied = true;
+}
+
+// Edge-detect "the room emptied after a real visit" and speak "pain material"
+// once. Reads the occupancy that computeOccupancy() has already set.
+function updateVoiceTrigger(nowMs) {
   if (roomOccupied) {
     if (occupiedSinceMs === null) occupiedSinceMs = nowMs;
     voiceEmptySinceMs = null;
@@ -206,13 +323,45 @@ function updateVoiceTrigger(nowMs) {
   }
 }
 
-// Both distance-driven triggers, evaluated together.
-function updateTriggers(nowMs) {
-  updateBellTrigger(nowMs);
+// While the room stays occupied, strike a toll at a random interval, sometimes
+// skipping one — the entry bell can't fire without a fresh empty->approach edge,
+// so this keeps the bell present through a long visit.
+function updateToll(nowMs) {
+  if (!roomOccupied) { nextTollMs = null; return; } // clears so re-entry re-rolls
+  if (nextTollMs === null) { scheduleNextToll(nowMs); return; }
+  if (nowMs < nextTollMs) return;
+  if (nowMs - lastBellMs < BELL_COOLDOWN_S * 1000) { scheduleNextToll(nowMs); return; }
+  if (Math.random() < TOLL_SKIP_PROB) {
+    scheduleNextToll(nowMs);
+    console.log('daisy-position: toll skipped');
+    return;
+  }
+  strikeBell(nowMs, `toll, far=${farCm.toFixed(0)}cm`); // re-rolls nextTollMs
+}
+
+// All presence triggers, evaluated together. `fresh` marks a real distance_cm
+// sample (vs the slow tick); it gates the sustained-approach counter (distance
+// bell only). computeOccupancy runs first so the bell, voice, and toll all read
+// one consistent roomOccupied for this evaluation.
+function updateTriggers(nowMs, fresh) {
+  computeOccupancy(nowMs);
+  updateBellTrigger(nowMs, fresh);
   updateVoiceTrigger(nowMs);
+  updateToll(nowMs);
 }
 
 function onChange(name, value) {
+  // `motion` arrives as a bool (AM312 OR'd state) — handle it before the numeric
+  // guard below. Stamp lastMotionMs on every edge so the hold window measures
+  // from the moment motion *fell* low; while held high, motionActive covers it.
+  if (name === 'motion') {
+    motionActive = value === true || value === 1;
+    lastMotionMs = Date.now();
+    // Re-evaluate occupancy promptly so a motion hit can arm/extend a visit
+    // without waiting on the next distance sample or the slow tick.
+    updateTriggers(Date.now(), false);
+    return;
+  }
   if (typeof value !== 'number') return;
   if (name === 'distance_near_cm') {
     // Effect onset, shared with the visualizer; keep it below the far reach.
@@ -225,7 +374,7 @@ function onChange(name, value) {
     const failure = span > 0 ? clamp((value - nearCm) / span, 0, 1) : (value >= farCm ? 1 : 0);
     writeCc(CC_TAPE_FAILURE, failure * 127);
     lastDistanceCm = value;
-    updateTriggers(Date.now());
+    updateTriggers(Date.now(), true);
   } else if (name === 'distance_velocity_cm_s') {
     lastVelocityCmS = value;
   } else if (name === 'freeze') {
@@ -272,9 +421,16 @@ module.exports = ({ publish, bus }) => {
   // and speak on leave.
   if (bus) bus.on('change', (e) => onChange(e.name, e.value));
 
-  // Keep the entry re-arm + leave-confirm timers advancing even while a dead-
-  // still empty room emits no distance_cm changes (it's deduped on-change).
-  triggerTimer = setInterval(() => updateTriggers(Date.now()), BELL_TICK_MS);
+  console.log(
+    MOTION_PRESENCE
+      ? `daisy-position: AM312 motion presence ON (hold ${MOTION_HOLD_S}s; augments distance occupancy)`
+      : 'daisy-position: AM312 motion presence OFF (occupancy is distance-only)',
+  );
+
+  // Keep the entry re-arm + leave-confirm + toll timers advancing even while a
+  // dead-still room emits no distance_cm changes (it's deduped on-change). The
+  // tick is not a fresh sample, so it never advances the sustained-approach gate.
+  triggerTimer = setInterval(() => updateTriggers(Date.now(), false), BELL_TICK_MS);
   if (typeof triggerTimer.unref === 'function') triggerTimer.unref();
 
   open();

@@ -280,12 +280,13 @@ def _make_backend(i2c):
 
 
 class DistanceDriver:
-    # Seconds with no valid read before we snap to the far reach. Long enough
-    # to ride out the typical multi-frame dropouts on a real target (a moving
-    # hand drops 1-3 frames at a time), short enough that walking out of the
-    # cone shows up as "idle" within a beat rather than holding the user's last
-    # close-range position for multiple seconds.
-    NO_TARGET_TIMEOUT_S = 0.6
+    # Seconds with no valid read before we snap to the far reach. Long enough to
+    # ride out multi-frame dropouts (dark clothing, an oblique torso, projector
+    # IR) that would otherwise flicker a present visitor to "empty"; the cost is
+    # that a genuine walk-away takes this long to register as idle. Presence
+    # favours ride-out over snappiness, so the default sits above the old 0.6 s.
+    # Env-overridable via NO_TARGET_TIMEOUT_S (see config.py).
+    NO_TARGET_TIMEOUT_S = config.NO_TARGET_TIMEOUT_S
 
     def __init__(self, ingest, mock: bool = False):
         self.ingest = ingest
