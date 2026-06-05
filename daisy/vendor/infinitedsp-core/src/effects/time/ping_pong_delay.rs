@@ -108,6 +108,11 @@ impl FrameProcessor<Stereo> for PingPongDelay {
             delay_samples
         };
 
+        // PATCH (vendored): both ring pointers advance by exactly 1 per frame, so
+        // replace the two per-sample `% len` (len is non-power-of-2 → integer
+        // division each) with a running read pointer + branch-subtract wrap.
+        // Bit-identical to the modulo form for the constant per-block delay.
+        let mut read_ptr = (self.write_ptr + len - delay_samples) % len;
         for (i, frame) in buffer.chunks_mut(2).enumerate() {
             if frame.len() < 2 {
                 break;
@@ -118,8 +123,6 @@ impl FrameProcessor<Stereo> for PingPongDelay {
 
             let fb = self.feedback_buffer[i];
             let mix = self.mix_buffer[i];
-
-            let read_ptr = (self.write_ptr + len - delay_samples) % len;
 
             let delayed_l = self.left_buffer[read_ptr];
             let delayed_r = self.right_buffer[read_ptr];
@@ -133,7 +136,14 @@ impl FrameProcessor<Stereo> for PingPongDelay {
             frame[0] = input_l * (1.0 - mix) + delayed_l * mix;
             frame[1] = input_r * (1.0 - mix) + delayed_r * mix;
 
-            self.write_ptr = (self.write_ptr + 1) % len;
+            self.write_ptr += 1;
+            if self.write_ptr == len {
+                self.write_ptr = 0;
+            }
+            read_ptr += 1;
+            if read_ptr == len {
+                read_ptr = 0;
+            }
         }
     }
 

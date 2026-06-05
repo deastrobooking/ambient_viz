@@ -113,7 +113,12 @@ impl Stutter {
         self.last_trigger = trig;
 
         self.buffer[self.write_pos] = input;
-        self.write_pos = (self.write_pos + 1) % buffer_len;
+        // PATCH (vendored): branch-subtract instead of non-power-of-2 `% buffer_len`
+        // (an integer division) on the always-run write pointer.
+        self.write_pos += 1;
+        if self.write_pos >= buffer_len {
+            self.write_pos = 0;
+        }
 
         if !self.is_stuttering {
             return input;

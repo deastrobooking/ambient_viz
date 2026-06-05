@@ -553,15 +553,23 @@ impl<'a> FrameProcessor<Mono> for SpeechSynth<'a> {
 
             let p = 110.0 * self.cur_pitch;
 
+            // PATCH (vendored): the per-oscillator detune factors
+            // `1 + ((idx/3)*2-1)*0.005` are constant (the voice stack is always 4
+            // oscillators — SpeechSynth::new), so use a precomputed table instead
+            // of recomputing `spread` for all 4 oscillators every sample. Same f32
+            // values as the original expression.
+            const DETUNE: [f32; 4] = [
+                1.0 + ((0.0 / 3.0) * 2.0 - 1.0) * 0.005,
+                1.0 + ((1.0 / 3.0) * 2.0 - 1.0) * 0.005,
+                1.0 + ((2.0 / 3.0) * 2.0 - 1.0) * 0.005,
+                1.0 + ((3.0 / 3.0) * 2.0 - 1.0) * 0.005,
+            ];
             let voiced_stack = self
                 .voice_stack
                 .oscillators
                 .iter_mut()
                 .enumerate()
-                .map(|(idx, osc)| {
-                    let spread = (idx as f32 / 3.0) * 2.0 - 1.0;
-                    osc.tick(p * (1.0 + spread * 0.005))
-                })
+                .map(|(idx, osc)| osc.tick(p * DETUNE[idx]))
                 .sum::<f32>()
                 * 0.25;
 

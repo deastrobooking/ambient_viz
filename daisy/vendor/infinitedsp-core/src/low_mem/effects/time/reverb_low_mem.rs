@@ -3,20 +3,29 @@ use crate::core::channels::Stereo;
 use crate::FrameProcessor;
 use alloc::vec;
 use alloc::vec::Vec;
-use wide::f32x4;
 
 const I16_SCALE: f32 = 32767.0;
 const I16_SCALE_INV: f32 = 1.0 / 32767.0;
 
 /// 4 parallel Comb filters using i16 storage and 2x downsampling.
+///
+/// PATCH (vendored): was `wide::f32x4`, which has NO hardware SIMD on the Daisy's
+/// Cortex-M7 — each f32x4 op is 4 scalar ops plus lane pack/unpack (`splat`,
+/// `to_array`, `reduce_add`) overhead. Rewritten as plain scalar 4-lane. The
+/// feedback/damp params are broadcast scalars (every lane identical), so they
+/// become plain `f32`; only `filter_state` is per-lane. The math and lane order
+/// are preserved (new_input uses the OLD filter_state, then it updates), so the
+/// result is numerically equivalent to the vectorized version (the comb-sum
+/// grouping differs by at most ~1 ULP — inaudible in a reverb tail).
 struct Comb4LowMem {
     buffers: [Vec<i16>; 4],
     pos: [usize; 4],
+    lens: [usize; 4],
 
-    feedback: f32x4,
-    damp: f32x4,
-    damp_inv: f32x4,
-    filter_state: f32x4,
+    feedback: f32,
+    damp: f32,
+    damp_inv: f32,
+    filter_state: [f32; 4],
 }
 
 impl Comb4LowMem {
@@ -36,44 +45,38 @@ impl Comb4LowMem {
                 vec![0; sizes_downsampled[3]],
             ],
             pos: [0; 4],
-            feedback: f32x4::splat(feedback),
-            damp: f32x4::splat(damp),
-            damp_inv: f32x4::splat(1.0 - damp),
-            filter_state: f32x4::ZERO,
+            lens: sizes_downsampled,
+            feedback,
+            damp,
+            damp_inv: 1.0 - damp,
+            filter_state: [0.0; 4],
         }
     }
 
     fn set_params(&mut self, feedback: f32, damp: f32, damp_inv: f32) {
-        self.feedback = f32x4::splat(feedback);
-        self.damp = f32x4::splat(damp);
-        self.damp_inv = f32x4::splat(damp_inv);
+        self.feedback = feedback;
+        self.damp = damp;
+        self.damp_inv = damp_inv;
     }
 
-    fn process_downsampled(&mut self, input: f32x4) -> f32x4 {
-        let d0 = self.buffers[0][self.pos[0]] as f32 * I16_SCALE_INV;
-        let d1 = self.buffers[1][self.pos[1]] as f32 * I16_SCALE_INV;
-        let d2 = self.buffers[2][self.pos[2]] as f32 * I16_SCALE_INV;
-        let d3 = self.buffers[3][self.pos[3]] as f32 * I16_SCALE_INV;
-        let delayed = f32x4::new([d0, d1, d2, d3]);
-
-        let new_input = input + self.filter_state * self.feedback;
-        self.filter_state = delayed * self.damp_inv + self.filter_state * self.damp;
-
-        let to_write = new_input.to_array();
-
-        self.buffers[0][self.pos[0]] = (to_write[0].clamp(-1.0, 1.0) * I16_SCALE) as i16;
-        self.buffers[1][self.pos[1]] = (to_write[1].clamp(-1.0, 1.0) * I16_SCALE) as i16;
-        self.buffers[2][self.pos[2]] = (to_write[2].clamp(-1.0, 1.0) * I16_SCALE) as i16;
-        self.buffers[3][self.pos[3]] = (to_write[3].clamp(-1.0, 1.0) * I16_SCALE) as i16;
-
+    /// Returns the SUM of the 4 comb lanes' delayed outputs (the caller used a
+    /// `f32x4 + f32x4 ... .reduce_add()`; summing the scalar lanes in order is
+    /// equivalent).
+    fn process_downsampled(&mut self, input: f32) -> f32 {
+        let mut out = 0.0;
         for i in 0..4 {
+            let delayed = self.buffers[i][self.pos[i]] as f32 * I16_SCALE_INV;
+            let new_input = input + self.filter_state[i] * self.feedback;
+            self.filter_state[i] = delayed * self.damp_inv + self.filter_state[i] * self.damp;
+            self.buffers[i][self.pos[i]] = (new_input.clamp(-1.0, 1.0) * I16_SCALE) as i16;
+
             self.pos[i] += 1;
-            if self.pos[i] >= self.buffers[i].len() {
+            if self.pos[i] >= self.lens[i] {
                 self.pos[i] = 0;
             }
+            out += delayed;
         }
-
-        delayed
+        out
     }
 
     fn reset(&mut self) {
@@ -81,7 +84,7 @@ impl Comb4LowMem {
             buf.fill(0);
         }
         self.pos = [0; 4];
-        self.filter_state = f32x4::ZERO;
+        self.filter_state = [0.0; 4];
     }
 }
 
@@ -256,15 +259,14 @@ impl FrameProcessor<Stereo> for ReverbLowMem {
                 frame[1] = self.last_out_r;
             } else {
                 let in_down = (self.downsample_acc_l + input_mix) * 0.5;
-                let in_vec = f32x4::splat(in_down);
 
-                let mut out_l_vec = self.combs_l[0].process_downsampled(in_vec);
-                out_l_vec += self.combs_l[1].process_downsampled(in_vec);
-                let mut out_l = out_l_vec.reduce_add();
+                // PATCH (vendored): scalar combs (process_downsampled now returns
+                // the summed 4-lane output).
+                let mut out_l = self.combs_l[0].process_downsampled(in_down);
+                out_l += self.combs_l[1].process_downsampled(in_down);
 
-                let mut out_r_vec = self.combs_r[0].process_downsampled(in_vec);
-                out_r_vec += self.combs_r[1].process_downsampled(in_vec);
-                let mut out_r = out_r_vec.reduce_add();
+                let mut out_r = self.combs_r[0].process_downsampled(in_down);
+                out_r += self.combs_r[1].process_downsampled(in_down);
 
                 for ap in &mut self.allpasses_l {
                     out_l = ap.process_downsampled(out_l);

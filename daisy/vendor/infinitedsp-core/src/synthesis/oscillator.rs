@@ -5,6 +5,23 @@ use alloc::vec::Vec;
 use core::f32::consts::PI;
 use wide::f32x4;
 
+/// PATCH (vendored): fast sine of a normalized phase in [0,1) — i.e. sin(2π·phase).
+/// ~0.2% error vs libm::sinf but ~50× cheaper on the Cortex-M7 (libm sinf is
+/// ~1250 cyc/call there). The FM stab's carrier+modulator call the Sine path 2×
+/// per active voice per sample (NUM_VOICES = 8), so libm::sinf blew the Daisy's
+/// audio-callback budget on struck chords → SAI underrun / "distortion during
+/// bells." Parabolic + one refinement pass, same shape as the firmware fast-cos.
+#[inline]
+fn fast_sin_norm(phase: f32) -> f32 {
+    // sin is 1-periodic in `phase`; wrap to [-0.5, 0.5) then to x in [-PI, PI).
+    let p = if phase >= 0.5 { phase - 1.0 } else { phase };
+    let x = p * (2.0 * PI);
+    let abs_x = if x < 0.0 { -x } else { x };
+    let y = (4.0 / PI) * x - (4.0 / (PI * PI)) * x * abs_x;
+    let abs_y = if y < 0.0 { -y } else { y };
+    0.225 * (y * abs_y - y) + y
+}
+
 /// The waveform shape for the oscillator.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Waveform {
@@ -30,6 +47,7 @@ pub struct Oscillator {
     pub frequency: AudioParam,
     pub waveform: Waveform,
     pub sample_rate: f32,
+    inv_sr: f32, // PATCH (vendored): cached 1/sample_rate (tick is called 6×/sample by the voice)
     freq_buffer: Vec<f32>,
     pub rng_state: u32,
 }
@@ -46,6 +64,7 @@ impl Oscillator {
             frequency,
             waveform,
             sample_rate: 44100.0,
+            inv_sr: 1.0 / 44100.0,
             freq_buffer: Vec::new(),
             rng_state: 12345,
         }
@@ -91,8 +110,7 @@ impl Oscillator {
     /// Processes a single sample from the oscillator.
     #[inline(always)]
     pub fn tick(&mut self, freq_hz: f32) -> f32 {
-        let inv_sr = 1.0 / self.sample_rate;
-        let inc = freq_hz * inv_sr;
+        let inc = freq_hz * self.inv_sr; // PATCH (vendored): cached inv_sr
 
         if self.waveform != Waveform::WhiteNoise {
             self.phase += inc;
@@ -104,7 +122,7 @@ impl Oscillator {
         }
 
         match self.waveform {
-            Waveform::Sine => libm::sinf(self.phase * 2.0 * PI),
+            Waveform::Sine => fast_sin_norm(self.phase), // PATCH (vendored): see fast_sin_norm
             Waveform::Triangle => {
                 if self.phase < 0.5 {
                     4.0 * self.phase - 1.0
@@ -157,7 +175,7 @@ impl FrameProcessor<Mono> for Oscillator {
                         } else if phase < 0.0 {
                             phase += 1.0;
                         }
-                        out_chunk[i] = libm::sinf(phase * 2.0 * PI);
+                        out_chunk[i] = fast_sin_norm(phase); // PATCH (vendored)
                     }
                 }
             }
@@ -261,7 +279,7 @@ impl FrameProcessor<Mono> for Oscillator {
             }
 
             let val = match self.waveform {
-                Waveform::Sine => libm::sinf(phase * 2.0 * PI),
+                Waveform::Sine => fast_sin_norm(phase), // PATCH (vendored)
                 Waveform::Triangle => {
                     let x = phase;
                     if x < 0.5 {
@@ -297,6 +315,7 @@ impl FrameProcessor<Mono> for Oscillator {
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
+        self.inv_sr = 1.0 / sample_rate; // PATCH (vendored)
         self.frequency.set_sample_rate(sample_rate);
     }
 
@@ -331,6 +350,8 @@ mod tests {
 
         // First sample at 44100Hz, 441Hz increment is 0.01.
         // Phase after first sample is 0.01. sin(0.01 * 2 * PI)
-        assert!((buffer[0] - libm::sinf(0.01 * 2.0 * PI)).abs() < 1e-5);
+        // PATCH (vendored): Sine now uses fast_sin_norm (~0.2% error), so widen
+        // the tolerance from 1e-5 to 5e-3.
+        assert!((buffer[0] - libm::sinf(0.01 * 2.0 * PI)).abs() < 5e-3);
     }
 }
