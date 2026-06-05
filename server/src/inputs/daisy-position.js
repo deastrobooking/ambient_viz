@@ -29,9 +29,10 @@ const REOPEN_MS = 1000;
 // CC map — must match dsp::install_kiosk_bindings on the firmware.
 const CC_TAPE_FAILURE = 23;
 const CC_FREEZE = 24;
-// Distance -> failure curve (cm). Mirror of the visualizer's presence shaping:
-// at/within the onset the tape sits at its subtle default (failure 0); past it
-// the deck falls apart with distance, fully destroyed at/beyond the far reach.
+// Distance -> failure curve (cm). Mirror of the visualizer's presence shaping.
+// REVERSED geometry (sensor faces the screen): NEAR is most destroyed, FAR is
+// clearest. At/beyond the onset (closest) the deck is fully eaten (failure 1);
+// it cleans up with distance, pristine (failure 0) at/beyond the far reach.
 // NEITHER end is fixed — both track values published by the Python sidecar so
 // they're tunable on install day without rebuilding: `distance_near_cm` is the
 // onset (one knob in config.py, shared with the visualizer), `distance_far_cm`
@@ -441,7 +442,8 @@ function onChange(name, value) {
     if (value > nearCm) farCm = value;
   } else if (name === 'distance_cm') {
     const span = farCm - nearCm;
-    const failure = span > 0 ? clamp((value - nearCm) / span, 0, 1) : (value >= farCm ? 1 : 0);
+    // Reversed: failure 1 at the near onset, 0 at the far reach.
+    const failure = span > 0 ? clamp((farCm - value) / span, 0, 1) : (value <= nearCm ? 1 : 0);
     writeCc(CC_TAPE_FAILURE, failure * 127);
     lastDistanceCm = value;
     updateTriggers(Date.now(), true);

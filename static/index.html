@@ -5301,13 +5301,14 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     return (typeof f === 'number' && f > distanceNearCm()) ? f : DISTANCE_FAR_DEFAULT_CM;
   }
 
-  // Distance→maxTwistDeg: distortion grows WITH distance. At/within NEAR the
-  // authored maxTwistDeg goes to zero; at/beyond the live FAR reach the ceiling
-  // is used as-is (max twist). Quadratic ease-in: gain = ((d-NEAR)/(FAR-NEAR))².
+  // REVERSED geometry (sensor faces the screen): NEAR = most distorted, FAR =
+  // clearest. Distance→maxTwistDeg: distortion shrinks WITH distance. At/within
+  // NEAR the authored maxTwistDeg is used as-is (max twist); at/beyond the live
+  // FAR reach it goes to zero. Quadratic ease: gain = (1-(d-NEAR)/(FAR-NEAR))².
   //
   // Distance→bitmapHeight (opt-in via the distanceToBitmap toggle): resolution
-  // drops WITH distance. At/within NEAR the effective bitmap equals the authored
-  // ceiling (full res); at/beyond FAR it is locked to MIN (lowest res). The
+  // rises WITH distance. At/within NEAR the effective bitmap is locked to MIN
+  // (lowest res); at/beyond FAR it equals the authored ceiling (full res). The
   // interpolation is HARMONIC (linear in 1/height), not linear in height: the
   // perceived pixelation scales with pixel size ∝ 1/height, so lerping height
   // directly leaves the image near-full-res for most of the range then collapses
@@ -5382,12 +5383,12 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     const farCm = distanceFarCm();
     if (typeof d === 'number') {
       if (d <= nearCm) {
-        twistGain = 0;
+        twistGain = 1; // reversed: closest = max twist
       } else if (d >= farCm) {
-        twistGain = 1;
+        twistGain = 0; // reversed: farthest = no twist
       } else {
         const x = (d - nearCm) / (farCm - nearCm);
-        twistGain = x * x;
+        twistGain = (1 - x) * (1 - x);
       }
     }
     let resolvedBitmap = null;
@@ -5414,10 +5415,10 @@ if (typeof DedicatedWorkerGlobalScope !== 'undefined' &&
     if (manual.distanceToBitmap === 'on' && resolvedBitmap !== null) {
       let effective = resolvedBitmap;
       if (typeof d === 'number' && resolvedBitmap > DISTANCE_BITMAP_MIN) {
-        let x;
-        if (d <= nearCm) x = 0;
-        else if (d >= farCm) x = 1;
-        else x = (d - nearCm) / (farCm - nearCm);
+        let x; // reversed: closest = MIN res (x=1), farthest = full res (x=0)
+        if (d <= nearCm) x = 1;
+        else if (d >= farCm) x = 0;
+        else x = 1 - (d - nearCm) / (farCm - nearCm);
         // Harmonic interp: lerp 1/height so perceived pixelation (∝ 1/height)
         // grows evenly with distance instead of collapsing at the far end.
         const invFull = 1 / resolvedBitmap;
