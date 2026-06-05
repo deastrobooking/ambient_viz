@@ -153,7 +153,11 @@ impl PainMaterialVoice {
 
         // A big, smeared room — long tail, moderate damping.
         let mut reverb = Reverb::new_with_params(
-            AudioParam::Static(0.92), // room size: long tail
+            // 0.92 pushed the comb feedback to ~0.977 (near self-oscillation):
+            // the low-mem reverb's i16 combs built up and clipped INTERNALLY,
+            // distorting the tail. 0.65 (~0.9 feedback) keeps the buildup well
+            // under full-scale — calmer tail, no internal clip. Dial 0.5..0.8.
+            AudioParam::Static(0.65), // room size
             AudioParam::Static(0.35), // damping
             0,
         );

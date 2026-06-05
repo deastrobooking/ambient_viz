@@ -18,23 +18,23 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use daisy_embassy::audio::{AudioPeripherals, HALF_DMA_BUFFER_LENGTH};
 use daisy_embassy::led::UserLed;
 use daisy_embassy::{hal, new_daisy_board};
+use defmt::info;
+#[cfg(feature = "voice")]
+use dsp::PainMaterialVoice;
 #[cfg(feature = "freeze")]
 use dsp::freeze::{self, Freeze, GlitchTape};
 use dsp::limiter::Limiter;
 use dsp::tape::TapeProcessor;
 #[cfg(feature = "bell")]
 use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _, PingPongDelay};
-#[cfg(feature = "voice")]
-use dsp::PainMaterialVoice;
-use defmt::info;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::join::join;
 use embassy_futures::yield_now;
 use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_time::{Delay, Timer};
-use embedded_alloc::LlffHeap as Heap;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
+use embedded_alloc::LlffHeap as Heap;
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use heapless::spsc::{Consumer, Producer, Queue};
 use static_cell::StaticCell;
@@ -78,14 +78,15 @@ const SAMPLE_RATE: f32 = 48_000.0;
 const BELL_DELAY_WET: f32 = 0.6;
 
 /// Master level for the FM bell (dry + its ping-pong), summed onto the bed.
-/// 0.1 ≈ −20 dB ≈ 1/4 the perceived loudness of unity (the old level).
+/// 0.02 (≈ −34 dB): a quiet accent under the bed. Well below the limiter
+/// ceiling so the bell+voice trails don't cause loud-passage distortion.
 #[cfg(feature = "bell")]
-const BELL_GAIN: f32 = 0.1;
+const BELL_GAIN: f32 = 0.02;
 
-/// Master level for the pain-material voice, summed onto the bed.
-/// 0.1 ≈ −20 dB ≈ 1/4 the perceived loudness of unity (the old level).
+/// Master level for the pain-material voice, summed onto the bed. 0.04 (≈ −28 dB),
+/// a touch above the bell to compensate for the calmer (lower room_size) reverb.
 #[cfg(feature = "voice")]
-const VOICE_GAIN: f32 = 0.1;
+const VOICE_GAIN: f32 = 0.04;
 
 const RING_LEN: usize = 8192;
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
@@ -189,12 +190,16 @@ async fn main(spawner: Spawner) {
         // (AP=full, C=1, B=1, SIZE=2^23).
         cm.MPU.rnr.write(1);
         cm.MPU.rbar.write(0xC000_0000);
-        cm.MPU.rasr.write((0b011 << 24) | (1 << 17) | (1 << 16) | ((23 - 1) << 1) | 1);
+        cm.MPU
+            .rasr
+            .write((0b011 << 24) | (1 << 17) | (1 << 16) | ((23 - 1) << 1) | 1);
         // Region 2: SRAM1 @ 0x3000_0000, 128 KB, normal non-cacheable
         // (AP=full, TEX=001/C=0/B=0, SIZE=2^17) — keeps SAI DMA coherent.
         cm.MPU.rnr.write(2);
         cm.MPU.rbar.write(0x3000_0000);
-        cm.MPU.rasr.write((0b011 << 24) | (0b001 << 19) | ((17 - 1) << 1) | 1);
+        cm.MPU
+            .rasr
+            .write((0b011 << 24) | (0b001 << 19) | ((17 - 1) << 1) | 1);
         // Re-enable MPU: background default map for privileged + MPU on.
         cm.MPU.ctrl.write(0x05);
         dsb();
@@ -376,7 +381,11 @@ async fn main(spawner: Spawner) {
             // Reading: at idle (just the bed) it should settle to the calm 1 s
             // pulse; if it stays fast at idle, even tape+bell overruns. Trigger
             // the voice — if it goes fast only then, the voice is the CPU hog.
-            let period = if SAI_ERR.swap(0, Ordering::Relaxed) > 0 { 150 } else { 1000 };
+            let period = if SAI_ERR.swap(0, Ordering::Relaxed) > 0 {
+                150
+            } else {
+                1000
+            };
             led.on();
             Timer::after_millis(period).await;
             led.off();
@@ -567,7 +576,11 @@ async fn audio_task(
                         //         pitch is internal to the formant synth.
                         // All mix on top, pre-limiter.
                         #[cfg(any(feature = "bell", feature = "voice"))]
-                        dsp::MidiMessage::NoteOn { channel, note, velocity } => {
+                        dsp::MidiMessage::NoteOn {
+                            channel,
+                            note,
+                            velocity,
+                        } => {
                             let v = velocity as f32 / 127.0;
                             match channel {
                                 #[cfg(feature = "voice")]
