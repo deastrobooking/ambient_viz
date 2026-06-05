@@ -1742,8 +1742,25 @@ function spawnMesh3d(s) {
   const available = MESH_NAMES.filter(n => !present.has(n));
   const pool = available.length > 0 ? available : MESH_NAMES;
   s.meshId = pool[Math.floor(Math.random() * pool.length)] || 'rencen';
-  s.wx = rand(-1.4, 1.4);
-  s.wy = rand(-0.6, 0.6);
+  // Place each mesh in a screen quadrant not already occupied by another live
+  // mesh so coexisting meshes stay spread apart instead of clustering. The
+  // quadrant is (sign of wx = left/right, sign of wy = top/bottom, since
+  // projX/projY = center + w*flyAxis/z). When there are more meshes than the
+  // 4 quadrants, fall back to any quadrant. Magnitudes stay inside the
+  // original visible band (with a small floor off the center axes) so meshes
+  // remain on-screen and clearly separated rather than hugging the middle.
+  const QUADRANTS = [[-1, -1], [1, -1], [-1, 1], [1, 1]]; // TL, TR, BL, BR
+  const usedQuad = new Set();
+  for (let i = 0; i < meshes3d.length; i++) {
+    const m = meshes3d[i];
+    if (m === s || typeof m.wx !== 'number' || typeof m.wy !== 'number') continue;
+    usedQuad.add((m.wx >= 0 ? 1 : -1) + ',' + (m.wy >= 0 ? 1 : -1));
+  }
+  let quadPool = QUADRANTS.filter(q => !usedQuad.has(q[0] + ',' + q[1]));
+  if (quadPool.length === 0) quadPool = QUADRANTS;
+  const quad = quadPool[Math.floor(Math.random() * quadPool.length)];
+  s.wx = quad[0] * rand(0.5, 1.4);
+  s.wy = quad[1] * rand(0.22, 0.6);
   s.z = Z_FAR;
   s.vz = rand(0.0004, 0.0014);          // slower than flyouts — these read as imposing
   s.size = rand(180, 700);              // CSS px at z=1 (longest axis); ~4× range so meshes read as varied in scale
