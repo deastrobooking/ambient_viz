@@ -153,6 +153,8 @@ const VOICE_PHRASES = [
   'you are fake',
   'everybody sees through you',
   'you are weak',
+  'time space transmat',
+  'avoid eye contact',
 ];
 
 // --- Periodic voice ("active room") -----------------------------------------
