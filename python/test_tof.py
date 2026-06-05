@@ -104,6 +104,129 @@ def _empty_room_lines(drv, now):
     ]
 
 
+def _env_num(key, default):
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+class _TriggerMonitor:
+    """Live mirror of server/src/inputs/daisy-position.js — the entry-bell +
+    exit-voice + hysteretic-occupancy state machine the Node→Daisy bridge runs on
+    the distance_cm / distance_velocity_cm_s / distance_far_cm feed. test_tof
+    doesn't run the Node side, so this replicates it (defaults + env-var names
+    match the JS) to show, live, when the bell would ring / the voice would speak
+    — and, crucially, whether the room ever transitions occupied<->empty at all.
+    Keep in sync with daisy-position.js if you retune either. (The periodic toll
+    is omitted — irrelevant to entry/exit debugging.)"""
+
+    def __init__(self):
+        self.enter_frac = _env_num("BELL_ENTER_FRACTION", 0.15)
+        self.empty_frac = _env_num("BELL_EMPTY_FRACTION", 0.08)
+        self.rearm_recede_s = _env_num("BELL_REARM_RECEDE_S", 2.5)
+        self.cooldown_s = _env_num("BELL_COOLDOWN_S", 30)
+        self.approach_cm_s = _env_num("BELL_APPROACH_CM_S", 2.0)
+        self.approach_sustain = max(1, int(_env_num("BELL_APPROACH_SUSTAIN", 3)))
+        self.voice_dwell_s = _env_num("VOICE_PRESENCE_MIN_S", 3.0)
+        self.voice_confirm_s = _env_num("VOICE_CONFIRM_EMPTY_S", 2.0)
+
+        self.bell_armed = False
+        self.empty_since = None
+        self.approach_frames = 0
+        self.last_bell_t = None
+        self.room_occupied = False
+        self.occupied_since = None
+        self.voice_pending = False
+        self.voice_empty_since = None
+
+        self._t0 = None
+        self.enter = None
+        self.empty = None
+        self.events = collections.deque(maxlen=8)
+
+    def update(self, now, dist, vel, far, fresh=True):
+        """Feed one frame: dist = smoothed distance_cm, vel = velocity (approach
+        negative), far = learned far reach. Mirrors updateBellTrigger +
+        updateVoiceTrigger; logs each arm/fire/occupancy transition."""
+        if self._t0 is None:
+            self._t0 = now
+        if dist is None or not (far and far > 0):
+            return
+        vel = vel or 0.0
+        enter = far * (1.0 - self.enter_frac)   # cross BELOW to trigger / occupy
+        empty = far * (1.0 - self.empty_frac)   # recede ABOVE to re-arm / empty
+        self.enter, self.empty = enter, empty
+
+        # --- entry bell (updateBellTrigger) ---
+        if dist >= empty:
+            if self.empty_since is None:
+                self.empty_since = now
+            if not self.bell_armed and (now - self.empty_since) >= self.rearm_recede_s:
+                self.bell_armed = True
+                self.events.append((now, "bell ARMED (receded to empty)"))
+            self.approach_frames = 0
+        else:
+            self.empty_since = None
+            if fresh:
+                if dist <= enter and (-vel) >= self.approach_cm_s:
+                    self.approach_frames += 1
+                else:
+                    self.approach_frames = 0
+            cooled = self.last_bell_t is None or (now - self.last_bell_t) >= self.cooldown_s
+            if self.bell_armed and self.approach_frames >= self.approach_sustain and cooled:
+                self.events.append((now, f"** BELL ** entry @ {dist:.0f}cm, {-vel:.1f}cm/s in"))
+                self.bell_armed = False
+                self.approach_frames = 0
+                self.last_bell_t = now
+
+        # --- occupancy + exit voice (updateVoiceTrigger) ---
+        prev = self.room_occupied
+        if dist <= enter:
+            self.room_occupied = True
+        elif dist >= empty:
+            self.room_occupied = False
+        if self.room_occupied != prev:
+            self.events.append((now, f"occupancy -> {'OCCUPIED' if self.room_occupied else 'EMPTY'}"))
+
+        if self.room_occupied:
+            if self.occupied_since is None:
+                self.occupied_since = now
+            self.voice_empty_since = None
+            if (now - self.occupied_since) >= self.voice_dwell_s:
+                self.voice_pending = True
+        else:
+            self.occupied_since = None
+            if self.voice_pending:
+                if self.voice_empty_since is None:
+                    self.voice_empty_since = now
+                if (now - self.voice_empty_since) >= self.voice_confirm_s:
+                    self.events.append((now, "** VOICE ** room emptied after a visit"))
+                    self.voice_pending = False
+                    self.voice_empty_since = None
+
+    def lines(self, dist):
+        d = f"{dist:.1f}" if dist is not None else "--"
+        en = f"{self.enter:.0f}" if self.enter is not None else "--"
+        em = f"{self.empty:.0f}" if self.empty is not None else "--"
+        out = [
+            f"  TRIGGERS  occupied={'YES' if self.room_occupied else 'no '}  "
+            f"armed={'YES' if self.bell_armed else 'no '}  "
+            f"approach={self.approach_frames}/{self.approach_sustain}  "
+            f"voice_pending={'YES' if self.voice_pending else 'no'}",
+            f"            dist={d:>7}cm   occupy≤{en}   empty≥{em}   "
+            "(needs dist to swing across BOTH to fire entry/exit)",
+        ]
+        if self.events:
+            out.append("  recent trigger events:")
+            for (t, msg) in self.events:
+                rel = (t - self._t0) if self._t0 is not None else 0.0
+                out.append(f"    t+{rel:7.1f}s  {msg}")
+        else:
+            out.append("  recent trigger events: (none yet — walk into/out of the cone)")
+        return out
+
+
 _TUNE_HINT = (
     "  tune (config.py or env): EMPTY_ROOM_VELOCITY_CM_S, EMPTY_ROOM_STILLNESS_WINDOW_S,\n"
     "                           EMPTY_ROOM_MIN_CM, EMPTY_ROOM_RELEARN_S, EMPTY_ROOM_DOWN_ALPHA\n"
@@ -117,6 +240,7 @@ def _loop_l1x(backend) -> int:
     real DistanceDriver step, so what you see is what the kiosk computes."""
     sensor = backend._sensor
     drv = _make_driver(backend)
+    mon = _TriggerMonitor()
     window = collections.deque(maxlen=50)  # ~1 s at 50 Hz, for the noise-floor sd
     last_print = 0.0
     last_d = None
@@ -137,7 +261,9 @@ def _loop_l1x(backend) -> int:
             # to no-target so the learner sees the same filtered stream the kiosk
             # does. last_d still displays the raw number for tuning visibility.
             d_ok = d if (d is not None and last_status in backend._VALID_STATUS) else None
-            drv._process_sample(d_ok, time.monotonic())
+            sample_t = time.monotonic()
+            drv._process_sample(d_ok, sample_t)
+            mon.update(sample_t, drv._smoothed, drv._vel_ema, drv._far_cm)
             if d_ok is not None:
                 window.append(d_ok)
         now = time.monotonic()
@@ -162,6 +288,9 @@ def _loop_l1x(backend) -> int:
             for ln in _empty_room_lines(drv, now):
                 print(ln)
             print()
+            for ln in mon.lines(drv._smoothed):
+                print(ln)
+            print()
             print(_TUNE_HINT)
             print("  ctrl-c to exit", flush=True)
             last_print = now
@@ -174,6 +303,7 @@ def _loop_l5cx(backend) -> int:
     n = backend._grid_n
     side = 8 if n == 64 else 4
     drv = _make_driver(backend)
+    mon = _TriggerMonitor()
     print(f"\nclosest = nearest valid zone in the cone (what publishes as distance_cm)")
     print("grid shows per-zone distance in cm ('--' = no valid target this frame)")
     print("ctrl-c to exit\n")
@@ -201,6 +331,7 @@ def _loop_l5cx(backend) -> int:
             # Feed the reduced closest-zone distance (None = no-target) through
             # the real driver step so the empty-room learner runs live.
             drv._process_sample(closest, now)
+            mon.update(now, drv._smoothed, drv._vel_ema, drv._far_cm)
             if now - last_print >= 0.25:
                 closest_s = f"{closest:5.1f} cm" if closest is not None else "   -- "
                 rows = "\n".join(
@@ -215,6 +346,9 @@ def _loop_l5cx(backend) -> int:
                       f"far ceiling={backend.far_cm:.0f}cm\n")
                 print(rows + "\n")
                 for ln in _empty_room_lines(drv, now):
+                    print(ln)
+                print()
+                for ln in mon.lines(drv._smoothed):
                     print(ln)
                 print()
                 print(_TUNE_HINT, flush=True)
