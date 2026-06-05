@@ -87,6 +87,17 @@ All values land on the SSE bus and become available in the browser as
   `VL53_SENSOR` env); L1X prints raw + rolling 1 s mean/stddev, L5CX
   prints the closest zone + a live grid. Use it during Phase 4 of
   `PI_KIOSK_BRINGUP.md` to validate the sensor before the SSE pipeline.
+- **Combined motion+distance bringup**: `python test_am312.py` shows the
+  fused AM312 + ToF occupancy and the entry-bell / exit-voice triggers —
+  a faithful Python mirror of `server/src/inputs/daisy-position.js`'s
+  motion fusion (no Node side needed). Three modes: `--scenario`
+  (default; a deterministic timeline + event log run both motion-ON and
+  motion-OFF, so you can see what motion adds — no hardware), `--mock`
+  (synthetic feeds from the real drivers' mock loops), and `--live` (real
+  AM312 GPIOs per-sensor + real ToF, the Pi view). Motion fusion is ON by
+  default here (production defaults it OFF); `--motion off` tests the
+  distance-only fallback. Keep it in sync with daisy-position.js if you
+  retune either.
 - **MPR121 baseline auto-cal**: first ~30 s after init, touch behavior
   may be inconsistent while the MPR121 calibrates to its environment.
   The handoff doc flags this.
