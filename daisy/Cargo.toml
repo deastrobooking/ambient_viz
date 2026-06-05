@@ -10,6 +10,12 @@ default-members = ["crates/dsp", "crates/host"]
 # changes. The patch below must match daisy-embassy's own patch.crates-io block.
 # Bump these together with the daisy-embassy rev in crates/firmware/Cargo.toml.
 [patch.crates-io]
+# Vendored + patched: hoist SpeechSynth's per-sample expf out of its hot loop
+# (the Daisy M7's ~1250-cycle libm transcendentals × 3/sample overran the audio
+# callback → SAI underruns → screech), and stop Stutter::set_sample_rate from
+# Vec-resizing its ring (the doubling transient blew the AXI heap, which had
+# forced a 44.1 kHz pitch hack). See vendor/infinitedsp-core. Drop once upstreamed.
+infinitedsp-core = { path = "vendor/infinitedsp-core" }
 embassy-stm32   = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
 embassy-time    = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
 embassy-sync    = { git = "https://github.com/embassy-rs/embassy.git", rev = "2a1ea6766d00c867c717290d0bb31a8e3f237dca" }
