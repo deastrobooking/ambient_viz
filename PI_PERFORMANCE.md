@@ -272,3 +272,51 @@ pattern shown in `hardware-handoff.md`'s example: at the worst-case
 ~10 kHz edge rate, callback setup/teardown churn becomes a meaningful
 fraction of one core. The current implementation comment in
 `python/ambient_kiosk/sensors/breath.py` flags this; preserve it.
+
+---
+
+## Going native (wgpu) vs the in-browser FBO migration
+
+(2026-06-06 analysis — "would a native wgpu app have fewer compositor ops /
+better FPS than Chromium?")
+
+**Compositor operations are not the bottleneck.** The diagnosis above stands:
+the wall is per-frame `texImage2D(canvas)` GPU-bandwidth, the bridge from the
+**Canvas2D** main renderer into the WebGL dither/lattice post passes. Compositing
+one fullscreen layer is cheap next to that, so dropping Chromium's compositor (or
+going direct DRM/KMS scanout) saves a small term, not the dominant one.
+
+**A native wgpu app *could* raise the FPS ceiling — but via different mechanisms
+than "fewer compositor ops":**
+
+1. **No CPU-canvas → GPU bridge.** A native GPU renderer keeps everything
+   GPU-resident, so the `texImage2D(canvas)` upload — the dominant cost —
+   disappears by construction (no Canvas2D surface to upload).
+2. **No Chromium GPU-process / command-buffer tax.** WebGL calls are serialized
+   through the GPU process; native talks to Mesa/V3D directly. (This is part of
+   why CPU profiling *undercounts* the real cost.)
+3. **No WebGL upload conversions** (flipY / premultiply / colorspace on
+   `texImage2D`).
+
+**The catch:** the renderer is **Canvas2D-native** (the entire visual language is
+`drawImage`/paths/fills). Porting to wgpu/WGSL is a from-scratch reimplementation
+of every visual element as GPU geometry + shaders, *plus* re-doing the FFT
+(currently Web Audio `AnalyserNode`), the SSE sensor bridge, the bpm/keypoint
+lanes, and the `localaudio` POS-sync — all browser-integrated. Months-scale.
+wgpu on Pi 4 is viable (v3dv Vulkan / v3d GLES); the renderer port is the risk,
+not the backend.
+
+**Higher-ROI path (already underway):** finish migrating the remaining Canvas2D
+compositing to **FBO/WebGL-resident** rendering so the per-frame
+`texImage2D(canvas)` upload is eliminated *inside the browser* (see the
+"Replaces the per-frame texImage2D" / FBO / atlas comments in
+`static/index.html`). That captures mechanism #1 — the dominant term — without
+leaving Chromium or rewriting the interaction/audio/sensor stack.
+
+**Measure before either:**
+- Sweep `?bitmap=N` — if FPS scales strongly with bitmap size, you're
+  upload-bandwidth-bound (FBO migration / native is the answer; compositor ops
+  irrelevant).
+- Check whether the fullscreen Chromium surface already gets **direct scanout**
+  (compositor/`drm_info` overlay stats). If it does, the compositor-ops savings
+  from going native are ~zero.
