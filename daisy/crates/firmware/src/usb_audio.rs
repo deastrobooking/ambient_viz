@@ -6,12 +6,15 @@
 //! this module holds the interrupt binding, constants, and the device/stream
 //! tasks (which need the concrete driver type).
 
+use core::sync::atomic::Ordering;
+
 use embassy_stm32::{bind_interrupts, peripherals, usb};
 use embassy_usb::UsbDevice;
 use heapless::spsc::Consumer;
 
 use crate::uac_source::{AudioSourceEpIn, MAX_EXTRA_SAMPLES};
 use crate::USB_RING_LEN;
+use crate::{USB_CAPTURING, USB_PKT_MAX_FR};
 
 bind_interrupts!(pub struct Irqs {
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
@@ -58,6 +61,8 @@ pub async fn stream_task(
         crate::dbg_uart!("uac: audio IN enabled — streaming line-out");
         // Reset latency: drop the backlog buffered while the host wasn't capturing.
         while samples.dequeue().is_some() {}
+        // Now capturing: arm the tee's drop counter (see USB_DROP in main.rs).
+        USB_CAPTURING.store(true, Ordering::Relaxed);
         loop {
             let mut len = 0;
             while len + 2 * SAMPLE_BYTES <= pkt.len() {
@@ -67,8 +72,12 @@ pub async fn stream_task(
                 pkt[len + 2..len + 4].copy_from_slice(&r.to_le_bytes());
                 len += 4;
             }
+            // DIAG: peak single-poll drain in stereo frames. ~48 = healthy 1 ms
+            // pacing; toward the 56-frame cap = catching up after missed polls.
+            USB_PKT_MAX_FR.fetch_max((len / (2 * SAMPLE_BYTES)) as u32, Ordering::Relaxed);
             if audio_ep.write(&pkt[..len]).await.is_err() {
                 crate::dbg_uart!("uac: audio IN disabled");
+                USB_CAPTURING.store(false, Ordering::Relaxed);
                 break;
             }
         }

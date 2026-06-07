@@ -13,7 +13,7 @@ mod usb_audio;
 mod usb_cdc;
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use daisy_embassy::audio::{AudioPeripherals, HALF_DMA_BUFFER_LENGTH};
 use daisy_embassy::led::UserLed;
@@ -111,6 +111,29 @@ static OUT_PEAK_MILLI: AtomicU32 = AtomicU32::new(0);
 static CB_FULL_US: AtomicU32 = AtomicU32::new(0);
 static SAI_ERR: AtomicU32 = AtomicU32::new(0);
 static SD_UNDERRUN: AtomicU32 = AtomicU32::new(0);
+
+// USB capture-tee health (the visualizer feed). Logged per-interval with the
+// audio counters. These two exist to settle the open question of WHY the iso
+// capture clicks — overflow vs missed 1 ms polls — which our notes say was
+// never confirmed (see daisy-usb-capture-clicks):
+//   usb_drop      — samples the SAI tee dropped because the iso drain couldn't
+//                   keep up (USB_RING full). Counted ONLY while the host is
+//                   actively capturing (USB_CAPTURING), so a parked/idle stream
+//                   — which intentionally lets the ring overflow — reads clean.
+//                   High while capturing ⇒ SD stalls outrun the ~5.3 ms ring
+//                   (the "overflow" failure mode; a bigger ring would help).
+//   usb_pkt_max_fr — largest single-poll drain in stereo frames the stream task
+//                   sent. ~48 is healthy 1 ms pacing; climbing toward the
+//                   56-frame packet cap ⇒ the drain is catching up after missed
+//                   1 ms polls (the "scheduling" failure mode; only async SD or
+//                   a wider poll interval helps — a bigger ring would NOT).
+// Read together each beat: drops≈0 + pktmax≈48 = clean; drops spiking = overflow;
+// pktmax pinned near the cap with low drops = missed polls.
+static USB_DROP: AtomicU32 = AtomicU32::new(0);
+static USB_PKT_MAX_FR: AtomicU32 = AtomicU32::new(0);
+// True while the host (Pi) has the streaming alt-setting active. Gates USB_DROP
+// so the expected overflow during not-capturing periods doesn't inflate it.
+static USB_CAPTURING: AtomicBool = AtomicBool::new(false);
 
 // 2b: audio runs on a high-priority interrupt executor so blocking SD reads
 // (and, later, DSP/MIDI) on the thread executor can never starve the SAI
@@ -394,11 +417,13 @@ async fn main(spawner: Spawner) {
             // cb_full spikes ~730 us on loss-FIR rebuild blocks but they're
             // isolated; sai_err (SAI underruns) is the real health metric.
             dbg_uart!(
-                "diag: cb_full {} us | sai_err {} sd_under {} | peak {}",
+                "diag: cb_full {} us | sai_err {} sd_under {} | peak {} | usb_drop {} usb_pktmax {}",
                 CB_FULL_US.swap(0, Ordering::Relaxed),
                 SAI_ERR.swap(0, Ordering::Relaxed),
                 SD_UNDERRUN.swap(0, Ordering::Relaxed),
                 OUT_PEAK_MILLI.swap(0, Ordering::Relaxed),
+                USB_DROP.swap(0, Ordering::Relaxed),
+                USB_PKT_MAX_FR.swap(0, Ordering::Relaxed),
             );
         }
     };
@@ -662,13 +687,24 @@ async fn audio_task(
                 OUT_PEAK_MILLI.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
 
                 // f32 -> SAI 24-bit, and tee the *processed* (heard) audio to USB.
+                // Tally tee drops locally and load the capture flag once — keeps
+                // the RT path to a single atomic add per block, not per sample.
+                let usb_capturing = USB_CAPTURING.load(Ordering::Relaxed);
+                let mut usb_dropped = 0u32;
                 for (i, frame) in output[..n].chunks_mut(2).enumerate() {
                     let l = buf[2 * i];
                     let r = buf[2 * i + 1];
                     frame[0] = f32_to_u24(l);
                     frame[1] = f32_to_u24(r);
-                    let _ = usb_producer.enqueue(f32_to_i16(l));
-                    let _ = usb_producer.enqueue(f32_to_i16(r));
+                    if usb_producer.enqueue(f32_to_i16(l)).is_err() {
+                        usb_dropped += 1;
+                    }
+                    if usb_producer.enqueue(f32_to_i16(r)).is_err() {
+                        usb_dropped += 1;
+                    }
+                }
+                if usb_capturing && usb_dropped > 0 {
+                    USB_DROP.fetch_add(usb_dropped, Ordering::Relaxed);
                 }
 
                 let frames = (n / 2) as u64;

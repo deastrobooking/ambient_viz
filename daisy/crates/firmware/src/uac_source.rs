@@ -242,6 +242,26 @@ impl<'d, D: Driver<'d>> AudioSource<'d, D> {
             MAX_AUDIO_CHANNEL_COUNT as u8,
             sample_width as u8,
         ) + MAX_AUDIO_CHANNEL_COUNT as u16 * sample_width as u16 * MAX_EXTRA_SAMPLES;
+        // The trailing `1` is the iso polling interval in 1 ms full-speed USB
+        // frames (bInterval=1 → one packet per SOF, the floor for FS iso).
+        //
+        // EXPERIMENT — not done, measure first with the usb_drop/usb_pktmax diag
+        // counters: bumping this to `2` makes the host poll every 2 ms, doubling
+        // the slack stream_task has to stage a packet before a poll is missed.
+        // That directly targets the "missed poll" underrun (executor frozen on a
+        // blocking SD read), so it should help IF usb_pktmax is pinned near the
+        // packet cap with low usb_drop. It does NOT help the "overflow" mode
+        // (high usb_drop) — a bigger USB_RING does that.
+        // Costs if you make the change:
+        //   - each missed poll then loses a 2 ms slot, not 1 ms (fewer but bigger
+        //     glitches), and baseline capture latency doubles;
+        //   - the per-poll catch-up headroom halves (MAX_EXTRA_SAMPLES is per
+        //     packet), so double MAX_EXTRA_SAMPLES to keep the same recovery rate;
+        //   - the packet now carries ~2 ms ≈ 384 B + headroom — still under the
+        //     1023 B FS-iso cap, so max_packet_size is fine as computed;
+        //   - some USB-audio host stacks assume 1 ms iso and the Pi capture is
+        //     already finicky, so re-verify enumeration + capture on the Pi.
+        // The real fix for the root cause is non-blocking (async/DMA) SD reads.
         let audio_in_endpoint = b.alloc_endpoint_in(EndpointType::Isochronous, None, max_packet_size, 1);
         debug!(
             "uac: audio EP addr={:?} mps={} interval={}",
