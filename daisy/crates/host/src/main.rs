@@ -5,6 +5,12 @@
 //!   cargo run -p host --release -- <path-to-audio-file>
 //!
 //! Without a path, the output is silent (engine still runs).
+//!
+//! When stdin is a TTY the groovebox TUI starts automatically (see `tui.rs`
+//! for the key map). When stdin is piped, the line-protocol reader is used
+//! instead so batch command files and shell scripts still work.
+
+mod tui;
 
 use std::env;
 use std::fs::File;
@@ -281,7 +287,16 @@ fn main() -> Result<()> {
         }
     }
 
-    std::thread::park();
+    // If stdin is a TTY (interactive session), run the raw-key TUI on the
+    // main thread. If stdin is piped (batch commands, CI), use the line-mode
+    // reader and park the main thread so audio keeps playing.
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        tui::run(engine);
+    } else {
+        spawn_groove_stdin(engine);
+        std::thread::park();
+    }
     Ok(())
 }
 

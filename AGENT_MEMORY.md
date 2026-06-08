@@ -186,18 +186,18 @@ without reading the old visualizer handoff first.
 
 ### M1: Playable Host Groovebox
 
-Status: partially implemented.
+Status: complete.
 
-- Current: host stdin protocol, fixed tempo loop, pad triggers, step edits,
-  selected track, transport, lane levels, damage/space/tone/filter macros.
-- Current: `HELP` and `STATE` host commands print command help and a performance
-  snapshot with transport, selected track, step position, selected step value,
-  macro values, Spectre band 1, and master-filter state.
-- Next: keyboard shortcuts or a small TUI so the host is playable without
-  typing full commands.
+- Host stdin protocol, fixed tempo loop, pad triggers, step edits, selected
+  track, transport, lane levels, damage/space/tone/filter macros.
+- `HELP` and `STATE` commands print command help and engine snapshots.
+- `daisy/crates/host/src/tui.rs`: raw-key TUI activated automatically when
+  stdin is a TTY. Key map: `[space]` PLAY/STOP, `r` RESET, `k/c/o/s/a` track
+  select, `1-8` step toggle, `[/]` pattern slot, `p` capture, `d/D/e/E/f/F/m/M`
+  macro nudge. Stdin line-protocol still works when stdin is piped.
 
-Acceptance: on macOS, the user can perform a basic pattern, trigger pads, edit
-steps, and sweep filter/damage/space macros against the same DSP used by Daisy.
+Acceptance: met — pattern, pads, step edits, and filter/damage sweeps are all
+reachable without typing full commands.
 
 ### M2: Shared Comms Contract
 

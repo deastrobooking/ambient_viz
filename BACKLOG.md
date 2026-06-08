@@ -23,11 +23,11 @@ failure live control, SAI audio path) are intentionally excluded.
   owns current state, donor research, and the milestone plan; architecture and
   donor docs are shortened to focused references. — `AGENT_MEMORY.md`,
   `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`, `GROOVEBOX_REPURPOSE.md`
-- [ ] **Host TUI / shortcut layer** — stdin text protocol works but requires
-  typing full commands; not usable for live performance. Add a
-  `crossterm`-based raw-key TUI: `[space]` = PLAY/STOP, digit rows = drum
-  pads, arrow keys = macro nudge. Layer translates keys → `GrooveEvent`; text
-  protocol stays intact. — `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
+- [x] **Host TUI / shortcut layer** — `daisy/crates/host/src/tui.rs`: raw-key
+  TUI activates when stdin is a TTY. `[space]` PLAY/STOP, `r` RESET,
+  `k/c/o/s/a` track select, `1-8` step toggle, `[/]` pattern slot, `p`
+  capture, `d/D e/E f/F m/M` macro nudge. Stdin text protocol still works
+  when piped. — `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
 - [ ] **Groovebox control protocol** — `groove::parse_line` now defines the first
   shared text command set for `PLAY`, `STOP`, `RESET`, `PAD`, `TOGGLE`, `STEP`,
   `MACRO`, `TRACK`, `BAND`, and `FILTER`; selected-band filter controls are now
