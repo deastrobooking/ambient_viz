@@ -14,11 +14,11 @@ use alloc::vec::Vec;
 // Public so downstream crates (e.g. host bins) can drive time-based effects:
 // `FrameProcessor` carries `process`/`set_sample_rate`, `AudioParam` sets the
 // delay's time/feedback, and `PingPongDelay` is the delay itself.
-pub use infinitedsp_core::FrameProcessor;
 pub use infinitedsp_core::core::audio_param::AudioParam;
 use infinitedsp_core::effects::dynamics::distortion::{Distortion, DistortionType};
 pub use infinitedsp_core::effects::time::ping_pong_delay::PingPongDelay;
 use infinitedsp_core::effects::time::reverb::Reverb;
+pub use infinitedsp_core::FrameProcessor;
 
 pub mod analog_bass_drum;
 pub mod bass;
@@ -26,12 +26,14 @@ pub mod bloom;
 pub mod chord;
 pub mod fm_stab;
 pub mod freeze;
+pub mod groove;
 pub mod hihat;
 pub mod limiter;
 pub mod midi;
 pub mod midi_map;
 pub mod pain_voice;
 pub mod sequencer;
+pub mod spectre_filter;
 pub mod svf;
 pub mod tape;
 pub mod timeline;
@@ -39,10 +41,15 @@ pub mod timeline;
 pub use analog_bass_drum::AnalogBassDrum;
 pub use bass::{BassPatch, RumbleBass};
 pub use fm_stab::{FmPatch, FmStab, Shaper};
+pub use groove::{GrooveEvent, Macro, Track};
 pub use hihat::HiHat;
 pub use midi::{MidiByteParser, MidiMessage};
-pub use midi_map::{MidiMap, Param, install_kiosk_bindings};
+pub use midi_map::{install_kiosk_bindings, MidiMap, Param};
 pub use pain_voice::PainMaterialVoice;
+pub use spectre_filter::{
+    BandMode, ChannelMode, DynamicBandSettings, DynamicFilter, DynamicFilterSettings, MasterFilter,
+    MasterFilterModel, MasterFilterSettings,
+};
 pub use svf::Svf;
 
 pub struct Engine {
@@ -88,6 +95,9 @@ pub struct Engine {
     /// Gain multiplier applied to the kick's output. Set per-trigger from
     /// MIDI velocity (0..1), so soft pad hits play a quieter kick.
     kick_velocity: f32,
+    /// Master gain on the kick bus. Separate from per-hit velocity so hardware
+    /// macros can mix the kick lane without changing pattern accents.
+    kick_gain: f32,
     /// MIDI note number that triggers the kick. Defaults to 60 (C4) — pads
     /// in "note mode" on most controllers. Change via [`Engine::set_kick_trigger_note`].
     kick_trigger_note: u8,
@@ -98,6 +108,14 @@ pub struct Engine {
     /// chord, scaled by a "proximity" amount. Stands in for the exhibit's ToF
     /// "approach pulls clarity + tone out of the rain" gesture.
     bloom: bloom::BloomBank,
+    /// Standalone Spectre-inspired master filter insert. Default settings are
+    /// bypassed, so it is silent in old patches until explicitly enabled.
+    spectre_filter: spectre_filter::MasterFilter,
+    spectre_filter_settings: spectre_filter::MasterFilterSettings,
+    /// Standalone Spectre-inspired dynamic band rack. All bands default to
+    /// bypassed; groove macros can open the first band as a performance filter.
+    spectre_dynamic_filter: spectre_filter::DynamicFilter,
+    spectre_dynamic_settings: spectre_filter::DynamicFilterSettings,
     tape: tape::TapeProcessor,
     /// Master "freeze" — parallel-send grain hold; produces a looped grain of
     /// the post-everything master, run through `glitch_tape` and summed *under*
@@ -121,6 +139,9 @@ pub struct Engine {
     /// hat / stab triggers — the sampler, reverb, tape and bloom still run.
     /// Lets a host audition the track + processing without the drum pattern.
     sequencer_enabled: bool,
+    /// Current hardware-selected lane. The DSP core stores it so host and
+    /// firmware surfaces can share selection semantics without UI state.
+    selected_track: Track,
 }
 
 impl Engine {
@@ -199,11 +220,16 @@ impl Engine {
             bass: bass::RumbleBass::new(sample_rate),
             bass_buf: Vec::new(),
             kick_velocity: 1.0,
+            kick_gain: 1.0,
             kick_trigger_note: 60,
             midi_map: MidiMap::new(),
             sequencer: sequencer::Sequencer::new(sample_rate),
             reverb,
             bloom: bloom::BloomBank::new(sample_rate),
+            spectre_filter: spectre_filter::MasterFilter::new(sample_rate),
+            spectre_filter_settings: spectre_filter::MasterFilterSettings::default(),
+            spectre_dynamic_filter: spectre_filter::DynamicFilter::new(sample_rate),
+            spectre_dynamic_settings: spectre_filter::DynamicFilterSettings::default(),
             tape: tape::TapeProcessor::new(sample_rate),
             freeze: freeze::Freeze::new(sample_rate),
             glitch_tape: freeze::GlitchTape::new(sample_rate),
@@ -215,6 +241,7 @@ impl Engine {
             // with `set_reverb_wet` / the ReverbWet CC.
             reverb_wet: 0.18,
             sequencer_enabled: true,
+            selected_track: Track::Kick,
         }
     }
 
@@ -326,6 +353,25 @@ impl Engine {
         self.bloom.amount()
     }
 
+    pub fn set_spectre_filter(&mut self, settings: MasterFilterSettings) {
+        self.spectre_filter_settings = settings;
+    }
+    pub fn spectre_filter_settings(&self) -> MasterFilterSettings {
+        self.spectre_filter_settings
+    }
+    pub fn spectre_filter_mut(&mut self) -> &mut MasterFilter {
+        &mut self.spectre_filter
+    }
+    pub fn set_spectre_dynamic_filter(&mut self, settings: DynamicFilterSettings) {
+        self.spectre_dynamic_settings = settings;
+    }
+    pub fn spectre_dynamic_filter_settings(&self) -> DynamicFilterSettings {
+        self.spectre_dynamic_settings
+    }
+    pub fn spectre_dynamic_filter_mut(&mut self) -> &mut DynamicFilter {
+        &mut self.spectre_dynamic_filter
+    }
+
     /// Set the master freeze wet/dry amount (0 = passthrough, 1 = held grain).
     /// Crossing above 0 latches the current grain and loops it.
     pub fn set_freeze(&mut self, amount: f32) {
@@ -346,6 +392,13 @@ impl Engine {
         self.sequencer_enabled
     }
 
+    pub fn set_kick_gain(&mut self, g: f32) {
+        self.kick_gain = g.max(0.0);
+    }
+    pub fn kick_gain(&self) -> f32 {
+        self.kick_gain
+    }
+
     /// Master gain on the hi-hat bus (default 0.6).
     pub fn set_hihat_gain(&mut self, g: f32) {
         self.hihat_gain = g.max(0.0);
@@ -361,6 +414,158 @@ impl Engine {
     /// Mutable access to the open hi-hat voice.
     pub fn hihat_open_mut(&mut self) -> &mut HiHat {
         &mut self.hihat_open
+    }
+
+    pub fn selected_track(&self) -> Track {
+        self.selected_track
+    }
+
+    /// Apply one decoded groovebox control event. This is intentionally small
+    /// and bounded so any host can translate its hardware/UI protocol into the
+    /// same action type before touching the realtime engine.
+    pub fn handle_groove_event(&mut self, evt: GrooveEvent) {
+        match evt {
+            GrooveEvent::TransportPlay(playing) => self.set_sequencer_enabled(playing),
+            GrooveEvent::TransportReset => self.sequencer.reset(),
+            GrooveEvent::SelectTrack(track) => self.selected_track = track,
+            GrooveEvent::ToggleStep { track, step } => self.toggle_step(track, step as usize),
+            GrooveEvent::SetStepVelocity {
+                track,
+                step,
+                velocity,
+            } => self.set_step_velocity(track, step as usize, velocity),
+            GrooveEvent::SetMacro { macro_id, value } => {
+                if let Some(m) = Macro::from_id(macro_id) {
+                    self.apply_macro(m, value);
+                }
+            }
+            GrooveEvent::Pad { note, velocity } => self.trigger_pad(note, velocity),
+        }
+    }
+
+    fn toggle_step(&mut self, track: Track, step: usize) {
+        if track == Track::Bass {
+            let next = match self.sequencer.bass_step(step) {
+                Some(sequencer::BassCell::Rest) => sequencer::BassCell::Strike(1.0),
+                Some(_) => sequencer::BassCell::Rest,
+                None => return,
+            };
+            self.sequencer.set_bass_step(step, next);
+            return;
+        }
+
+        let Some(voice) = track.sequencer_voice() else {
+            return;
+        };
+        let Some(current) = self.sequencer.step_velocity(voice, step) else {
+            return;
+        };
+        self.sequencer
+            .set_step_velocity(voice, step, if current > 0.0 { 0.0 } else { 1.0 });
+    }
+
+    fn set_step_velocity(&mut self, track: Track, step: usize, velocity: f32) {
+        let v = velocity.clamp(0.0, 1.0);
+        if track == Track::Bass {
+            self.sequencer.set_bass_step(
+                step,
+                if v > 0.0 {
+                    sequencer::BassCell::Strike(v)
+                } else {
+                    sequencer::BassCell::Rest
+                },
+            );
+            return;
+        }
+
+        if let Some(voice) = track.sequencer_voice() {
+            self.sequencer.set_step_velocity(voice, step, v);
+        }
+    }
+
+    fn apply_macro(&mut self, m: Macro, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match m {
+            Macro::Damage => {
+                self.tape.set_failure(v);
+                self.kick_dist.set_drive(AudioParam::linear(1.0 + v * 5.0));
+                self.freeze
+                    .set_amount(if v > 0.85 { (v - 0.85) / 0.15 } else { 0.0 });
+            }
+            Macro::Space => {
+                self.reverb_wet = 0.05 + v * 0.45;
+                self.stab_delay_wet = v;
+                self.stab_delay
+                    .set_feedback(AudioParam::linear(0.2 + v * 0.55));
+                self.bloom.set_amount(v);
+            }
+            Macro::Tone => {
+                self.kick.set_tone(v);
+                self.hihat_closed.set_tone(v);
+                self.hihat_open.set_tone(v);
+                self.stabs.set_index(0.2 + v * 3.8);
+                self.bass.set_cutoff(80.0 + v * 3920.0);
+                self.spectre_filter_settings = MasterFilterSettings {
+                    model: MasterFilterModel::SemMorph,
+                    cutoff_hz: 120.0 + v * 15_000.0,
+                    resonance: 0.15 + v * 0.45,
+                    drive: v * 0.35,
+                    morph: v,
+                    mix: v * 0.6,
+                };
+            }
+            Macro::KickLevel => self.kick_gain = v * 1.5,
+            Macro::HatLevel => self.hihat_gain = v,
+            Macro::StabLevel => self.stabs.set_gain(v),
+            Macro::BassLevel => self.bass.set_gain(v),
+            Macro::FilterCutoff => {
+                let mut settings = self.spectre_dynamic_settings;
+                settings.bands[0].enabled = v > 0.0;
+                settings.bands[0].mode = BandMode::Bell;
+                settings.bands[0].channel_mode = ChannelMode::Stereo;
+                settings.bands[0].frequency_hz = 80.0 * libm::powf(100.0, v);
+                settings.bands[0].gain_db = 0.0;
+                settings.bands[0].q = settings.bands[0].q.clamp(0.4, 8.0);
+                settings.bands[0].env_attack_ms = 6.0;
+                settings.bands[0].env_release_ms = 180.0;
+                self.spectre_dynamic_settings = settings;
+            }
+            Macro::FilterResonance => {
+                let mut settings = self.spectre_dynamic_settings;
+                settings.bands[0].enabled = true;
+                settings.bands[0].mode = BandMode::Bell;
+                settings.bands[0].channel_mode = ChannelMode::Stereo;
+                settings.bands[0].q = 0.4 + v * 7.6;
+                self.spectre_dynamic_settings = settings;
+            }
+            Macro::FilterMotion => {
+                let mut settings = self.spectre_dynamic_settings;
+                settings.bands[0].enabled = v > 0.0;
+                settings.bands[0].mode = BandMode::Bell;
+                settings.bands[0].channel_mode = ChannelMode::Stereo;
+                settings.bands[0].dynamic_db = -18.0 + v * 36.0;
+                settings.bands[0].sweep_octaves = v * 2.0;
+                settings.bands[0].env_sensitivity = 0.35 + v * 2.65;
+                settings.bands[0].env_attack_ms = 4.0 + (1.0 - v) * 20.0;
+                settings.bands[0].env_release_ms = 80.0 + v * 360.0;
+                self.spectre_dynamic_settings = settings;
+            }
+        }
+    }
+
+    fn trigger_pad(&mut self, note: u8, velocity: f32) {
+        let v = velocity.clamp(0.0, 1.0);
+        if v <= 0.0 {
+            return;
+        }
+
+        match note {
+            // GM-ish drum note plus whichever note the engine uses for kick.
+            n if n == 36 || n == self.kick_trigger_note => self.trigger_kick(v),
+            42 | 44 => self.hihat_closed.trig(),
+            46 => self.hihat_open.trig(),
+            _ => self.stabs.note_on(note, v),
+        }
     }
 
     /// Dispatch an inbound MIDI message. Note-on of the kick trigger note
@@ -488,7 +693,7 @@ impl Engine {
             .zip(self.hihat_buf.iter())
             .zip(self.stab_buf.iter())
         {
-            let kick_mix = k * vel;
+            let kick_mix = k * vel * self.kick_gain;
             let hat_mix = h * hh_gain;
             out_frame[0] += kick_mix + hat_mix + st;
             out_frame[1] += kick_mix + hat_mix + st;
@@ -539,6 +744,14 @@ impl Engine {
             frame[0] += b;
             frame[1] += b;
         }
+
+        // 5d. Standalone Spectre-inspired dynamic rack + master filter. These
+        // zero-allocation inserts carry the first audio-first import from
+        // Spectre-Filter while staying bypassed in default patches.
+        self.spectre_dynamic_filter
+            .process_buffer(output, &self.spectre_dynamic_settings);
+        self.spectre_filter
+            .process_buffer(output, self.spectre_filter_settings);
 
         // 6. Tape emulation — final stage on the master bus. Currently
         //    Phase 1 (head bump + hiss); wow/flutter, loss filter, and
@@ -654,5 +867,128 @@ impl Sampler {
 
             self.position += self.step;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groove_event_toggles_drum_steps() {
+        let mut engine = Engine::new(48_000.0);
+
+        engine
+            .sequencer_mut()
+            .set_step_velocity(sequencer::Voice::Kick, 3, 0.0);
+        engine.handle_groove_event(GrooveEvent::ToggleStep {
+            track: Track::Kick,
+            step: 3,
+        });
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 3),
+            Some(1.0)
+        );
+
+        engine.handle_groove_event(GrooveEvent::ToggleStep {
+            track: Track::Kick,
+            step: 3,
+        });
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 3),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn groove_event_sets_bass_and_macros() {
+        let mut engine = Engine::new(48_000.0);
+
+        engine.handle_groove_event(GrooveEvent::SetStepVelocity {
+            track: Track::Bass,
+            step: 4,
+            velocity: 0.6,
+        });
+        assert_eq!(
+            engine.sequencer().bass_step(4),
+            Some(sequencer::BassCell::Strike(0.6))
+        );
+
+        engine.handle_groove_event(GrooveEvent::SetMacro {
+            macro_id: 3,
+            value: 0.5,
+        });
+        assert_eq!(engine.kick_gain(), 0.75);
+
+        engine.handle_groove_event(GrooveEvent::SetMacro {
+            macro_id: Macro::FilterMotion.id(),
+            value: 1.0,
+        });
+        let filter = engine.spectre_dynamic_filter_settings();
+        assert!(filter.bands[0].enabled);
+        assert!(filter.bands[0].dynamic_db > 0.0);
+    }
+
+    #[test]
+    fn groove_pad_respects_custom_kick_note() {
+        let mut engine = Engine::new(48_000.0);
+        engine.set_kick_trigger_note(48);
+        engine.handle_groove_event(GrooveEvent::Pad {
+            note: 48,
+            velocity: 1.0,
+        });
+
+        let mut out = [0.0_f32; 4096];
+        engine.process(&[], &mut out);
+        assert!(out.iter().any(|s| s.abs() > 0.0));
+    }
+
+    #[test]
+    fn spectre_filter_insert_stays_finite_when_enabled() {
+        let mut engine = Engine::new(48_000.0);
+        engine.set_spectre_filter(MasterFilterSettings {
+            model: MasterFilterModel::Diode,
+            cutoff_hz: 900.0,
+            resonance: 0.85,
+            drive: 0.9,
+            morph: 0.0,
+            mix: 1.0,
+        });
+        engine.handle_groove_event(GrooveEvent::Pad {
+            note: 36,
+            velocity: 1.0,
+        });
+
+        let mut out = [0.0_f32; 4096];
+        engine.process(&[], &mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn spectre_dynamic_filter_insert_stays_finite_when_enabled() {
+        let mut engine = Engine::new(48_000.0);
+        let mut settings = DynamicFilterSettings::default();
+        settings.bands[0] = DynamicBandSettings {
+            enabled: true,
+            mode: BandMode::BandPass,
+            channel_mode: ChannelMode::Stereo,
+            frequency_hz: 650.0,
+            gain_db: 6.0,
+            q: 1.2,
+            dynamic_db: 10.0,
+            sweep_octaves: 0.5,
+            env_attack_ms: 4.0,
+            env_release_ms: 160.0,
+            env_sensitivity: 1.4,
+        };
+        engine.set_spectre_dynamic_filter(settings);
+        engine.handle_groove_event(GrooveEvent::Pad {
+            note: 36,
+            velocity: 1.0,
+        });
+
+        let mut out = [0.0_f32; 4096];
+        engine.process(&[], &mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 }

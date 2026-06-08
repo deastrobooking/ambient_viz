@@ -9,6 +9,35 @@ Each item links its source doc/memory. Dependencies noted inline. Completed
 verification checklists from already-shipped work (USB composite Phases A–D, tape
 failure live control, SAI audio path) are intentionally excluded.
 
+## Audio-first fork priorities
+
+- [ ] **Host groovebox harness** — first stdin-command pass exists: host reads
+  the shared text protocol, applies `GrooveEvent`, starts a fixed 120 BPM loop
+  without a timeline, and makes old bloom/freeze audition modulation opt-in via
+  `--test-mod`. Next: richer keyboard/serial/MIDI feedback and state display. —
+  `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
+- [ ] **Groovebox control protocol** — `groove::parse_line` now defines the first
+  shared text command set for `PLAY`, `STOP`, `RESET`, `PAD`, `TOGGLE`, `STEP`,
+  `MACRO`, and `TRACK`; next write a Mac-side sender/receiver before mapping
+  custom hardware. — `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`
+- [ ] **Pattern bank + editing model** — add fixed-size pattern banks, bass
+  tie/hold editing, copy/clear/fill/randomize helpers, and quantized pattern
+  changes. Keep mutation realtime-bounded. — `AUDIO_ENGINE_FORK.md`
+- [ ] **Synth/filter/modulation expansion** — selectively port small
+  Nexus12/WolfGang ideas: one oscillator/filter at a time, fixed modulation
+  matrix, macro scenes, and tests. Avoid plugin/desktop runtime assumptions. —
+  `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`
+- [ ] **Standalone Spectre filter core** — master-filter insert and standalone
+  dynamic band rack have landed (`Off`, `Clean LP`, `Ladder12`, `Ladder24`,
+  `Diode`, `SEM Morph`; 8 biquad bands; Stereo/Mid/Side/Left/Right modes;
+  envelope-followed gain/cutoff). `MACRO filter_cutoff`, `filter_resonance`,
+  and `filter_motion` steer band 0 through the shared protocol. Next:
+  transient/color models, selected-band controls, and host-side analyzer. —
+  `SYNTH_SUITE_IMPORT_PLAN.md`
+- [ ] **Standalone Daisy groovebox build** — codec line out first, hardware
+  controls into `Engine::handle_groove_event`, project/pattern/sample storage,
+  visual/Pi sync optional. — `AUDIO_ENGINE_FORK.md`, `daisy/README.md`
+
 ## Audio capture / transport
 
 - [ ] **Run the USB-capture diagnostic** — flash `debug-uart`, briefly revive

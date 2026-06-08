@@ -1,16 +1,20 @@
 # ambient-viz-daisy
 
-Cargo workspace for the ambient visualizer's audio coprocessor:
+Cargo workspace for the fork's audio-first Daisy engine:
 
 | Crate             | Type                        | What it is                                                                                            |
 | ----------------- | --------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `crates/dsp`      | `no_std` library            | Audio + MIDI core. Sampler, mixer, voice allocation. Same code on both targets.                       |
-| `crates/firmware` | embedded binary (thumbv7em) | Daisy Seed firmware. Embassy + SAI + USB UAC + UART-MIDI + `dsp`.                                     |
-| `crates/host`     | std binary (macOS)          | Local dev host. CoreAudio + CoreMIDI + `dsp`. Lets you iterate on the audio logic without reflashing. |
+| `crates/dsp`      | `no_std` library            | Groovebox/synth core: sampler, drums, FM stabs, bass, sequencer, tape, freeze, bloom, MIDI, controls. |
+| `crates/firmware` | embedded binary (thumbv7em) | Daisy Seed firmware. Embassy + SAI audio, USB CDC/UAC support, UART-MIDI, SD-card work, and `dsp`.    |
+| `crates/host`     | std binary (macOS)          | Local dev host. CoreAudio + CoreMIDI + `dsp`. Lets you iterate on audio logic without reflashing.     |
 
-End goal: physical MIDI controller (TRS 3.5mm → UART) drives a sampler/mixer
-on the Daisy. Output goes both to the Daisy codec (→ PA) and to the Pi over
-USB Audio Class (→ visualizer).
+Fork direction: the Daisy is the instrument. Video/visualizer integration is
+optional downstream telemetry, not the center of the architecture. The primary
+goal is a playable hardware groovebox/synth engine controlled by pads, encoders,
+MIDI, CDC serial, sensors, or a small companion MCU.
+
+Audio output should be excellent over the Daisy codec/line out first. USB audio,
+I²S, Pi capture, and browser analysis are secondary integration paths.
 
 ## Dev workflow
 
@@ -82,9 +86,9 @@ features = ["seed_1_2"]   # or seed_1_1, patch_sm
 
 ```
                          ┌─────────────────┐
-                         │  crates/dsp     │     no_std, no allocator
-                         │  Engine::process│     buffer-size + sr agnostic
-                         │  Engine::handle_midi   stereo interleaved f32
+                         │  crates/dsp     │     no_std audio engine
+                         │  Engine::process│     stereo interleaved f32
+                         │  MIDI + GrooveEvent controls
                          └────┬───────┬────┘
                               │       │
                 ┌─────────────┘       └────────────────┐
@@ -97,8 +101,8 @@ features = ["seed_1_2"]   # or seed_1_1, patch_sm
         └───────┬────────┘                    └────────┬────────┘
                 │                                      │
        macOS CoreAudio                       Codec out → PA
-       macOS CoreMIDI                        USB out → Pi (visualizer)
-                                             UART in ← TRS MIDI adapter
+       macOS CoreMIDI/CDC                    UART/CDC/MIDI controls
+       fast audition                         optional USB/Pi/visualizer sync
 ```
 
 Why this works:
@@ -106,8 +110,8 @@ Why this works:
 - `dsp` is `no_std` so it compiles unchanged into both targets.
 - All I/O (audio, MIDI, USB) lives in the host-specific crate. The `dsp`
   crate never directly touches a peripheral or a `std` type.
-- `MidiMessage` will be a small enum decoded by each host from its own
-  transport. (Not yet implemented — currently `dsp` is a sine wave stub.)
+- `MidiMessage` and `GrooveEvent` are small control types decoded by each host
+  from its own transport.
 - Buffer sizes differ (~512 frames on cpal, ~48 on embassy SAI) — `Engine::process`
   is block-size agnostic so this is transparent.
 
@@ -119,9 +123,9 @@ Likely path: bake the file as i16 PCM mono onto the SD card (~50 MB at
 22 kHz mono, no decode CPU at runtime), stream into a ring buffer from
 a low-priority embassy task. On the Mac, host reads the same WAV from disk.
 
-Not yet implemented — `dsp` doesn't know about samples at all in this
-revision. When we add a sampler, samples will reach `dsp` as `&[i16]`
-slices that hosts source however they like.
+The host path already decodes file-backed samples into stereo f32 and feeds the
+sampler. Firmware sample storage remains the embedded problem: SD streaming or
+pre-baked PCM banks, prepared outside the realtime audio callback.
 
 ## Project layout
 
@@ -147,13 +151,21 @@ daisy/
 
 ## Roadmap
 
-1. **Workspace + sine wave** ← you are here. `cargo run -p host` plays a sine.
-2. **MIDI input on host** — `midir` enumerates CoreMIDI ports, feeds `Engine::handle_midi`.
-3. **Sampler in dsp** — voice allocation, ADSR, sample playback from `&[i16]`.
-4. **Daisy SAI passthrough** — wire `Engine::process` into the audio callback.
-5. **Daisy UART-MIDI** — 31.25 kbaud USART RX, decode → `Engine::handle_midi`.
-6. **Daisy USB UAC source** — Pi captures audio over USB.
-7. **SD card sample storage** — `embedded-sdmmc` + ring buffer.
+1. **Host groovebox harness** — map keyboard/MIDI/serial controls to
+   `GrooveEvent` so patterns, pads, and macros are playable on macOS.
+2. **Control protocol** — define a small CDC/MIDI-friendly command vocabulary
+   for pads, steps, macros, transport, and selected track.
+3. **Pattern editing** — add bass ties/holds, copy/clear, pattern banks, and
+   realtime-safe mutation helpers.
+4. **Synth expansion** — selectively port Nexus 12/WolfGang oscillator, filter,
+   modulation, and macro ideas into small fixed-size `no_std` modules.
+5. **Hardware bridge** — map the friend's controller hardware through MIDI,
+   CDC serial, or a small MCU into `GrooveEvent`.
+6. **Firmware groovebox build** — make the Daisy standalone: codec line out,
+   hardware control input, project/pattern/sample storage, and bounded realtime
+   audio.
+7. **Optional visual sync** — send audio position/features to Pi/browser only
+   after the instrument works as a standalone box.
 
 ```
 

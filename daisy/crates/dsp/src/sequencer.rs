@@ -28,8 +28,8 @@
 
 use heapless::Vec;
 
-use crate::chord::{self, Chord, Key, parse_chord, parse_key, tokenize_prog};
-use crate::timeline::{Keypoint, MAX_KEYPOINTS, bpm_at};
+use crate::chord::{self, parse_chord, parse_key, tokenize_prog, Chord, Key};
+use crate::timeline::{bpm_at, Keypoint, MAX_KEYPOINTS};
 
 /// Default loop length in steps when a pattern is built in code (4 bars of
 /// 8th notes). Patterns loaded from a grid set their own length up to
@@ -327,6 +327,32 @@ impl Sequencer {
         }
         let v = velocity.clamp(0.0, 1.0);
         self.voice_array(voice)[idx] = v;
+    }
+
+    pub fn step_velocity(&self, voice: Voice, idx: usize) -> Option<f32> {
+        if idx >= self.steps_per_loop {
+            return None;
+        }
+        Some(match voice {
+            Voice::Kick => self.kick_pattern[idx],
+            Voice::Chat => self.chat_pattern[idx],
+            Voice::Ohat => self.ohat_pattern[idx],
+            Voice::Stab => self.stab_pattern[idx],
+        })
+    }
+
+    pub fn set_bass_step(&mut self, idx: usize, cell: BassCell) {
+        if idx >= self.steps_per_loop {
+            return;
+        }
+        self.bass_pattern[idx] = cell;
+    }
+
+    pub fn bass_step(&self, idx: usize) -> Option<BassCell> {
+        if idx >= self.steps_per_loop {
+            return None;
+        }
+        Some(self.bass_pattern[idx])
     }
 
     /// Parse and apply a grid file in one step. See [`parse_grid`] for format.
@@ -691,7 +717,9 @@ pub fn parse_grid(text: &str) -> Result<PatternGrid, ParseError> {
                     ' ' | '\t' | '|' | ',' => continue,
                     _ => continue,
                 };
-                grid.stabtone.push(v).map_err(|_| ParseError::TooManyCells)?;
+                grid.stabtone
+                    .push(v)
+                    .map_err(|_| ParseError::TooManyCells)?;
             }
             continue;
         }
@@ -835,7 +863,10 @@ chat: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
             }
         }
         // 8 steps/s ± a step for phase alignment.
-        assert!((7..=9).contains(&hats), "expected ~8 hats in 1 s, got {hats}");
+        assert!(
+            (7..=9).contains(&hats),
+            "expected ~8 hats in 1 s, got {hats}"
+        );
     }
 
     #[test]
@@ -916,7 +947,8 @@ bassprog: i v
         fn steps_held(bpm: f32) -> u32 {
             // One strike, held to the end of a 16-step loop, then a rest pattern
             // that releases at step 12.
-            let pat = "steps: 16\nres: 16\nkick: X...X...X...X...\nbass: X___________....\nbassprog: i\n";
+            let pat =
+                "steps: 16\nres: 16\nkick: X...X...X...X...\nbass: X___________....\nbassprog: i\n";
             let mut seq = Sequencer::new(48_000.0);
             seq.load_grid(pat).unwrap();
             // loop seconds = 16 sixteenths = 4 beats = 4 * 60/bpm.
@@ -939,7 +971,10 @@ bassprog: i v
         }
         let slow = steps_held(60.0);
         let fast = steps_held(140.0);
-        assert_eq!(slow, fast, "held duration in steps must not depend on tempo");
+        assert_eq!(
+            slow, fast,
+            "held duration in steps must not depend on tempo"
+        );
         assert_eq!(slow, 12, "strike at 0, release at 12 → 12 steps held");
     }
 

@@ -46,6 +46,14 @@ pub fn parse_bpm(bytes: &[u8]) -> Option<Vec<Keypoint, MAX_KEYPOINTS>> {
     Some(kps)
 }
 
+/// Build a single-keypoint fixed-BPM lane. Useful for standalone groovebox
+/// operation where no visualizer timeline sidecar exists.
+pub fn fixed_bpm(bpm: f32) -> Vec<Keypoint, MAX_KEYPOINTS> {
+    let mut out = Vec::new();
+    let _ = out.push(Keypoint { t: 0.0, v: bpm });
+    out
+}
+
 /// Linear interpolation between BPM keypoints. Clamps at the ends.
 /// Caller is responsible for the wrap (e.g. `t = elapsed % loop_seconds`).
 pub fn bpm_at(keypoints: &[Keypoint], t: f32) -> f32 {

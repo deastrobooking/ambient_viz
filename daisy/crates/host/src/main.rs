@@ -8,6 +8,7 @@
 
 use std::env;
 use std::fs::File;
+use std::io::{self, BufRead};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +17,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use dsp::Param;
 use midir::{Ignore, MidiInput};
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -26,8 +27,11 @@ use symphonia::core::probe::Hint;
 fn main() -> Result<()> {
     // First non-flag argument is the audio path; `--no-seq` runs the engine
     // with the step sequencer disabled (track + processing, no drum pattern).
+    // `--test-mod` restores the old exhibit audition scaffolding that pins
+    // bloom and pulses freeze. It is off by default for the groovebox harness.
     let args: Vec<String> = env::args().skip(1).collect();
     let no_seq = args.iter().any(|a| a == "--no-seq");
+    let test_mod = args.iter().any(|a| a == "--test-mod");
     let audio_path = args.into_iter().find(|a| !a.starts_with("--"));
 
     let host = cpal::default_host();
@@ -49,6 +53,11 @@ fn main() -> Result<()> {
     );
 
     let engine = Arc::new(Mutex::new(dsp::Engine::new(engine_sample_rate)));
+    {
+        let mut eng = engine.lock().unwrap();
+        eng.sequencer_mut()
+            .set_tempo(dsp::timeline::fixed_bpm(120.0), 8.0);
+    }
 
     // `loop_seconds` is the loaded sample's duration; the BPM thread uses
     // it to map wall-clock time back to a position in the loop. `mp3_path`
@@ -110,6 +119,7 @@ fn main() -> Result<()> {
     // Connect to a MIDI input. midir owns the callback thread; the connection
     // must stay alive (we bind it to a named local so it lives till main exits).
     let _midi_conn = connect_midi(Arc::clone(&engine))?;
+    spawn_groove_stdin(Arc::clone(&engine));
 
     let config: cpal::StreamConfig = supported.config();
     let stream_engine = Arc::clone(&engine);
@@ -122,6 +132,7 @@ fn main() -> Result<()> {
 
     stream.play()?;
     println!("playing — Ctrl+C to stop");
+    print_groove_help();
 
     // No MIDI knob handy, so drive the resonant-bloom "proximity" with an
     // internal LFO standing in for the ToF distance sensor: one smooth
@@ -129,7 +140,7 @@ fn main() -> Result<()> {
     // cosine starts at 0 (far/silent), peaks at 1 (full D-Lydian bloom) at the
     // half-period, and returns to 0. This is host-only test scaffolding — the
     // real exhibit drives `set_bloom_amount` from the kiosk distance sensor.
-    {
+    if test_mod {
         use std::f32::consts::PI;
         let bloom_engine = Arc::clone(&engine);
         let period_s = 8.0 * 4.0 * 60.0 / 112.0; // 8 bars · 4 beats · (60/BPM)
@@ -141,9 +152,9 @@ fn main() -> Result<()> {
                 std::thread::sleep(dt);
                 let t = start.elapsed().as_secs_f32();
                 let _sweep = 0.5 - 0.5 * ((t / period_s) * 2.0 * PI).cos(); // far→near→far LFO
-                // AUDITION: pinned high so the bloom is judged at the peak of
-                // the gesture, not the fleeting LFO crest. Swap to `_sweep` to
-                // restore the far→near→far sweep.
+                                                                            // AUDITION: pinned high so the bloom is judged at the peak of
+                                                                            // the gesture, not the fleeting LFO crest. Swap to `_sweep` to
+                                                                            // restore the far→near→far sweep.
                 let amount = 0.9;
                 bloom_engine.lock().unwrap().set_bloom_amount(amount);
             }
@@ -153,18 +164,16 @@ fn main() -> Result<()> {
     // Master-freeze test: hold a grain for ~0.5 s once every ~10 s, then
     // release. Host-only scaffolding — the real exhibit drives `set_freeze`
     // from the visualizer's JS freeze over the (unconnected) CDC path.
-    {
+    if test_mod {
         let freeze_engine = Arc::clone(&engine);
         println!("freeze test: holding ~0.5s every ~10s");
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(9500));
-                freeze_engine.lock().unwrap().set_freeze(1.0);
-                println!("  freeze ON");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                freeze_engine.lock().unwrap().set_freeze(0.0);
-                println!("  freeze OFF");
-            }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(9500));
+            freeze_engine.lock().unwrap().set_freeze(1.0);
+            println!("  freeze ON");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            freeze_engine.lock().unwrap().set_freeze(0.0);
+            println!("  freeze OFF");
         });
     }
 
@@ -274,6 +283,46 @@ fn main() -> Result<()> {
 
     std::thread::park();
     Ok(())
+}
+
+fn spawn_groove_stdin(engine: Arc<Mutex<dsp::Engine>>) {
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else {
+                eprintln!("groove stdin: read error");
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            match dsp::groove::parse_line(trimmed) {
+                Ok(evt) => {
+                    let mut eng = engine.lock().unwrap();
+                    eng.handle_groove_event(evt);
+                    println!(
+                        "  groove {:?} | track={:?} seq={} step={}",
+                        evt,
+                        eng.selected_track(),
+                        eng.sequencer_enabled(),
+                        eng.sequencer().step()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  groove parse error {:?}: {}", e, trimmed);
+                    print_groove_help();
+                }
+            }
+        }
+    });
+}
+
+fn print_groove_help() {
+    println!("groove stdin commands:");
+    println!("  PLAY 1 | STOP | RESET | TRACK kick");
+    println!("  PAD 36 127 | TOGGLE kick 0 | STEP bass 4 96 | MACRO damage 64");
 }
 
 /// Connect to a MIDI input port and forward decoded messages to the engine.

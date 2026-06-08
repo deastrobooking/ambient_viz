@@ -4,6 +4,12 @@ Browser-based audio visualizer for ambient / industrial / IDM material.
 Black-and-white CRT/glitch aesthetic — reference points: NIN, Aphex Twin,
 Venetian Snares.
 
+> **Audio-first fork note:** this repository now also contains a Daisy/Rust
+> groovebox/synth-engine fork. For current agent handoff and audio-engine
+> direction, read `AGENTS.md`, `AGENT_MEMORY.md`, `AUDIO_ENGINE_FORK.md`, and
+> `SYNTH_SUITE_IMPORT_PLAN.md`. The browser visualizer remains useful, but it
+> is no longer the center of the fork roadmap.
+
 ## Layout
 
 - `static/` — everything served to the browser.
