@@ -11,15 +11,23 @@ failure live control, SAI audio path) are intentionally excluded.
 
 ## Audio-first fork priorities
 
+- [x] **Condensed audio-fork docs and agent memory** — `AGENT_MEMORY.md` now
+  owns current state, donor research, and the milestone plan; architecture and
+  donor docs are shortened to focused references. — `AGENT_MEMORY.md`,
+  `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`, `GROOVEBOX_REPURPOSE.md`
 - [ ] **Host groovebox harness** — first stdin-command pass exists: host reads
   the shared text protocol, applies `GrooveEvent`, starts a fixed 120 BPM loop
   without a timeline, and makes old bloom/freeze audition modulation opt-in via
-  `--test-mod`. Next: richer keyboard/serial/MIDI feedback and state display. —
+  `--test-mod`; `HELP` and `STATE` now print host-side command help and engine
+  snapshots including macro/filter state. Next: keyboard/serial/MIDI ergonomics
+  and a more playable TUI/shortcut layer. —
   `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
 - [ ] **Groovebox control protocol** — `groove::parse_line` now defines the first
   shared text command set for `PLAY`, `STOP`, `RESET`, `PAD`, `TOGGLE`, `STEP`,
-  `MACRO`, and `TRACK`; next write a Mac-side sender/receiver before mapping
-  custom hardware. — `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`
+  `MACRO`, `TRACK`, `BAND`, and `FILTER`; selected-band filter controls are now
+  routed through `Engine::handle_groove_event`. Next write a compact
+  CDC/MIDI/UART event encoder only after the text protocol feels good. —
+  `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`
 - [ ] **Pattern bank + editing model** — add fixed-size pattern banks, bass
   tie/hold editing, copy/clear/fill/randomize helpers, and quantized pattern
   changes. Keep mutation realtime-bounded. — `AUDIO_ENGINE_FORK.md`

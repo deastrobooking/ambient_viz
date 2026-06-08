@@ -11,8 +11,8 @@ controls, and shared comms.
 
 Before planning or coding, read:
 
-1. `AGENT_MEMORY.md` — compact current-state handoff.
-2. `AUDIO_ENGINE_FORK.md` — north star and milestone plan.
+1. `AGENT_MEMORY.md` — compact current-state handoff and milestone plan.
+2. `AUDIO_ENGINE_FORK.md` — north star and architecture summary.
 3. `SYNTH_SUITE_IMPORT_PLAN.md` — Wolfgang/Nexus/Spectre import boundaries.
 4. `daisy/README.md` — current Daisy workspace framing and workflow.
 5. `BACKLOG.md` — prioritized permanent task list.
@@ -45,6 +45,9 @@ PAD 36 127
 TOGGLE kick 0
 STEP bass 4 96
 MACRO damage 64
+MACRO filter_cutoff 80
+MACRO filter_resonance 48
+MACRO filter_motion 96
 ```
 
 ## Donor Project Boundaries

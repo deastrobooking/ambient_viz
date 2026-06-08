@@ -1,153 +1,93 @@
-# Wolfgang / Nexus / Spectre Import Plan
+# Donor Import Boundaries
 
-This fork is the definitive audio performance and synth software. The other
-Rust projects are source references and potential donor modules, but this repo
-owns the standalone instrument runtime.
+This repo owns the standalone instrument runtime. Wolfgang, Nexus 12, and
+Spectre are references and selective donor sources, not runtimes to merge whole.
 
-## Rule Of The Fork
+The rule: every imported idea becomes a small, tested, realtime-bounded module
+behind `daisy/crates/dsp::Engine` or the shared `GrooveEvent` protocol.
 
-Keep the runtime centered on `daisy/crates/dsp::Engine` and its shared control
-protocol. Features from Wolfgang, Nexus 12, and Spectre should enter through
-small, tested, realtime-bounded modules.
+## Never Import Into Firmware
 
-Do not import desktop/plugin assumptions into the embedded path:
+- NIH-plug, CLAP/VST3, egui, or plugin parameter layers.
+- Desktop DAW/session app runtime.
+- GUI graph/analyzer state.
+- File IO, allocation, parsing, or blocking locks in audio processing.
+- Unbounded project/preset state inside `dsp`.
 
-- no NIH-plug dependency in Daisy firmware,
-- no egui/UI state in `dsp`,
-- no allocation or file IO in audio processing,
-- no DAW graph/runtime dependency in the hardware engine.
+## Wolfgang_Rust
 
-## Standard Comms
+Use as the groovebox/workstation architecture reference.
 
-All surfaces should target `GrooveEvent`.
+Borrow:
 
-Line protocol:
+- realtime callback contract;
+- transport and quantization;
+- session/pattern/project concepts;
+- MIDI learn, controller layers, feedback mapping;
+- DrumCanyon/SynthCanyon/SoundCanyon concepts reduced to embedded endpoints.
 
-```text
-PLAY 1
-STOP
-RESET
-TRACK kick
-PAD 36 127
-TOGGLE kick 0
-STEP bass 4 96
-MACRO damage 64
-```
+Avoid:
 
-The protocol intentionally uses 7-bit values so it maps cleanly to MIDI,
-encoders, CDC serial, OSC/WebSocket bridges, or a controller MCU.
+- full DAW mixer/session runtime;
+- desktop app shell;
+- patch graph execution before the embedded control model is stable.
 
-## Wolfgang_Rust Feature Targets
+## Nexus12
 
-Use Wolfgang as the groovebox and workstation reference.
+Use as the flagship synth reference.
 
-Priority imports:
+Borrow:
 
-1. Transport/quantization concepts.
-2. Pattern/session model.
-3. MIDI learn, controller layers, and feedback mapping.
-4. DrumCanyon pad model: pad source, choke, bus, kit, sequence.
-5. SynthCanyon/SoundCanyon rack vocabulary, but folded into bounded endpoints.
-6. Project/preset model, reduced to fixed-shape embedded banks.
+- fixed-size polyphony and deterministic voice stealing;
+- oscillator families;
+- per-voice filter families;
+- small modulation matrix;
+- performance LFOs and macro scenes;
+- editor/page vocabulary for future companion UI.
 
-Avoid importing:
+Avoid:
 
-- desktop app shell,
-- full DAW mixer/session runtime,
-- patch graph execution before the embedded endpoint model is stable.
+- plugin/editor assumptions;
+- host automation parameter layer;
+- unbounded preset or UI state in `dsp`.
 
-## Nexus12 Feature Targets
+## Spectre-Filter
 
-Use Nexus 12 as the flagship synth reference.
+Use as the standalone filter/effects reference.
 
-Priority imports:
+Borrow:
 
-1. Oscillator vocabulary: polyBLEP saw/square/pulse, analog saw/pulse, formant,
-   terrain/function, Karplus-style modes.
-2. Fixed polyphonic voice engine with deterministic stealing.
-3. Per-voice filter lanes: ladder, SEM, diode, comb, clean LP.
-4. Fixed modulation matrix: LFO, velocity, key, gate, random, envelope sources.
-5. Performance macros and morph scenes.
-6. UI/page structure for the eventual desktop/editor surface.
+- dynamic filter/EQ behavior;
+- channel modes;
+- master filter, transient, and color models;
+- envelope detectors and performance LFOs;
+- analyzer snapshots for host/editor display.
 
-Avoid importing:
+Avoid:
 
-- NIH-plug parameter layer,
-- plugin editor assumptions,
-- unbounded preset/UI state into `dsp`.
-
-## Spectre-Filter Feature Targets
-
-Use Spectre as the standalone filter/effects reference.
-
-Priority imports:
-
-1. Eight-band dynamic filter/EQ as a standalone `dsp` effect.
-2. Master filter models: Clean LP, Ladder12, Ladder24, Diode, SEM Morph.
-3. Envelope follower detectors and dynamic band gain/cutoff movement.
-4. Performance LFOs for filter and macro motion.
-5. Master transients and master color models.
-6. Analyzer data path for a host/editor, not for the embedded audio callback.
-
-Avoid importing:
-
-- CLAP/VST3 aux bus assumptions,
-- GUI graph state into processing,
+- DAW sidechain bus assumptions;
+- GUI graph state in processing;
 - analyzer allocation in realtime.
 
-## Implementation Order
+## Current Import Status
 
-### 1. Comms And Host Harness
+Landed:
 
-- Finish `groove::parse_line`.
-- Add host stdin/UDP/serial-style command ingestion.
-- Print state snapshots for pattern position, selected track, and macros.
+- shared `GrooveEvent` and text protocol;
+- host stdin groovebox harness;
+- default-bypassed Spectre dynamic rack and master filter in `Engine`;
+- macro ids 7-9 for `filter_cutoff`, `filter_resonance`, `filter_motion`;
+- selected-band `BAND` and explicit/selected `FILTER` commands;
+- finite-output tests for the Spectre filter path.
 
-### 2. Standalone Spectre Filter Core
-
-- Status: first master-filter pass implemented in `daisy/crates/dsp/src/spectre_filter.rs`.
-- Landed:
-  - master filter models: Off, Clean LP, Ladder12, Ladder24, Diode, SEM Morph;
-  - envelope follower;
-  - eight-band dynamic biquad core;
-  - channel modes: Stereo, Mid, Side, Left, Right;
-  - envelope-followed dynamic gain/cutoff movement;
-  - default-bypassed `Engine` dynamic rack and master insert before tape;
-  - Tone macro can open the filter as a performance color path;
-  - `filter_cutoff`, `filter_resonance`, and `filter_motion` macros steer the
-    first dynamic band through the shared protocol;
-  - finite-output tests.
-- Next add selected-band protocol controls, transient/color models, and host
-  analyzer state.
-- Keep analyzer/UI state host-side only.
-
-### 3. Nexus Voice Expansion
-
-- Add one oscillator at a time.
-- Add one filter family at a time.
-- Keep every voice and filter allocation-free after construction.
-- Add no-NaN/no-infinite tests across MIDI range.
-
-### 4. Wolfgang Groovebox Model
-
-- Pattern banks.
-- Quantized scene/pattern launch.
-- Controller mapping and feedback.
-- Reduced project save/load format.
-
-### 5. Editor/UI Surface
-
-- Desktop editor can borrow Nexus/Spectre visual ideas.
-- Hardware stays command/protocol driven.
-- The UI edits project/control state; the audio engine consumes bounded runtime
-  specs and `GrooveEvent`s.
+Next donor work is tracked in `AGENT_MEMORY.md` milestones M3-M5.
 
 ## Acceptance Gate
 
 Every imported feature needs:
 
-- a narrow host-side test,
-- finite-output coverage for DSP,
-- no process-time allocation by design,
-- one host harness control path,
-- a clear firmware story before it is considered hardware-ready.
+- one narrow host-side control path;
+- finite-output DSP tests where applicable;
+- no process-time allocation by design;
+- a clear firmware-control story;
+- docs updated in `AGENT_MEMORY.md` and `BACKLOG.md`.

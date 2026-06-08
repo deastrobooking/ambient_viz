@@ -41,7 +41,7 @@ pub mod timeline;
 pub use analog_bass_drum::AnalogBassDrum;
 pub use bass::{BassPatch, RumbleBass};
 pub use fm_stab::{FmPatch, FmStab, Shaper};
-pub use groove::{GrooveEvent, Macro, Track};
+pub use groove::{FilterParam, GrooveEvent, Macro, Track};
 pub use hihat::HiHat;
 pub use midi::{MidiByteParser, MidiMessage};
 pub use midi_map::{install_kiosk_bindings, MidiMap, Param};
@@ -116,6 +116,7 @@ pub struct Engine {
     /// bypassed; groove macros can open the first band as a performance filter.
     spectre_dynamic_filter: spectre_filter::DynamicFilter,
     spectre_dynamic_settings: spectre_filter::DynamicFilterSettings,
+    selected_filter_band: usize,
     tape: tape::TapeProcessor,
     /// Master "freeze" — parallel-send grain hold; produces a looped grain of
     /// the post-everything master, run through `glitch_tape` and summed *under*
@@ -230,6 +231,7 @@ impl Engine {
             spectre_filter_settings: spectre_filter::MasterFilterSettings::default(),
             spectre_dynamic_filter: spectre_filter::DynamicFilter::new(sample_rate),
             spectre_dynamic_settings: spectre_filter::DynamicFilterSettings::default(),
+            selected_filter_band: 0,
             tape: tape::TapeProcessor::new(sample_rate),
             freeze: freeze::Freeze::new(sample_rate),
             glitch_tape: freeze::GlitchTape::new(sample_rate),
@@ -371,6 +373,12 @@ impl Engine {
     pub fn spectre_dynamic_filter_mut(&mut self) -> &mut DynamicFilter {
         &mut self.spectre_dynamic_filter
     }
+    pub fn selected_filter_band(&self) -> usize {
+        self.selected_filter_band
+    }
+    pub fn select_filter_band(&mut self, band: usize) {
+        self.selected_filter_band = band.min(spectre_filter::DYNAMIC_BAND_COUNT - 1);
+    }
 
     /// Set the master freeze wet/dry amount (0 = passthrough, 1 = held grain).
     /// Crossing above 0 latches the current grain and loops it.
@@ -428,6 +436,7 @@ impl Engine {
             GrooveEvent::TransportPlay(playing) => self.set_sequencer_enabled(playing),
             GrooveEvent::TransportReset => self.sequencer.reset(),
             GrooveEvent::SelectTrack(track) => self.selected_track = track,
+            GrooveEvent::SelectFilterBand(band) => self.select_filter_band(band as usize),
             GrooveEvent::ToggleStep { track, step } => self.toggle_step(track, step as usize),
             GrooveEvent::SetStepVelocity {
                 track,
@@ -438,6 +447,12 @@ impl Engine {
                 if let Some(m) = Macro::from_id(macro_id) {
                     self.apply_macro(m, value);
                 }
+            }
+            GrooveEvent::SetFilterParam { band, param, value } => {
+                let band = band
+                    .map(|band| band as usize)
+                    .unwrap_or(self.selected_filter_band);
+                self.apply_filter_param(band, param, value);
             }
             GrooveEvent::Pad { note, velocity } => self.trigger_pad(note, velocity),
         }
@@ -519,38 +534,47 @@ impl Engine {
             Macro::StabLevel => self.stabs.set_gain(v),
             Macro::BassLevel => self.bass.set_gain(v),
             Macro::FilterCutoff => {
-                let mut settings = self.spectre_dynamic_settings;
-                settings.bands[0].enabled = v > 0.0;
-                settings.bands[0].mode = BandMode::Bell;
-                settings.bands[0].channel_mode = ChannelMode::Stereo;
-                settings.bands[0].frequency_hz = 80.0 * libm::powf(100.0, v);
-                settings.bands[0].gain_db = 0.0;
-                settings.bands[0].q = settings.bands[0].q.clamp(0.4, 8.0);
-                settings.bands[0].env_attack_ms = 6.0;
-                settings.bands[0].env_release_ms = 180.0;
-                self.spectre_dynamic_settings = settings;
+                self.apply_filter_param(self.selected_filter_band, FilterParam::Cutoff, v)
             }
             Macro::FilterResonance => {
-                let mut settings = self.spectre_dynamic_settings;
-                settings.bands[0].enabled = true;
-                settings.bands[0].mode = BandMode::Bell;
-                settings.bands[0].channel_mode = ChannelMode::Stereo;
-                settings.bands[0].q = 0.4 + v * 7.6;
-                self.spectre_dynamic_settings = settings;
+                self.apply_filter_param(self.selected_filter_band, FilterParam::Resonance, v)
             }
             Macro::FilterMotion => {
-                let mut settings = self.spectre_dynamic_settings;
-                settings.bands[0].enabled = v > 0.0;
-                settings.bands[0].mode = BandMode::Bell;
-                settings.bands[0].channel_mode = ChannelMode::Stereo;
-                settings.bands[0].dynamic_db = -18.0 + v * 36.0;
-                settings.bands[0].sweep_octaves = v * 2.0;
-                settings.bands[0].env_sensitivity = 0.35 + v * 2.65;
-                settings.bands[0].env_attack_ms = 4.0 + (1.0 - v) * 20.0;
-                settings.bands[0].env_release_ms = 80.0 + v * 360.0;
-                self.spectre_dynamic_settings = settings;
+                self.apply_filter_param(self.selected_filter_band, FilterParam::Motion, v)
             }
         }
+    }
+
+    fn apply_filter_param(&mut self, band: usize, param: FilterParam, value: f32) {
+        let band = band.min(spectre_filter::DYNAMIC_BAND_COUNT - 1);
+        let v = value.clamp(0.0, 1.0);
+        let mut settings = self.spectre_dynamic_settings;
+        let band_settings = &mut settings.bands[band];
+        band_settings.enabled = v > 0.0 || param == FilterParam::Resonance;
+        band_settings.mode = BandMode::Bell;
+        band_settings.channel_mode = ChannelMode::Stereo;
+
+        match param {
+            FilterParam::Cutoff => {
+                band_settings.frequency_hz = 80.0 * libm::powf(100.0, v);
+                band_settings.gain_db = 0.0;
+                band_settings.q = band_settings.q.clamp(0.4, 8.0);
+                band_settings.env_attack_ms = 6.0;
+                band_settings.env_release_ms = 180.0;
+            }
+            FilterParam::Resonance => {
+                band_settings.q = 0.4 + v * 7.6;
+            }
+            FilterParam::Motion => {
+                band_settings.dynamic_db = -18.0 + v * 36.0;
+                band_settings.sweep_octaves = v * 2.0;
+                band_settings.env_sensitivity = 0.35 + v * 2.65;
+                band_settings.env_attack_ms = 4.0 + (1.0 - v) * 20.0;
+                band_settings.env_release_ms = 80.0 + v * 360.0;
+            }
+        }
+
+        self.spectre_dynamic_settings = settings;
     }
 
     fn trigger_pad(&mut self, note: u8, velocity: f32) {
@@ -927,6 +951,32 @@ mod tests {
         let filter = engine.spectre_dynamic_filter_settings();
         assert!(filter.bands[0].enabled);
         assert!(filter.bands[0].dynamic_db > 0.0);
+    }
+
+    #[test]
+    fn groove_filter_events_target_selected_or_explicit_band() {
+        let mut engine = Engine::new(48_000.0);
+
+        engine.handle_groove_event(GrooveEvent::SelectFilterBand(2));
+        assert_eq!(engine.selected_filter_band(), 2);
+        engine.handle_groove_event(GrooveEvent::SetMacro {
+            macro_id: Macro::FilterCutoff.id(),
+            value: 0.5,
+        });
+
+        let settings = engine.spectre_dynamic_filter_settings();
+        assert!(!settings.bands[0].enabled);
+        assert!(settings.bands[2].enabled);
+        assert!(settings.bands[2].frequency_hz > 700.0);
+
+        engine.handle_groove_event(GrooveEvent::SetFilterParam {
+            band: Some(4),
+            param: FilterParam::Resonance,
+            value: 1.0,
+        });
+        let settings = engine.spectre_dynamic_filter_settings();
+        assert!(settings.bands[4].enabled);
+        assert_eq!(settings.bands[4].q, 8.0);
     }
 
     #[test]

@@ -86,6 +86,44 @@ pub enum Macro {
     FilterMotion,
 }
 
+/// Dynamic filter parameter addressed by the shared control protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterParam {
+    Cutoff,
+    Resonance,
+    Motion,
+}
+
+impl FilterParam {
+    pub fn id(self) -> u8 {
+        match self {
+            FilterParam::Cutoff => 0,
+            FilterParam::Resonance => 1,
+            FilterParam::Motion => 2,
+        }
+    }
+
+    pub fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Cutoff),
+            1 => Some(Self::Resonance),
+            2 => Some(Self::Motion),
+            _ => None,
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "0" | "cutoff" | "CUTOFF" | "freq" | "FREQ" | "frequency" | "FREQUENCY" => {
+                Some(Self::Cutoff)
+            }
+            "1" | "resonance" | "RESONANCE" | "q" | "Q" => Some(Self::Resonance),
+            "2" | "motion" | "MOTION" | "dynamic" | "DYNAMIC" => Some(Self::Motion),
+            _ => None,
+        }
+    }
+}
+
 impl Macro {
     pub fn id(self) -> u8 {
         match self {
@@ -147,6 +185,8 @@ pub enum GrooveEvent {
     TransportPlay(bool),
     TransportReset,
     SelectTrack(Track),
+    /// Select a zero-based Spectre dynamic filter band index.
+    SelectFilterBand(u8),
     ToggleStep {
         track: Track,
         step: u8,
@@ -158,6 +198,12 @@ pub enum GrooveEvent {
     },
     SetMacro {
         macro_id: u8,
+        value: f32,
+    },
+    /// Set a Spectre filter parameter. `None` means use the selected band.
+    SetFilterParam {
+        band: Option<u8>,
+        param: FilterParam,
         value: f32,
     },
     Pad {
@@ -175,6 +221,8 @@ pub enum ParseError {
     BadBool,
     BadTrack,
     BadMacro,
+    BadFilterBand,
+    BadFilterParam,
     BadNumber,
 }
 
@@ -193,6 +241,9 @@ pub enum ParseError {
 /// TOGGLE kick 0
 /// STEP bass 4 96
 /// MACRO damage 64
+/// BAND 1
+/// FILTER cutoff 80
+/// FILTER 3 q 48
 /// ```
 pub fn parse_line(line: &str) -> Result<GrooveEvent, ParseError> {
     let mut parts = line.split_ascii_whitespace();
@@ -205,6 +256,9 @@ pub fn parse_line(line: &str) -> Result<GrooveEvent, ParseError> {
         "STOP" | "stop" => Ok(GrooveEvent::TransportPlay(false)),
         "RESET" | "reset" => Ok(GrooveEvent::TransportReset),
         "TRACK" | "track" => Ok(GrooveEvent::SelectTrack(parse_track(next(&mut parts)?)?)),
+        "BAND" | "band" => Ok(GrooveEvent::SelectFilterBand(parse_filter_band(next(
+            &mut parts,
+        )?)?)),
         "PAD" | "pad" => Ok(GrooveEvent::Pad {
             note: parse_u8(next(&mut parts)?)?,
             velocity: parse_unit(next(&mut parts)?)?,
@@ -225,6 +279,7 @@ pub fn parse_line(line: &str) -> Result<GrooveEvent, ParseError> {
                 value: parse_unit(next(&mut parts)?)?,
             })
         }
+        "FILTER" | "filter" => parse_filter_command(&mut parts),
         _ => Err(ParseError::UnknownCommand),
     }
 }
@@ -247,6 +302,33 @@ fn parse_track(token: &str) -> Result<Track, ParseError> {
 
 fn parse_macro(token: &str) -> Result<Macro, ParseError> {
     Macro::from_token(token).ok_or(ParseError::BadMacro)
+}
+
+fn parse_filter_param(token: &str) -> Result<FilterParam, ParseError> {
+    FilterParam::from_token(token).ok_or(ParseError::BadFilterParam)
+}
+
+fn parse_filter_band(token: &str) -> Result<u8, ParseError> {
+    let band = parse_u8(token)?;
+    if !(1..=8).contains(&band) {
+        return Err(ParseError::BadFilterBand);
+    }
+    Ok(band - 1)
+}
+
+fn parse_filter_command(
+    parts: &mut core::str::SplitAsciiWhitespace<'_>,
+) -> Result<GrooveEvent, ParseError> {
+    let first = next(parts)?;
+    let (band, param_token) = match first.parse::<u8>() {
+        Ok(_) => (Some(parse_filter_band(first)?), next(parts)?),
+        Err(_) => (None, first),
+    };
+    Ok(GrooveEvent::SetFilterParam {
+        band,
+        param: parse_filter_param(param_token)?,
+        value: parse_unit(next(parts)?)?,
+    })
 }
 
 fn parse_u8(token: &str) -> Result<u8, ParseError> {
@@ -274,6 +356,7 @@ mod tests {
             parse_line("TRACK bass"),
             Ok(GrooveEvent::SelectTrack(Track::Bass))
         );
+        assert_eq!(parse_line("BAND 3"), Ok(GrooveEvent::SelectFilterBand(2)));
     }
 
     #[test]
@@ -314,6 +397,22 @@ mod tests {
                 value: 1.0,
             })
         );
+        assert_eq!(
+            parse_line("FILTER cutoff 64"),
+            Ok(GrooveEvent::SetFilterParam {
+                band: None,
+                param: FilterParam::Cutoff,
+                value: 64.0 / 127.0,
+            })
+        );
+        assert_eq!(
+            parse_line("FILTER 4 q 32"),
+            Ok(GrooveEvent::SetFilterParam {
+                band: Some(3),
+                param: FilterParam::Resonance,
+                value: 32.0 / 127.0,
+            })
+        );
     }
 
     #[test]
@@ -323,6 +422,8 @@ mod tests {
         assert_eq!(parse_line("PLAY maybe"), Err(ParseError::BadBool));
         assert_eq!(parse_line("STEP nope 1 2"), Err(ParseError::BadTrack));
         assert_eq!(parse_line("MACRO nope 1"), Err(ParseError::BadMacro));
+        assert_eq!(parse_line("BAND 9"), Err(ParseError::BadFilterBand));
+        assert_eq!(parse_line("FILTER nope 1"), Err(ParseError::BadFilterParam));
         assert_eq!(parse_line("PAD 36 255"), Err(ParseError::BadNumber));
     }
 }

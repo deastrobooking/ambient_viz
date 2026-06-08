@@ -287,6 +287,7 @@ fn main() -> Result<()> {
 
 fn spawn_groove_stdin(engine: Arc<Mutex<dsp::Engine>>) {
     std::thread::spawn(move || {
+        let mut state = GrooveboxHostState::default();
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else {
@@ -298,17 +299,24 @@ fn spawn_groove_stdin(engine: Arc<Mutex<dsp::Engine>>) {
                 continue;
             }
 
+            if trimmed.eq_ignore_ascii_case("HELP") || trimmed == "?" {
+                print_groove_help();
+                continue;
+            }
+
+            if trimmed.eq_ignore_ascii_case("STATE") {
+                let eng = engine.lock().unwrap();
+                println!("{}", state.snapshot(&eng));
+                continue;
+            }
+
             match dsp::groove::parse_line(trimmed) {
                 Ok(evt) => {
                     let mut eng = engine.lock().unwrap();
                     eng.handle_groove_event(evt);
-                    println!(
-                        "  groove {:?} | track={:?} seq={} step={}",
-                        evt,
-                        eng.selected_track(),
-                        eng.sequencer_enabled(),
-                        eng.sequencer().step()
-                    );
+                    state.observe_event(evt);
+                    println!("  groove {:?}", evt);
+                    println!("{}", state.snapshot(&eng));
                 }
                 Err(e) => {
                     eprintln!("  groove parse error {:?}: {}", e, trimmed);
@@ -321,8 +329,132 @@ fn spawn_groove_stdin(engine: Arc<Mutex<dsp::Engine>>) {
 
 fn print_groove_help() {
     println!("groove stdin commands:");
+    println!("  HELP | STATE");
     println!("  PLAY 1 | STOP | RESET | TRACK kick");
-    println!("  PAD 36 127 | TOGGLE kick 0 | STEP bass 4 96 | MACRO damage 64");
+    println!("  PAD 36 127 | TOGGLE kick 0 | STEP bass 4 96");
+    println!("  MACRO damage 64 | MACRO space 96 | MACRO tone 80");
+    println!("  MACRO filter_cutoff 80 | MACRO filter_resonance 48 | MACRO filter_motion 96");
+    println!("  BAND 1 | FILTER cutoff 80 | FILTER 3 q 48 | FILTER 3 motion 96");
+}
+
+#[derive(Debug, Default)]
+struct GrooveboxHostState {
+    macros: [Option<f32>; 10],
+}
+
+impl GrooveboxHostState {
+    fn observe_event(&mut self, evt: dsp::GrooveEvent) {
+        if let dsp::GrooveEvent::SetMacro { macro_id, value } = evt {
+            if let Some(slot) = self.macros.get_mut(macro_id as usize) {
+                *slot = Some(value.clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    fn snapshot(&self, eng: &dsp::Engine) -> String {
+        let seq = eng.sequencer();
+        let step = seq.step() as usize;
+        let loop_steps = seq.steps_per_loop().max(1);
+        let display_step = step % loop_steps;
+        let selected = eng.selected_track();
+        let selected_step = selected_step_value(eng, selected, display_step);
+        let dyn_settings = eng.spectre_dynamic_filter_settings();
+        let band_idx = eng
+            .selected_filter_band()
+            .min(dyn_settings.bands.len().saturating_sub(1));
+        let band = dyn_settings.bands[band_idx];
+        let master = eng.spectre_filter_settings();
+
+        format!(
+            concat!(
+                "  state transport={} track={} step={}/{} spb={} selected_step={}\n",
+                "  macros damage={} space={} tone={} levels[k={} h={} st={} b={}]\n",
+                "  filter band={} enabled={} mode={:?} ch={:?} freq={:.1}Hz q={:.2} dyn={:+.1}dB sweep={:.2}oct\n",
+                "  master_filter model={:?} cutoff={:.1}Hz res={:.2} drive={:.2} morph={:.2} mix={:.2}"
+            ),
+            if eng.sequencer_enabled() {
+                "play"
+            } else {
+                "stop"
+            },
+            track_name(selected),
+            display_step,
+            loop_steps,
+            seq.steps_per_beat(),
+            selected_step,
+            self.macro_value(dsp::Macro::Damage),
+            self.macro_value(dsp::Macro::Space),
+            self.macro_value(dsp::Macro::Tone),
+            self.macro_value(dsp::Macro::KickLevel),
+            self.macro_value(dsp::Macro::HatLevel),
+            self.macro_value(dsp::Macro::StabLevel),
+            self.macro_value(dsp::Macro::BassLevel),
+            band_idx + 1,
+            band.enabled,
+            band.mode,
+            band.channel_mode,
+            band.frequency_hz,
+            band.q,
+            band.dynamic_db,
+            band.sweep_octaves,
+            master.model,
+            master.cutoff_hz,
+            master.resonance,
+            master.drive,
+            master.morph,
+            master.mix,
+        )
+    }
+
+    fn macro_value(&self, m: dsp::Macro) -> String {
+        self.macros
+            .get(m.id() as usize)
+            .and_then(|v| *v)
+            .map(format_normalized)
+            .unwrap_or_else(|| "--".to_string())
+    }
+}
+
+fn selected_step_value(eng: &dsp::Engine, track: dsp::Track, step: usize) -> String {
+    match track {
+        dsp::Track::Bass => eng
+            .sequencer()
+            .bass_step(step)
+            .map(|cell| match cell {
+                dsp::sequencer::BassCell::Rest => "rest".to_string(),
+                dsp::sequencer::BassCell::Hold => "hold".to_string(),
+                dsp::sequencer::BassCell::Strike(v) => format!("strike:{v:.2}"),
+            })
+            .unwrap_or_else(|| "n/a".to_string()),
+        _ => sequencer_voice(track)
+            .and_then(|voice| eng.sequencer().step_velocity(voice, step))
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+    }
+}
+
+fn sequencer_voice(track: dsp::Track) -> Option<dsp::sequencer::Voice> {
+    match track {
+        dsp::Track::Kick => Some(dsp::sequencer::Voice::Kick),
+        dsp::Track::ClosedHat => Some(dsp::sequencer::Voice::Chat),
+        dsp::Track::OpenHat => Some(dsp::sequencer::Voice::Ohat),
+        dsp::Track::Stab => Some(dsp::sequencer::Voice::Stab),
+        dsp::Track::Bass => None,
+    }
+}
+
+fn track_name(track: dsp::Track) -> &'static str {
+    match track {
+        dsp::Track::Kick => "kick",
+        dsp::Track::ClosedHat => "closed_hat",
+        dsp::Track::OpenHat => "open_hat",
+        dsp::Track::Stab => "stab",
+        dsp::Track::Bass => "bass",
+    }
+}
+
+fn format_normalized(value: f32) -> String {
+    format!("{value:.2}")
 }
 
 /// Connect to a MIDI input port and forward decoded messages to the engine.
