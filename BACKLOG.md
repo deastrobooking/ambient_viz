@@ -9,19 +9,25 @@ Each item links its source doc/memory. Dependencies noted inline. Completed
 verification checklists from already-shipped work (USB composite Phases A–D, tape
 failure live control, SAI audio path) are intentionally excluded.
 
+## Critical-path priority order
+
+1. **M1 Host TUI** → makes the host performable right now, validates the protocol.
+2. **M6 Firmware bridge** → the only path to hardware-playable audio.
+3. **M3 Project snapshot** → persistence after M6 works.
+4. **M4 Transient + color** → DSP polish.
+5. **M5 Synth voices** → expand after the drum engine plays from hardware.
+
 ## Audio-first fork priorities
 
 - [x] **Condensed audio-fork docs and agent memory** — `AGENT_MEMORY.md` now
   owns current state, donor research, and the milestone plan; architecture and
   donor docs are shortened to focused references. — `AGENT_MEMORY.md`,
   `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`, `GROOVEBOX_REPURPOSE.md`
-- [ ] **Host groovebox harness** — first stdin-command pass exists: host reads
-  the shared text protocol, applies `GrooveEvent`, starts a fixed 120 BPM loop
-  without a timeline, and makes old bloom/freeze audition modulation opt-in via
-  `--test-mod`; `HELP` and `STATE` now print host-side command help and engine
-  snapshots including macro/filter state. Next: keyboard/serial/MIDI ergonomics
-  and a more playable TUI/shortcut layer. —
-  `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
+- [ ] **Host TUI / shortcut layer** — stdin text protocol works but requires
+  typing full commands; not usable for live performance. Add a
+  `crossterm`-based raw-key TUI: `[space]` = PLAY/STOP, digit rows = drum
+  pads, arrow keys = macro nudge. Layer translates keys → `GrooveEvent`; text
+  protocol stays intact. — `AUDIO_ENGINE_FORK.md`, `GROOVEBOX_REPURPOSE.md`
 - [ ] **Groovebox control protocol** — `groove::parse_line` now defines the first
   shared text command set for `PLAY`, `STOP`, `RESET`, `PAD`, `TOGGLE`, `STEP`,
   `MACRO`, `TRACK`, `BAND`, and `FILTER`; selected-band filter controls are now
@@ -47,9 +53,13 @@ failure live control, SAI audio path) are intentionally excluded.
   `STATE` displays selected-band envelope activity. Next: transient/color
   models and host-side analyzer snapshots. —
   `SYNTH_SUITE_IMPORT_PLAN.md`
-- [ ] **Standalone Daisy groovebox build** — codec line out first, hardware
-  controls into `Engine::handle_groove_event`, project/pattern/sample storage,
-  visual/Pi sync optional. — `AUDIO_ENGINE_FORK.md`, `daisy/README.md`
+- [ ] **Firmware groovebox bridge (M6 — critical path)** — firmware still runs
+  exhibit kiosk pipeline (tape + bell + voice); has no `dsp::Engine` or
+  `handle_groove_event` call. Plan: replace audio path with `dsp::Engine`,
+  wire CDC serial → `groove::parse_line` → `handle_groove_event`, boot into a
+  default pattern. Disable `PingPongDelay`/`Reverb` behind a feature flag
+  until SDRAM budget is confirmed. See `AGENT_MEMORY.md` M6. —
+  `AUDIO_ENGINE_FORK.md`, `daisy/README.md`
 - [x] **Pi 4 audio-fork deployment guide** — `PI4_AUDIO_TEST_DEPLOYMENT.md`
   defines the Pi as a companion for mock SSE, sensors, Daisy CDC
   song-position/control, and visual sync; analog Daisy line out remains the

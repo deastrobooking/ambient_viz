@@ -1,6 +1,6 @@
 # Agent Memory
 
-Last updated: 2026-06-08.
+Last updated: 2026-06-07 (post-review pass).
 
 ## Direction
 
@@ -33,6 +33,23 @@ Use `PI4_AUDIO_TEST_DEPLOYMENT.md` when testing the current audio fork on a Pi
 4. It defines the Pi as a companion for mock SSE, sensors, Daisy CDC
 song-position/control, and visual sync. Audio acceptance remains Daisy codec
 line out, not Pi/browser USB capture.
+
+## Firmware Gap (Critical)
+
+The `daisy/crates/firmware/src/main.rs` still runs the **original exhibit kiosk
+pipeline** (tape + FM bell + PainMaterialVoice). It does **not** instantiate
+`dsp::Engine` or call `Engine::handle_groove_event`. The host harness is fully
+groovebox-capable; the Daisy firmware is not yet bridged.
+
+M6 (firmware bridge) is therefore the critical path before any hardware-playable
+groovebox can exist. The recommended order is:
+
+```text
+M1 TUI  →  M6 firmware bridge  →  M3/M4 polish  →  M5 synth expansion
+```
+
+Do not start M5 synth expansion before M6 — adding oscillators that can't run
+through Daisy line out adds no playable instrument surface.
 
 ## Current Implementation
 
@@ -248,15 +265,22 @@ allocation and can be controlled through the shared macro/mod system.
 
 ### M6: Firmware Groovebox Bridge
 
-Status: planning.
+Status: not started. **This is the critical-path blocker for hardware playability.**
 
-- Route CDC/MIDI/UART/hardware controls into `GrooveEvent`.
-- Keep parsing, storage, logging, and project mutation outside the audio path.
-- Boot into a default project/pattern bank.
-- Prioritize Daisy codec line out over browser/USB capture.
+Current firmware state: `daisy/crates/firmware/src/main.rs` runs the original
+exhibit pipeline (tape + FM bell + PainMaterialVoice). It does not instantiate
+`dsp::Engine` or call `handle_groove_event`.
 
-Acceptance: the Daisy can run standalone with hardware controls and line output;
-Pi/browser sync is optional.
+Plan:
+- Replace exhibit audio path with `dsp::Engine` (same as host).
+- Wire CDC serial → `groove::parse_line` → `engine.handle_groove_event`.
+- Boot into a hard-coded default pattern so the board makes sound immediately.
+- Disable `PingPongDelay` and `Reverb` behind a feature flag until SDRAM
+  allocation is profiled (both currently heap-allocate large buffers).
+- Preserve existing `debug-uart`, heap layout, embassy executor, and SAI path.
+
+Acceptance: Daisy boots, plays a drum loop from line out, and accepts CDC
+`GrooveEvent` text commands to edit steps and sweep macros.
 
 ### M7: Companion Editor And Visual Sync
 
@@ -271,18 +295,67 @@ Acceptance: visual tools enhance the instrument without defining its runtime.
 
 ## Next Milestone Planning
 
-Recommended next slices:
+Recommended order (each unblocks the next):
 
-1. **Finish M3 live pattern behavior**
-   Add a minimal project snapshot format outside the audio path.
+### Slice 1 — Complete M1: Host TUI / shortcut layer
 
-2. **Advance M4 filter suite**
-   Port Spectre transient and master color models as standalone no-alloc
-   effects, then add host/editor analyzer snapshots.
+The host is playable via typed text commands but not ergonomic for live
+performance. Priority work:
 
-3. **Prepare M5 synth expansion**
-   Choose the first Nexus-inspired oscillator/filter pair and define its fixed
-   voice/state budget before coding.
+- Add a thin `crossterm`-based TUI (single-key bindings, no full redraw) OR
+  accept raw stdin single-key events so pads / transport can be played from
+  the keyboard without typing full commands.
+- Map: `[space]` = PLAY/STOP toggle, digit rows = drum pads, arrow keys or
+  encoder emulation for macros.
+- Keep the stdin text protocol unchanged — the TUI layer translates key events
+  into the same `GrooveEvent` path before touching the engine.
+
+Acceptance: performing a live drum loop, triggering pads, and sweeping
+`filter_cutoff` requires no typed commands.
+
+### Slice 2 — M6 Firmware Bridge (critical path)
+
+The firmware still runs exhibit kiosk code. Bridging work:
+
+- Replace `main.rs` exhibit pipeline with `dsp::Engine::new(SAMPLE_RATE)` +
+  a fixed pattern bank + the same default 120 BPM sequencer setup as the host.
+- Wire CDC serial lines into `groove::parse_line` → `engine.handle_groove_event`.
+- Boot into a hard-coded default pattern (kick on 1/5/9/13, hat every 2 steps,
+  etc.) so the board makes sound immediately without a host.
+- Keep existing `debug-uart`, heap sizing, embassy executor structure, and SAI
+  audio path untouched — only swap the DSP layer.
+- Note: `PingPongDelay` and `Reverb` allocate large buffers — move them to
+  SDRAM once the basic pattern plays, or disable them initially with a feature
+  flag.
+
+Acceptance: the Daisy boots, plays the default drum pattern through line out,
+and accepts CDC text commands to edit steps, change tracks, and sweep macros.
+
+### Slice 3 — M3 Completion: Project Snapshot Format
+
+- Define a minimal `ProjectSnapshot` struct (pattern bank + active pattern +
+  BPM + macro state) that serializes to/from a compact fixed-size byte block.
+- Implement host-side `SAVE`/`LOAD` commands that write/read a JSON or binary
+  file using this struct (no allocation in the DSP path).
+- On firmware: load from SD card at boot; save on `CAPTURE ALL` command.
+
+Acceptance: a session can be saved on the host and the pattern survives restart.
+
+### Slice 4 — M4 Advancement: Transient + Color
+
+- Port Spectre transient shaper as a no-alloc `TransientProcessor` in `dsp`.
+- Port master color model (harmonic saturation / air) as a no-alloc insert.
+- Add host commands `TRANSIENT <attack> <sustain>` and `COLOR <amount>`.
+- Keep analyzer data host-side only (ring buffer fed from the audio callback).
+
+### Slice 5 — M5 Synth Expansion (after M6 confirmed working)
+
+- First oscillator: polyBLEP saw/square (Nexus reference) as a new
+  `dsp::PolyOsc` module with fixed polyphony (4 voices).
+- Wire `PAD <note> <vel>` into note-on/off for the poly osc alongside the
+  existing drum pad routing.
+- First filter: re-use the existing `Svf` (already in `dsp`) as the voice filter.
+- Confirm firmware heap budget before merging (use `host --bin heap_probe`).
 
 ## Verification
 

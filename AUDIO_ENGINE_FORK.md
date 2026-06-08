@@ -111,12 +111,12 @@ state, or block inside the audio path.
 
 The canonical milestone plan lives in `AGENT_MEMORY.md`.
 
-Short form:
+Short form (recommended order):
 
-1. M1 Playable Host Groovebox.
-2. M2 Shared Comms Contract.
-3. M3 Pattern Bank And Project Runtime.
-4. M4 Spectre Performance Filter Suite.
-5. M5 Nexus Voice Expansion.
-6. M6 Firmware Groovebox Bridge.
-7. M7 Companion Editor And Visual Sync.
+1. M1 Playable Host Groovebox — TUI/shortcut layer so the host is actually performable.
+2. M6 Firmware Groovebox Bridge — **critical path**: swap exhibit pipeline for `dsp::Engine` + CDC GrooveEvent routing.
+3. M2 Shared Comms Contract — compact encoder after text protocol is validated on firmware.
+4. M3 Pattern Bank And Project Runtime — project snapshot / save-to-SD.
+5. M4 Spectre Performance Filter Suite — transient shaping + master color models.
+6. M5 Nexus Voice Expansion — polyphonic synth voices after the drum engine plays from hardware.
+7. M7 Companion Editor And Visual Sync — deferred.
