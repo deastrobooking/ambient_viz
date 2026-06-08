@@ -12,6 +12,7 @@ GPIO-driven control.
 ## Run
 
 ```sh
+npm install
 node src/index.js
 # or
 npm start
@@ -19,7 +20,9 @@ npm start
 
 Open <http://localhost:8080/>.
 
-No npm dependencies — pure Node stdlib.
+`serialport` is used when `DAISY_SERIAL` is set for Daisy CDC song-position and
+control bridging. Mock/SSE-only testing still goes through the same package
+install path.
 
 ## Configuration (env vars)
 

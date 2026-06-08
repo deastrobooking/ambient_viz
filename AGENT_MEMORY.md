@@ -4,13 +4,14 @@ Last updated: 2026-06-08.
 
 ## Direction
 
-This fork is now the definitive audio performance and synth software. Treat
+This repository is now a full rebuild fork into a separate audio product. Treat
 `daisy/` as the product core: a standalone Daisy groovebox/synth engine with
-sampler, effects, hardware controls, shared comms, and codec line out.
+sampler, effects, hardware controls, shared comms, project runtime, and codec
+line out.
 
 The browser visualizer and Pi stack are optional companion layers for projection,
-telemetry, diagnostics, or legacy kiosk use. They must not block audio-engine,
-groovebox, firmware, or hardware-control progress.
+telemetry, diagnostics, or legacy kiosk use. They are not the product center and
+must not block audio-engine, groovebox, firmware, or hardware-control progress.
 
 ## Canonical Docs
 
@@ -18,14 +19,20 @@ Read in this order:
 
 1. `AGENT_MEMORY.md` — current state, donor research, milestone plan.
 2. `AGENTS.md` — standing agent rules for this fork.
-3. `AUDIO_ENGINE_FORK.md` — condensed architecture/north star.
+3. `AUDIO_ENGINE_FORK.md` — product architecture/north star.
 4. `SYNTH_SUITE_IMPORT_PLAN.md` — donor import boundaries.
 5. `daisy/README.md` — workspace/hardware notes.
-6. `BACKLOG.md` — permanent task list.
+6. `PI4_AUDIO_TEST_DEPLOYMENT.md` — Pi 4 companion deployment/testing guide.
+7. `BACKLOG.md` — permanent task list.
 
-Older visualizer docs (`README.md`, `DAISY_I2S_SETUP.md`, `INSTALL_DAY.md`,
+Legacy visualizer docs (`DAISY_I2S_SETUP.md`, `INSTALL_DAY.md`,
 `SENSOR_MAPPING.md`, `PI_KIOSK_BRINGUP.md`) are still useful for exhibit work,
-but they are no longer the architecture authority.
+but they are no longer product or architecture authority.
+
+Use `PI4_AUDIO_TEST_DEPLOYMENT.md` when testing the current audio fork on a Pi
+4. It defines the Pi as a companion for mock SSE, sensors, Daisy CDC
+song-position/control, and visual sync. Audio acceptance remains Daisy codec
+line out, not Pi/browser USB capture.
 
 ## Current Implementation
 
@@ -48,6 +55,14 @@ TRACK kick
 PAD 36 127
 TOGGLE kick 0
 STEP bass 4 96
+BASS 4 hold
+PBASS 1 4 tie
+PATTERN 1
+CAPTURE 1
+PCOPY 1 2
+PCLEAR 2
+PFILL 1 kick 127
+PRAND 1 kick 42 64 127
 MACRO damage 64
 MACRO filter_cutoff 80
 MACRO filter_resonance 48
@@ -64,8 +79,8 @@ can share one vocabulary.
 
 `daisy/crates/dsp/src/lib.rs` now exposes `Engine::handle_groove_event` and
 routes groove events into transport, selected track, sequencer step edits, pad
-triggers, lane levels, damage/space/tone macros, selected Spectre band, and
-Spectre filter parameter edits.
+triggers, pattern-bank operations, lane levels, damage/space/tone macros,
+selected Spectre band, and Spectre filter parameter edits.
 
 `daisy/crates/host/src/main.rs` starts a fixed 120 BPM loop when no sidecar is
 loaded, reads the line protocol from stdin, applies events through the shared
@@ -185,24 +200,35 @@ Acceptance: host, firmware, and future controller MCU can all translate into
 
 ### M3: Pattern Bank And Project Runtime
 
-Status: not started.
+Status: partially implemented.
 
-- Fixed-size pattern bank in `dsp` or a small adjacent runtime module.
-- Copy, clear, fill, randomize, and duplicate helpers.
-- Bass hold/tie editing and quantized pattern change.
-- Minimal project snapshot format generated outside the audio path.
+- Current: `PatternSnapshot` copies fixed sequencer pattern state without
+  realtime allocation.
+- Current: `PatternBank` provides 8 fixed slots with capture/load/copy/clear,
+  fill, and deterministic randomize helpers.
+- Current: `Engine` owns a pattern bank and routes `PATTERN`, `CAPTURE`,
+  `PCOPY`, `PCLEAR`, `PFILL`, and `PRAND` through `GrooveEvent`.
+- Current: live and slot bass hold/tie editing is available through `BASS` and
+  `PBASS`.
+- Current: `PATTERN <slot>` queues a pattern load and applies it at step 0 when
+  selected mid-loop; selecting at step 0 loads immediately.
+- Next: minimal project snapshot format generated outside the audio path.
 
 Acceptance: multiple patterns can be edited and switched without allocation or
 timing surprises in audio processing.
 
 ### M4: Spectre Performance Filter Suite
 
-Status: first dynamic rack and master insert landed.
+Status: partially implemented.
 
-- Add selected-band protocol/editing.
-- Add host display for active band frequency, Q, dynamic amount, sweep, and
-  envelope activity.
-- Port transient shaping and master color models as standalone effects.
+- Current: default-bypassed dynamic rack and master insert landed.
+- Current: selected-band protocol/editing landed via `BAND` and `FILTER`.
+- Current: host `STATE` displays active band frequency, Q, dynamic amount, and
+  sweep.
+- Current: `DynamicFilter::envelope_values`, `Engine::spectre_dynamic_envelopes`,
+  and host `STATE` expose selected-band envelope activity for performance
+  metering.
+- Next: port transient shaping and master color models as standalone effects.
 - Keep analyzer data host/editor-side.
 
 Acceptance: the fork has a musically useful standalone filter/effects section
@@ -243,6 +269,21 @@ Status: deferred.
 
 Acceptance: visual tools enhance the instrument without defining its runtime.
 
+## Next Milestone Planning
+
+Recommended next slices:
+
+1. **Finish M3 live pattern behavior**
+   Add a minimal project snapshot format outside the audio path.
+
+2. **Advance M4 filter suite**
+   Port Spectre transient and master color models as standalone no-alloc
+   effects, then add host/editor analyzer snapshots.
+
+3. **Prepare M5 synth expansion**
+   Choose the first Nexus-inspired oscillator/filter pair and define its fixed
+   voice/state budget before coding.
+
 ## Verification
 
 Last successful checks:
@@ -255,7 +296,7 @@ cd daisy
 
 Results:
 
-- `dsp`: 55 tests passed.
+- `dsp`: 61 tests passed after adding Spectre dynamic envelope metering.
 - `host`: check passed.
 
 Known warnings:

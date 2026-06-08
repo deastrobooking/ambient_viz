@@ -332,6 +332,9 @@ fn print_groove_help() {
     println!("  HELP | STATE");
     println!("  PLAY 1 | STOP | RESET | TRACK kick");
     println!("  PAD 36 127 | TOGGLE kick 0 | STEP bass 4 96");
+    println!("  BASS 4 hold | BASS 4 rest | PBASS 1 4 tie");
+    println!("  PATTERN 1 | CAPTURE 1 | PCOPY 1 2 | PCLEAR 2");
+    println!("  PFILL 1 kick 127 | PRAND 1 kick 42 64 127");
     println!("  MACRO damage 64 | MACRO space 96 | MACRO tone 80");
     println!("  MACRO filter_cutoff 80 | MACRO filter_resonance 48 | MACRO filter_motion 96");
     println!("  BAND 1 | FILTER cutoff 80 | FILTER 3 q 48 | FILTER 3 motion 96");
@@ -363,13 +366,15 @@ impl GrooveboxHostState {
             .selected_filter_band()
             .min(dyn_settings.bands.len().saturating_sub(1));
         let band = dyn_settings.bands[band_idx];
+        let envelopes = eng.spectre_dynamic_envelopes();
+        let band_envelope = envelopes[band_idx];
         let master = eng.spectre_filter_settings();
 
         format!(
             concat!(
-                "  state transport={} track={} step={}/{} spb={} selected_step={}\n",
+                "  state transport={} pattern={} pending_pattern={} track={} step={}/{} spb={} selected_step={}\n",
                 "  macros damage={} space={} tone={} levels[k={} h={} st={} b={}]\n",
-                "  filter band={} enabled={} mode={:?} ch={:?} freq={:.1}Hz q={:.2} dyn={:+.1}dB sweep={:.2}oct\n",
+                "  filter band={} env={:.3} enabled={} mode={:?} ch={:?} freq={:.1}Hz q={:.2} dyn={:+.1}dB sweep={:.2}oct\n",
                 "  master_filter model={:?} cutoff={:.1}Hz res={:.2} drive={:.2} morph={:.2} mix={:.2}"
             ),
             if eng.sequencer_enabled() {
@@ -377,6 +382,10 @@ impl GrooveboxHostState {
             } else {
                 "stop"
             },
+            eng.pattern_bank().selected() + 1,
+            eng.pending_pattern_slot()
+                .map(|slot| (slot + 1).to_string())
+                .unwrap_or_else(|| "--".to_string()),
             track_name(selected),
             display_step,
             loop_steps,
@@ -390,6 +399,7 @@ impl GrooveboxHostState {
             self.macro_value(dsp::Macro::StabLevel),
             self.macro_value(dsp::Macro::BassLevel),
             band_idx + 1,
+            band_envelope,
             band.enabled,
             band.mode,
             band.channel_mode,

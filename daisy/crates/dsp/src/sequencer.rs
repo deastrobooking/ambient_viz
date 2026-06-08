@@ -48,6 +48,8 @@ pub const MAX_GRID_STEPS: usize = 128;
 
 /// Max chords in a `prog:` progression.
 pub const MAX_PROG: usize = 64;
+/// Number of fixed pattern slots kept in memory for the groovebox runtime.
+pub const PATTERN_BANK_SLOTS: usize = 8;
 
 /// Convert a `res:` note division (4, 8, 16, 32, 12 for triplets …) into
 /// steps-per-beat in 4/4: a 1/N note means `N/4` steps per quarter-note beat.
@@ -107,6 +109,8 @@ impl Default for BassCell {
 /// One sample's worth of trigger output from [`Sequencer::advance`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StepEvent {
+    /// True on the sample where step 0 fires.
+    pub loop_start: bool,
     /// `Some(v)` = trigger the kick at velocity `v`. `None` = no kick.
     pub kick_velocity: Option<f32>,
     pub closed_hat: bool,
@@ -170,6 +174,230 @@ pub struct Sequencer {
     open_hat_count: u64,
     stab_count: u64,
     bass_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternBankError {
+    BadSlot,
+}
+
+/// Fixed-size snapshot of the playable pattern state. This intentionally omits
+/// realtime playback cursors and trigger counters so applying a snapshot always
+/// restarts musical pattern state cleanly.
+#[derive(Debug, Clone)]
+pub struct PatternSnapshot {
+    steps_per_loop: usize,
+    steps_per_beat: usize,
+    kick_pattern: [f32; MAX_GRID_STEPS],
+    chat_pattern: [f32; MAX_GRID_STEPS],
+    ohat_pattern: [f32; MAX_GRID_STEPS],
+    stab_pattern: [f32; MAX_GRID_STEPS],
+    stabtone_pattern: [f32; MAX_GRID_STEPS],
+    bass_pattern: [BassCell; MAX_GRID_STEPS],
+    key: Key,
+    base_octave: i32,
+    prog: Vec<Chord, MAX_PROG>,
+    bassprog: Vec<Chord, MAX_PROG>,
+}
+
+impl Default for PatternSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl PatternSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            steps_per_loop: STEPS_PER_LOOP,
+            steps_per_beat: STEPS_PER_BEAT,
+            kick_pattern: [0.0; MAX_GRID_STEPS],
+            chat_pattern: [0.0; MAX_GRID_STEPS],
+            ohat_pattern: [0.0; MAX_GRID_STEPS],
+            stab_pattern: [0.0; MAX_GRID_STEPS],
+            stabtone_pattern: [-1.0; MAX_GRID_STEPS],
+            bass_pattern: [BassCell::Rest; MAX_GRID_STEPS],
+            key: Key::default(),
+            base_octave: chord::DEFAULT_OCTAVE,
+            prog: Vec::new(),
+            bassprog: Vec::new(),
+        }
+    }
+
+    pub fn from_sequencer(seq: &Sequencer) -> Self {
+        Self {
+            steps_per_loop: seq.steps_per_loop,
+            steps_per_beat: seq.steps_per_beat,
+            kick_pattern: seq.kick_pattern,
+            chat_pattern: seq.chat_pattern,
+            ohat_pattern: seq.ohat_pattern,
+            stab_pattern: seq.stab_pattern,
+            stabtone_pattern: seq.stabtone_pattern,
+            bass_pattern: seq.bass_pattern,
+            key: seq.key,
+            base_octave: seq.base_octave,
+            prog: seq.prog.clone(),
+            bassprog: seq.bassprog.clone(),
+        }
+    }
+
+    pub fn steps_per_loop(&self) -> usize {
+        self.steps_per_loop
+    }
+
+    pub fn steps_per_beat(&self) -> usize {
+        self.steps_per_beat
+    }
+}
+
+/// Fixed-size in-memory pattern bank for standalone groovebox work. The bank
+/// owns snapshots only; callers decide when to capture/load them.
+#[derive(Debug, Clone)]
+pub struct PatternBank {
+    slots: [PatternSnapshot; PATTERN_BANK_SLOTS],
+    selected: usize,
+}
+
+impl Default for PatternBank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PatternBank {
+    pub fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| PatternSnapshot::empty()),
+            selected: 0,
+        }
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn capture(&mut self, slot: usize, sequencer: &Sequencer) -> Result<(), PatternBankError> {
+        let slot_ref = self.slot_mut(slot)?;
+        *slot_ref = PatternSnapshot::from_sequencer(sequencer);
+        self.selected = slot;
+        Ok(())
+    }
+
+    pub fn load(&mut self, slot: usize, sequencer: &mut Sequencer) -> Result<(), PatternBankError> {
+        let snapshot = self.slot(slot)?.clone();
+        sequencer.apply_snapshot(&snapshot);
+        self.selected = slot;
+        Ok(())
+    }
+
+    pub fn copy(&mut self, src: usize, dst: usize) -> Result<(), PatternBankError> {
+        let snapshot = self.slot(src)?.clone();
+        *self.slot_mut(dst)? = snapshot;
+        self.selected = dst;
+        Ok(())
+    }
+
+    pub fn clear(&mut self, slot: usize) -> Result<(), PatternBankError> {
+        *self.slot_mut(slot)? = PatternSnapshot::empty();
+        if self.selected == slot {
+            self.selected = slot;
+        }
+        Ok(())
+    }
+
+    pub fn fill_voice(
+        &mut self,
+        slot: usize,
+        voice: Voice,
+        velocity: f32,
+    ) -> Result<(), PatternBankError> {
+        let snapshot = self.slot_mut(slot)?;
+        let v = velocity.clamp(0.0, 1.0);
+        let steps = snapshot.steps_per_loop;
+        let lane = snapshot.voice_array_mut(voice);
+        for cell in &mut lane[..steps] {
+            *cell = v;
+        }
+        Ok(())
+    }
+
+    pub fn set_bass_step(
+        &mut self,
+        slot: usize,
+        step: usize,
+        cell: BassCell,
+    ) -> Result<(), PatternBankError> {
+        let snapshot = self.slot_mut(slot)?;
+        if step < snapshot.steps_per_loop {
+            snapshot.bass_pattern[step] = cell;
+        }
+        Ok(())
+    }
+
+    pub fn randomize_voice(
+        &mut self,
+        slot: usize,
+        voice: Voice,
+        seed: u32,
+        density: f32,
+        velocity: f32,
+    ) -> Result<(), PatternBankError> {
+        let snapshot = self.slot_mut(slot)?;
+        let mut rng = XorShift32::new(seed);
+        let threshold = density.clamp(0.0, 1.0);
+        let v = velocity.clamp(0.0, 1.0);
+        let steps = snapshot.steps_per_loop;
+        let lane = snapshot.voice_array_mut(voice);
+        for cell in &mut lane[..steps] {
+            *cell = if rng.next_unit() < threshold { v } else { 0.0 };
+        }
+        Ok(())
+    }
+
+    pub fn slot(&self, slot: usize) -> Result<&PatternSnapshot, PatternBankError> {
+        self.slots.get(slot).ok_or(PatternBankError::BadSlot)
+    }
+
+    fn slot_mut(&mut self, slot: usize) -> Result<&mut PatternSnapshot, PatternBankError> {
+        self.slots.get_mut(slot).ok_or(PatternBankError::BadSlot)
+    }
+}
+
+impl PatternSnapshot {
+    fn voice_array_mut(&mut self, voice: Voice) -> &mut [f32; MAX_GRID_STEPS] {
+        match voice {
+            Voice::Kick => &mut self.kick_pattern,
+            Voice::Chat => &mut self.chat_pattern,
+            Voice::Ohat => &mut self.ohat_pattern,
+            Voice::Stab => &mut self.stab_pattern,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XorShift32 {
+    state: u32,
+}
+
+impl XorShift32 {
+    fn new(seed: u32) -> Self {
+        Self {
+            state: if seed == 0 { 0x6d2b_79f5 } else { seed },
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        x
+    }
+
+    fn next_unit(&mut self) -> f32 {
+        self.next_u32() as f32 / u32::MAX as f32
+    }
 }
 
 /// Built-in default: matches the user's pre-grid hand-coded sequence.
@@ -430,6 +658,22 @@ impl Sequencer {
         Ok(grid)
     }
 
+    pub fn apply_snapshot(&mut self, snapshot: &PatternSnapshot) {
+        self.steps_per_loop = snapshot.steps_per_loop.clamp(1, MAX_GRID_STEPS);
+        self.steps_per_beat = snapshot.steps_per_beat.max(1);
+        self.kick_pattern = snapshot.kick_pattern;
+        self.chat_pattern = snapshot.chat_pattern;
+        self.ohat_pattern = snapshot.ohat_pattern;
+        self.stab_pattern = snapshot.stab_pattern;
+        self.stabtone_pattern = snapshot.stabtone_pattern;
+        self.bass_pattern = snapshot.bass_pattern;
+        self.key = snapshot.key;
+        self.base_octave = snapshot.base_octave;
+        self.prog = snapshot.prog.clone();
+        self.bassprog = snapshot.bassprog.clone();
+        self.reset();
+    }
+
     pub fn enable(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -484,6 +728,7 @@ impl Sequencer {
         if self.step_phase >= 1.0 {
             self.step_phase -= 1.0;
             let idx = self.step as usize;
+            evt.loop_start = idx == 0;
             let kv = self.kick_pattern[idx];
             let cv = self.chat_pattern[idx];
             let ov = self.ohat_pattern[idx];
@@ -842,6 +1087,69 @@ chat: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
         let seq = Sequencer::new(48_000.0);
         assert_eq!(seq.steps_per_beat(), 2);
         assert_eq!(seq.steps_per_loop(), 32);
+    }
+
+    #[test]
+    fn pattern_bank_capture_load_copy_clear_and_fill_are_bounded() {
+        let mut seq = Sequencer::new(48_000.0);
+        seq.set_step_velocity(Voice::Kick, 0, 0.25);
+        seq.set_step_velocity(Voice::Kick, 1, 0.75);
+
+        let mut bank = PatternBank::new();
+        bank.capture(0, &seq).unwrap();
+        seq.set_step_velocity(Voice::Kick, 0, 0.0);
+        bank.load(0, &mut seq).unwrap();
+        assert_eq!(seq.step_velocity(Voice::Kick, 0), Some(0.25));
+        assert_eq!(bank.selected(), 0);
+
+        bank.copy(0, 1).unwrap();
+        bank.fill_voice(1, Voice::Chat, 0.5).unwrap();
+        bank.load(1, &mut seq).unwrap();
+        assert_eq!(seq.step_velocity(Voice::Kick, 1), Some(0.75));
+        assert_eq!(seq.step_velocity(Voice::Chat, 0), Some(0.5));
+
+        bank.clear(1).unwrap();
+        bank.load(1, &mut seq).unwrap();
+        assert_eq!(seq.step_velocity(Voice::Kick, 0), Some(0.0));
+        assert_eq!(
+            bank.copy(0, PATTERN_BANK_SLOTS),
+            Err(PatternBankError::BadSlot)
+        );
+    }
+
+    #[test]
+    fn pattern_bank_sets_bass_hold_cells() {
+        let mut seq = Sequencer::new(48_000.0);
+        let mut bank = PatternBank::new();
+
+        bank.set_bass_step(0, 0, BassCell::Strike(0.8)).unwrap();
+        bank.set_bass_step(0, 1, BassCell::Hold).unwrap();
+        bank.set_bass_step(0, 2, BassCell::Rest).unwrap();
+        bank.load(0, &mut seq).unwrap();
+
+        assert_eq!(seq.bass_step(0), Some(BassCell::Strike(0.8)));
+        assert_eq!(seq.bass_step(1), Some(BassCell::Hold));
+        assert_eq!(seq.bass_step(2), Some(BassCell::Rest));
+    }
+
+    #[test]
+    fn pattern_bank_randomize_voice_is_deterministic() {
+        let mut a = PatternBank::new();
+        let mut b = PatternBank::new();
+
+        a.randomize_voice(0, Voice::Kick, 42, 0.5, 0.8).unwrap();
+        b.randomize_voice(0, Voice::Kick, 42, 0.5, 0.8).unwrap();
+
+        let mut seq_a = Sequencer::new(48_000.0);
+        let mut seq_b = Sequencer::new(48_000.0);
+        a.load(0, &mut seq_a).unwrap();
+        b.load(0, &mut seq_b).unwrap();
+        for i in 0..seq_a.steps_per_loop() {
+            assert_eq!(
+                seq_a.step_velocity(Voice::Kick, i),
+                seq_b.step_velocity(Voice::Kick, i)
+            );
+        }
     }
 
     #[test]

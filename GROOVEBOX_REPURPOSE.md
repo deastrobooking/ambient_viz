@@ -10,14 +10,15 @@ projects:
 
 ## Conclusion
 
-Use `ambient_viz/daisy` as the hardware runtime and let it drift away from the
-video software. It already has the right foundation: `no_std` DSP, macOS host
-audition, Daisy firmware target, sequencer, drums, stabs, bass, sampler,
-performance effects, MIDI/CDC plumbing, and codec/I/O work.
+Use `ambient_viz/daisy` as the hardware runtime for the separate product. Let it
+continue drifting away from the video software. It already has the right
+foundation: `no_std` DSP, macOS host audition, Daisy firmware target,
+sequencer, drums, stabs, bass, sampler, performance effects, pattern bank,
+MIDI/CDC plumbing, and codec/I/O work.
 
-The missing product layer is not sound generation; it is a hardware-friendly
-groovebox runtime: shared controls, pattern banks, project state, macro scenes,
-and firmware bridge.
+The remaining product layer is the hardware-friendly groovebox runtime:
+quantized pattern changes, bass tie editing, compact project state, macro
+scenes, and firmware bridge.
 
 ## Hardware Shape
 

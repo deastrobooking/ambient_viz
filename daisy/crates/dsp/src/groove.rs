@@ -185,6 +185,27 @@ pub enum GrooveEvent {
     TransportPlay(bool),
     TransportReset,
     SelectTrack(Track),
+    /// Load/select a zero-based pattern bank slot.
+    SelectPattern(u8),
+    /// Capture the current sequencer pattern into a zero-based bank slot.
+    CapturePattern(u8),
+    CopyPattern {
+        src: u8,
+        dst: u8,
+    },
+    ClearPattern(u8),
+    FillPattern {
+        slot: u8,
+        track: Track,
+        velocity: f32,
+    },
+    RandomizePattern {
+        slot: u8,
+        track: Track,
+        seed: u8,
+        density: f32,
+        velocity: f32,
+    },
     /// Select a zero-based Spectre dynamic filter band index.
     SelectFilterBand(u8),
     ToggleStep {
@@ -195,6 +216,11 @@ pub enum GrooveEvent {
         track: Track,
         step: u8,
         velocity: f32,
+    },
+    SetBassStep {
+        slot: Option<u8>,
+        step: u8,
+        cell: sequencer::BassCell,
     },
     SetMacro {
         macro_id: u8,
@@ -223,6 +249,7 @@ pub enum ParseError {
     BadMacro,
     BadFilterBand,
     BadFilterParam,
+    BadPatternSlot,
     BadNumber,
 }
 
@@ -240,7 +267,15 @@ pub enum ParseError {
 /// PAD 36 127
 /// TOGGLE kick 0
 /// STEP bass 4 96
+/// BASS 4 hold
+/// PBASS 1 4 rest
 /// MACRO damage 64
+/// PATTERN 1
+/// CAPTURE 1
+/// PCOPY 1 2
+/// PCLEAR 2
+/// PFILL 1 kick 127
+/// PRAND 1 kick 42 64 127
 /// BAND 1
 /// FILTER cutoff 80
 /// FILTER 3 q 48
@@ -256,6 +291,31 @@ pub fn parse_line(line: &str) -> Result<GrooveEvent, ParseError> {
         "STOP" | "stop" => Ok(GrooveEvent::TransportPlay(false)),
         "RESET" | "reset" => Ok(GrooveEvent::TransportReset),
         "TRACK" | "track" => Ok(GrooveEvent::SelectTrack(parse_track(next(&mut parts)?)?)),
+        "PATTERN" | "pattern" => Ok(GrooveEvent::SelectPattern(parse_pattern_slot(next(
+            &mut parts,
+        )?)?)),
+        "CAPTURE" | "capture" => Ok(GrooveEvent::CapturePattern(parse_pattern_slot(next(
+            &mut parts,
+        )?)?)),
+        "PCOPY" | "pcopy" => Ok(GrooveEvent::CopyPattern {
+            src: parse_pattern_slot(next(&mut parts)?)?,
+            dst: parse_pattern_slot(next(&mut parts)?)?,
+        }),
+        "PCLEAR" | "pclear" => Ok(GrooveEvent::ClearPattern(parse_pattern_slot(next(
+            &mut parts,
+        )?)?)),
+        "PFILL" | "pfill" => Ok(GrooveEvent::FillPattern {
+            slot: parse_pattern_slot(next(&mut parts)?)?,
+            track: parse_track(next(&mut parts)?)?,
+            velocity: parse_unit(next(&mut parts)?)?,
+        }),
+        "PRAND" | "prand" => Ok(GrooveEvent::RandomizePattern {
+            slot: parse_pattern_slot(next(&mut parts)?)?,
+            track: parse_track(next(&mut parts)?)?,
+            seed: parse_u8(next(&mut parts)?)?,
+            density: parse_unit(next(&mut parts)?)?,
+            velocity: parse_unit(next(&mut parts)?)?,
+        }),
         "BAND" | "band" => Ok(GrooveEvent::SelectFilterBand(parse_filter_band(next(
             &mut parts,
         )?)?)),
@@ -271,6 +331,16 @@ pub fn parse_line(line: &str) -> Result<GrooveEvent, ParseError> {
             track: parse_track(next(&mut parts)?)?,
             step: parse_u8(next(&mut parts)?)?,
             velocity: parse_unit(next(&mut parts)?)?,
+        }),
+        "BASS" | "bass" => Ok(GrooveEvent::SetBassStep {
+            slot: None,
+            step: parse_u8(next(&mut parts)?)?,
+            cell: parse_bass_cell(next(&mut parts)?)?,
+        }),
+        "PBASS" | "pbass" => Ok(GrooveEvent::SetBassStep {
+            slot: Some(parse_pattern_slot(next(&mut parts)?)?),
+            step: parse_u8(next(&mut parts)?)?,
+            cell: parse_bass_cell(next(&mut parts)?)?,
         }),
         "MACRO" | "macro" => {
             let m = parse_macro(next(&mut parts)?)?;
@@ -308,12 +378,28 @@ fn parse_filter_param(token: &str) -> Result<FilterParam, ParseError> {
     FilterParam::from_token(token).ok_or(ParseError::BadFilterParam)
 }
 
+fn parse_bass_cell(token: &str) -> Result<sequencer::BassCell, ParseError> {
+    match token {
+        "rest" | "REST" | "off" | "OFF" | "." | "-" | "0" => Ok(sequencer::BassCell::Rest),
+        "hold" | "HOLD" | "tie" | "TIE" | "_" => Ok(sequencer::BassCell::Hold),
+        _ => Ok(sequencer::BassCell::Strike(parse_unit(token)?)),
+    }
+}
+
 fn parse_filter_band(token: &str) -> Result<u8, ParseError> {
     let band = parse_u8(token)?;
     if !(1..=8).contains(&band) {
         return Err(ParseError::BadFilterBand);
     }
     Ok(band - 1)
+}
+
+fn parse_pattern_slot(token: &str) -> Result<u8, ParseError> {
+    let slot = parse_u8(token)?;
+    if !(1..=8).contains(&slot) {
+        return Err(ParseError::BadPatternSlot);
+    }
+    Ok(slot - 1)
 }
 
 fn parse_filter_command(
@@ -356,6 +442,8 @@ mod tests {
             parse_line("TRACK bass"),
             Ok(GrooveEvent::SelectTrack(Track::Bass))
         );
+        assert_eq!(parse_line("PATTERN 2"), Ok(GrooveEvent::SelectPattern(1)));
+        assert_eq!(parse_line("CAPTURE 2"), Ok(GrooveEvent::CapturePattern(1)));
         assert_eq!(parse_line("BAND 3"), Ok(GrooveEvent::SelectFilterBand(2)));
     }
 
@@ -381,6 +469,22 @@ mod tests {
                 track: Track::Bass,
                 step: 4,
                 velocity: 64.0 / 127.0,
+            })
+        );
+        assert_eq!(
+            parse_line("BASS 4 hold"),
+            Ok(GrooveEvent::SetBassStep {
+                slot: None,
+                step: 4,
+                cell: sequencer::BassCell::Hold,
+            })
+        );
+        assert_eq!(
+            parse_line("PBASS 2 5 tie"),
+            Ok(GrooveEvent::SetBassStep {
+                slot: Some(1),
+                step: 5,
+                cell: sequencer::BassCell::Hold,
             })
         );
         assert_eq!(
@@ -413,6 +517,29 @@ mod tests {
                 value: 32.0 / 127.0,
             })
         );
+        assert_eq!(
+            parse_line("PCOPY 1 2"),
+            Ok(GrooveEvent::CopyPattern { src: 0, dst: 1 })
+        );
+        assert_eq!(parse_line("PCLEAR 2"), Ok(GrooveEvent::ClearPattern(1)));
+        assert_eq!(
+            parse_line("PFILL 1 kick 127"),
+            Ok(GrooveEvent::FillPattern {
+                slot: 0,
+                track: Track::Kick,
+                velocity: 1.0,
+            })
+        );
+        assert_eq!(
+            parse_line("PRAND 1 kick 42 64 127"),
+            Ok(GrooveEvent::RandomizePattern {
+                slot: 0,
+                track: Track::Kick,
+                seed: 42,
+                density: 64.0 / 127.0,
+                velocity: 1.0,
+            })
+        );
     }
 
     #[test]
@@ -423,6 +550,7 @@ mod tests {
         assert_eq!(parse_line("STEP nope 1 2"), Err(ParseError::BadTrack));
         assert_eq!(parse_line("MACRO nope 1"), Err(ParseError::BadMacro));
         assert_eq!(parse_line("BAND 9"), Err(ParseError::BadFilterBand));
+        assert_eq!(parse_line("PATTERN 9"), Err(ParseError::BadPatternSlot));
         assert_eq!(parse_line("FILTER nope 1"), Err(ParseError::BadFilterParam));
         assert_eq!(parse_line("PAD 36 255"), Err(ParseError::BadNumber));
     }

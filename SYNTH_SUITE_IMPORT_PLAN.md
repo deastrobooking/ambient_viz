@@ -1,7 +1,8 @@
 # Donor Import Boundaries
 
-This repo owns the standalone instrument runtime. Wolfgang, Nexus 12, and
-Spectre are references and selective donor sources, not runtimes to merge whole.
+This repo owns the separate standalone instrument runtime. Wolfgang, Nexus 12,
+and Spectre are references and selective donor sources, not runtimes to merge
+whole.
 
 The rule: every imported idea becomes a small, tested, realtime-bounded module
 behind `daisy/crates/dsp::Engine` or the shared `GrooveEvent` protocol.
@@ -75,9 +76,11 @@ Landed:
 
 - shared `GrooveEvent` and text protocol;
 - host stdin groovebox harness;
+- fixed 8-slot pattern bank with capture/load/copy/clear/fill/randomize helpers;
 - default-bypassed Spectre dynamic rack and master filter in `Engine`;
 - macro ids 7-9 for `filter_cutoff`, `filter_resonance`, `filter_motion`;
 - selected-band `BAND` and explicit/selected `FILTER` commands;
+- host-visible dynamic-band envelope activity for performance metering;
 - finite-output tests for the Spectre filter path.
 
 Next donor work is tracked in `AGENT_MEMORY.md` milestones M3-M5.

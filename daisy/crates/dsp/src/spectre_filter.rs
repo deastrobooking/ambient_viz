@@ -189,6 +189,10 @@ impl DynamicFilter {
         }
     }
 
+    pub fn envelope_values(&self) -> [f32; DYNAMIC_BAND_COUNT] {
+        core::array::from_fn(|idx| self.bands[idx].envelope_value())
+    }
+
     pub fn process_buffer(&mut self, buffer: &mut [f32], settings: &DynamicFilterSettings) {
         for frame in buffer.chunks_exact_mut(2) {
             let (l, r) = self.process_stereo(frame[0], frame[1], settings);
@@ -238,6 +242,10 @@ impl DynamicBand {
         self.left.reset();
         self.right.reset();
         self.envelope.reset();
+    }
+
+    fn envelope_value(&self) -> f32 {
+        self.envelope.value()
     }
 
     #[inline]
@@ -850,5 +858,39 @@ mod tests {
         // The loud path is ducked by the dynamic band, so it should not scale
         // linearly by 18x relative to the quiet input.
         assert!(loud_energy < quiet_energy * 18.0);
+    }
+
+    #[test]
+    fn dynamic_filter_reports_envelope_activity() {
+        let mut filter = DynamicFilter::new(48_000.0);
+        let mut settings = DynamicFilterSettings::default();
+        settings.bands[0] = DynamicBandSettings {
+            enabled: true,
+            mode: BandMode::BandPass,
+            channel_mode: ChannelMode::Stereo,
+            frequency_hz: 900.0,
+            gain_db: 3.0,
+            q: 1.0,
+            dynamic_db: 8.0,
+            sweep_octaves: 0.75,
+            env_attack_ms: 1.0,
+            env_release_ms: 80.0,
+            env_sensitivity: 2.0,
+        };
+
+        assert_eq!(filter.envelope_values(), [0.0; DYNAMIC_BAND_COUNT]);
+        for _ in 0..512 {
+            let (left, right) = filter.process_stereo(0.75, -0.75, &settings);
+            assert!(left.is_finite());
+            assert!(right.is_finite());
+        }
+
+        let envelopes = filter.envelope_values();
+        assert!(envelopes[0] > 0.0);
+        assert!(envelopes[0].is_finite());
+        assert_eq!(envelopes[1], 0.0);
+
+        filter.reset();
+        assert_eq!(filter.envelope_values(), [0.0; DYNAMIC_BAND_COUNT]);
     }
 }

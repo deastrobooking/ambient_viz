@@ -1,11 +1,11 @@
 # Agent Guide
 
-This repository is in an audio-first fork transition.
+This repository is now a separate audio-instrument product fork.
 
 Future agents should not assume the browser visualizer is the product center.
-The definitive product direction is now a standalone Rust audio performance
-instrument: Daisy-based groovebox, synth engine, sampler, effects, hardware
-controls, and shared comms.
+The definitive product direction is a standalone Rust audio performance
+instrument: Daisy-based groovebox, synth engine, sampler, effects, pattern
+runtime, hardware controls, and shared comms.
 
 ## Read First
 
@@ -15,10 +15,11 @@ Before planning or coding, read:
 2. `AUDIO_ENGINE_FORK.md` — north star and architecture summary.
 3. `SYNTH_SUITE_IMPORT_PLAN.md` — Wolfgang/Nexus/Spectre import boundaries.
 4. `daisy/README.md` — current Daisy workspace framing and workflow.
-5. `BACKLOG.md` — prioritized permanent task list.
+5. `PI4_AUDIO_TEST_DEPLOYMENT.md` — Pi 4 companion deployment/testing.
+6. `BACKLOG.md` — prioritized permanent task list.
 
-Older visualizer/kiosk docs are still valid for exhibit work, but they are no
-longer the main roadmap for this fork.
+Older visualizer/kiosk docs are still valid for exhibit work, but they are
+legacy companion docs, not the product roadmap.
 
 ## Architecture Rules
 
@@ -26,6 +27,9 @@ longer the main roadmap for this fork.
 - `daisy/crates/host` is the fast macOS audition/control harness.
 - `daisy/crates/firmware` is the embedded runtime.
 - Browser/Pi/visualizer integration is optional telemetry or companion output.
+- Pi 4 deployment for the audio fork is documented in
+  `PI4_AUDIO_TEST_DEPLOYMENT.md`; use `PI_KIOSK_BRINGUP.md` only for full
+  legacy sensor/exhibit bringup.
 - Codec/line-out audio and hands-on playability come first.
 
 All external control surfaces should target the shared control vocabulary:
@@ -44,6 +48,12 @@ TRACK kick
 PAD 36 127
 TOGGLE kick 0
 STEP bass 4 96
+PATTERN 1
+CAPTURE 1
+PCOPY 1 2
+PCLEAR 2
+PFILL 1 kick 127
+PRAND 1 kick 42 64 127
 MACRO damage 64
 MACRO filter_cutoff 80
 MACRO filter_resonance 48

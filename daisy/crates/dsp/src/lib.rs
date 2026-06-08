@@ -46,6 +46,7 @@ pub use hihat::HiHat;
 pub use midi::{MidiByteParser, MidiMessage};
 pub use midi_map::{install_kiosk_bindings, MidiMap, Param};
 pub use pain_voice::PainMaterialVoice;
+pub use sequencer::{PatternBank, PatternBankError, PatternSnapshot, PATTERN_BANK_SLOTS};
 pub use spectre_filter::{
     BandMode, ChannelMode, DynamicBandSettings, DynamicFilter, DynamicFilterSettings, MasterFilter,
     MasterFilterModel, MasterFilterSettings,
@@ -103,6 +104,8 @@ pub struct Engine {
     kick_trigger_note: u8,
     midi_map: MidiMap,
     sequencer: sequencer::Sequencer,
+    pattern_bank: sequencer::PatternBank,
+    pending_pattern_slot: Option<usize>,
     reverb: Reverb,
     /// Resonant "bloom" bank — rings the pre-tape master into a fixed D Lydian
     /// chord, scaled by a "proximity" amount. Stands in for the exhibit's ToF
@@ -225,6 +228,8 @@ impl Engine {
             kick_trigger_note: 60,
             midi_map: MidiMap::new(),
             sequencer: sequencer::Sequencer::new(sample_rate),
+            pattern_bank: sequencer::PatternBank::new(),
+            pending_pattern_slot: None,
             reverb,
             bloom: bloom::BloomBank::new(sample_rate),
             spectre_filter: spectre_filter::MasterFilter::new(sample_rate),
@@ -340,6 +345,61 @@ impl Engine {
     pub fn sequencer(&self) -> &sequencer::Sequencer {
         &self.sequencer
     }
+    pub fn pattern_bank(&self) -> &PatternBank {
+        &self.pattern_bank
+    }
+    pub fn capture_pattern(&mut self, slot: usize) -> Result<(), PatternBankError> {
+        self.pattern_bank.capture(slot, &self.sequencer)
+    }
+    pub fn load_pattern(&mut self, slot: usize) -> Result<(), PatternBankError> {
+        self.pattern_bank.load(slot, &mut self.sequencer)
+    }
+    pub fn queue_pattern_load(&mut self, slot: usize) -> Result<(), PatternBankError> {
+        self.pattern_bank.slot(slot)?;
+        if self.sequencer.step() == 0 {
+            self.load_pattern(slot)?;
+            self.pending_pattern_slot = None;
+            return Ok(());
+        }
+        self.pending_pattern_slot = Some(slot);
+        Ok(())
+    }
+    pub fn pending_pattern_slot(&self) -> Option<usize> {
+        self.pending_pattern_slot
+    }
+    pub fn copy_pattern(&mut self, src: usize, dst: usize) -> Result<(), PatternBankError> {
+        self.pattern_bank.copy(src, dst)
+    }
+    pub fn clear_pattern(&mut self, slot: usize) -> Result<(), PatternBankError> {
+        self.pattern_bank.clear(slot)
+    }
+    pub fn fill_pattern_voice(
+        &mut self,
+        slot: usize,
+        voice: sequencer::Voice,
+        velocity: f32,
+    ) -> Result<(), PatternBankError> {
+        self.pattern_bank.fill_voice(slot, voice, velocity)
+    }
+    pub fn randomize_pattern_voice(
+        &mut self,
+        slot: usize,
+        voice: sequencer::Voice,
+        seed: u32,
+        density: f32,
+        velocity: f32,
+    ) -> Result<(), PatternBankError> {
+        self.pattern_bank
+            .randomize_voice(slot, voice, seed, density, velocity)
+    }
+    pub fn set_pattern_bass_step(
+        &mut self,
+        slot: usize,
+        step: usize,
+        cell: sequencer::BassCell,
+    ) -> Result<(), PatternBankError> {
+        self.pattern_bank.set_bass_step(slot, step, cell)
+    }
 
     /// Mutable access to the tape processor (enable/disable, hiss level, etc.).
     pub fn tape_mut(&mut self) -> &mut tape::TapeProcessor {
@@ -369,6 +429,9 @@ impl Engine {
     }
     pub fn spectre_dynamic_filter_settings(&self) -> DynamicFilterSettings {
         self.spectre_dynamic_settings
+    }
+    pub fn spectre_dynamic_envelopes(&self) -> [f32; spectre_filter::DYNAMIC_BAND_COUNT] {
+        self.spectre_dynamic_filter.envelope_values()
     }
     pub fn spectre_dynamic_filter_mut(&mut self) -> &mut DynamicFilter {
         &mut self.spectre_dynamic_filter
@@ -436,6 +499,51 @@ impl Engine {
             GrooveEvent::TransportPlay(playing) => self.set_sequencer_enabled(playing),
             GrooveEvent::TransportReset => self.sequencer.reset(),
             GrooveEvent::SelectTrack(track) => self.selected_track = track,
+            GrooveEvent::SelectPattern(slot) => {
+                let _ = self.queue_pattern_load(slot as usize);
+            }
+            GrooveEvent::CapturePattern(slot) => {
+                let _ = self.capture_pattern(slot as usize);
+            }
+            GrooveEvent::CopyPattern { src, dst } => {
+                let _ = self.copy_pattern(src as usize, dst as usize);
+            }
+            GrooveEvent::ClearPattern(slot) => {
+                let _ = self.clear_pattern(slot as usize);
+            }
+            GrooveEvent::FillPattern {
+                slot,
+                track,
+                velocity,
+            } => {
+                if let Some(voice) = track.sequencer_voice() {
+                    let _ = self.fill_pattern_voice(slot as usize, voice, velocity);
+                }
+            }
+            GrooveEvent::RandomizePattern {
+                slot,
+                track,
+                seed,
+                density,
+                velocity,
+            } => {
+                if let Some(voice) = track.sequencer_voice() {
+                    let _ = self.randomize_pattern_voice(
+                        slot as usize,
+                        voice,
+                        seed as u32,
+                        density,
+                        velocity,
+                    );
+                }
+            }
+            GrooveEvent::SetBassStep { slot, step, cell } => {
+                if let Some(slot) = slot {
+                    let _ = self.set_pattern_bass_step(slot as usize, step as usize, cell);
+                } else {
+                    self.sequencer.set_bass_step(step as usize, cell);
+                }
+            }
             GrooveEvent::SelectFilterBand(band) => self.select_filter_band(band as usize),
             GrooveEvent::ToggleStep { track, step } => self.toggle_step(track, step as usize),
             GrooveEvent::SetStepVelocity {
@@ -669,6 +777,11 @@ impl Engine {
         self.stab_send.resize(output.len(), 0.0);
         self.bass_buf.resize(n_frames, 0.0);
         for i in 0..n_frames {
+            if self.pending_pattern_slot.is_some() && self.sequencer.step() == 0 {
+                if let Some(slot) = self.pending_pattern_slot.take() {
+                    let _ = self.load_pattern(slot);
+                }
+            }
             // When disabled, freeze the sequencer clock and fire nothing; the
             // voices still tick (with no trigger) so any ringing tail decays.
             let evt = if self.sequencer_enabled {
@@ -676,6 +789,11 @@ impl Engine {
             } else {
                 sequencer::StepEvent::default()
             };
+            if evt.loop_start && self.pending_pattern_slot.is_some() {
+                if let Some(slot) = self.pending_pattern_slot.take() {
+                    let _ = self.load_pattern(slot);
+                }
+            }
             let kick_trig = if let Some(v) = evt.kick_velocity {
                 self.kick_velocity = v;
                 true
@@ -980,6 +1098,108 @@ mod tests {
     }
 
     #[test]
+    fn groove_pattern_events_manage_bank_slots() {
+        let mut engine = Engine::new(48_000.0);
+
+        engine.handle_groove_event(GrooveEvent::SetStepVelocity {
+            track: Track::Kick,
+            step: 0,
+            velocity: 0.25,
+        });
+        engine.handle_groove_event(GrooveEvent::CapturePattern(0));
+        engine.handle_groove_event(GrooveEvent::FillPattern {
+            slot: 0,
+            track: Track::Kick,
+            velocity: 1.0,
+        });
+        engine.handle_groove_event(GrooveEvent::SelectPattern(0));
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 0),
+            Some(1.0)
+        );
+
+        engine.handle_groove_event(GrooveEvent::CopyPattern { src: 0, dst: 1 });
+        engine.handle_groove_event(GrooveEvent::ClearPattern(0));
+        engine.handle_groove_event(GrooveEvent::SelectPattern(0));
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 0),
+            Some(0.0)
+        );
+        engine.handle_groove_event(GrooveEvent::SelectPattern(1));
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 0),
+            Some(1.0)
+        );
+
+        engine.handle_groove_event(GrooveEvent::SetBassStep {
+            slot: None,
+            step: 1,
+            cell: sequencer::BassCell::Hold,
+        });
+        assert_eq!(
+            engine.sequencer().bass_step(1),
+            Some(sequencer::BassCell::Hold)
+        );
+        engine.handle_groove_event(GrooveEvent::SetBassStep {
+            slot: Some(1),
+            step: 2,
+            cell: sequencer::BassCell::Strike(0.5),
+        });
+        engine.handle_groove_event(GrooveEvent::SelectPattern(1));
+        assert_eq!(
+            engine.sequencer().bass_step(2),
+            Some(sequencer::BassCell::Strike(0.5))
+        );
+    }
+
+    #[test]
+    fn pattern_select_queues_until_loop_boundary() {
+        let mut engine = Engine::new(48_000.0);
+        engine
+            .sequencer_mut()
+            .set_tempo(timeline::fixed_bpm(120.0), 8.0);
+
+        engine.handle_groove_event(GrooveEvent::SetStepVelocity {
+            track: Track::Kick,
+            step: 0,
+            velocity: 0.25,
+        });
+        engine.handle_groove_event(GrooveEvent::CapturePattern(0));
+        engine.handle_groove_event(GrooveEvent::FillPattern {
+            slot: 1,
+            track: Track::Kick,
+            velocity: 1.0,
+        });
+
+        let mut out = [0.0_f32; 4096];
+        for _ in 0..4 {
+            engine.process(&[], &mut out);
+        }
+        assert_ne!(engine.sequencer().step(), 0);
+
+        engine.handle_groove_event(GrooveEvent::SelectPattern(1));
+        assert_eq!(engine.pending_pattern_slot(), Some(1));
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 0),
+            Some(0.25)
+        );
+
+        for _ in 0..240 {
+            if engine.pending_pattern_slot().is_none() {
+                break;
+            }
+            engine.process(&[], &mut out);
+        }
+
+        assert_eq!(engine.pending_pattern_slot(), None);
+        assert_eq!(engine.pattern_bank().selected(), 1);
+        assert_eq!(
+            engine.sequencer().step_velocity(sequencer::Voice::Kick, 0),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn groove_pad_respects_custom_kick_note() {
         let mut engine = Engine::new(48_000.0);
         engine.set_kick_trigger_note(48);
@@ -1040,5 +1260,8 @@ mod tests {
         let mut out = [0.0_f32; 4096];
         engine.process(&[], &mut out);
         assert!(out.iter().all(|s| s.is_finite()));
+        let envelopes = engine.spectre_dynamic_envelopes();
+        assert!(envelopes[0].is_finite());
+        assert!(envelopes[0] > 0.0);
     }
 }

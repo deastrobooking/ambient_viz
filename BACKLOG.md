@@ -1,9 +1,9 @@
 # Backlog — future improvements
 
-Canonical, version-controlled backlog for ambient_viz. Captured 2026-06-06 from a
-design session + a sweep of all repo docs and notes. The live Claude Code task
-list mirrors this but is session-scoped; **this file is the permanent home** —
-update it here.
+Canonical, version-controlled backlog for the separate audio-instrument rebuild
+fork. Captured from design sessions plus sweeps of repo docs and notes. The live
+agent task list is session-scoped; **this file is the permanent home** — update
+it here.
 
 Each item links its source doc/memory. Dependencies noted inline. Completed
 verification checklists from already-shipped work (USB composite Phases A–D, tape
@@ -28,9 +28,12 @@ failure live control, SAI audio path) are intentionally excluded.
   routed through `Engine::handle_groove_event`. Next write a compact
   CDC/MIDI/UART event encoder only after the text protocol feels good. —
   `AUDIO_ENGINE_FORK.md`, `SYNTH_SUITE_IMPORT_PLAN.md`
-- [ ] **Pattern bank + editing model** — add fixed-size pattern banks, bass
-  tie/hold editing, copy/clear/fill/randomize helpers, and quantized pattern
-  changes. Keep mutation realtime-bounded. — `AUDIO_ENGINE_FORK.md`
+- [ ] **Pattern bank + editing model** — fixed 8-slot `PatternBank` now captures,
+  loads, copies, clears, fills, and deterministically randomizes drum/stab lanes
+  through `GrooveEvent` commands (`PATTERN`, `CAPTURE`, `PCOPY`, `PCLEAR`,
+  `PFILL`, `PRAND`); `BASS`/`PBASS` edit live or slotted bass rest/hold/strike
+  cells; `PATTERN` queues mid-loop loads to step 0. Next: minimal project
+  snapshot format. — `AUDIO_ENGINE_FORK.md`
 - [ ] **Synth/filter/modulation expansion** — selectively port small
   Nexus12/WolfGang ideas: one oscillator/filter at a time, fixed modulation
   matrix, macro scenes, and tests. Avoid plugin/desktop runtime assumptions. —
@@ -39,12 +42,18 @@ failure live control, SAI audio path) are intentionally excluded.
   dynamic band rack have landed (`Off`, `Clean LP`, `Ladder12`, `Ladder24`,
   `Diode`, `SEM Morph`; 8 biquad bands; Stereo/Mid/Side/Left/Right modes;
   envelope-followed gain/cutoff). `MACRO filter_cutoff`, `filter_resonance`,
-  and `filter_motion` steer band 0 through the shared protocol. Next:
-  transient/color models, selected-band controls, and host-side analyzer. —
+  and `filter_motion` steer the selected band through the shared protocol;
+  `BAND` and `FILTER` commands provide selected/explicit band editing, and host
+  `STATE` displays selected-band envelope activity. Next: transient/color
+  models and host-side analyzer snapshots. —
   `SYNTH_SUITE_IMPORT_PLAN.md`
 - [ ] **Standalone Daisy groovebox build** — codec line out first, hardware
   controls into `Engine::handle_groove_event`, project/pattern/sample storage,
   visual/Pi sync optional. — `AUDIO_ENGINE_FORK.md`, `daisy/README.md`
+- [x] **Pi 4 audio-fork deployment guide** — `PI4_AUDIO_TEST_DEPLOYMENT.md`
+  defines the Pi as a companion for mock SSE, sensors, Daisy CDC
+  song-position/control, and visual sync; analog Daisy line out remains the
+  audio acceptance path. — `PI4_AUDIO_TEST_DEPLOYMENT.md`
 
 ## Audio capture / transport
 

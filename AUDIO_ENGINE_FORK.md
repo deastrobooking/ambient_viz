@@ -1,8 +1,8 @@
-# Audio-First Fork
+# Separate Audio Product Fork
 
-This fork is moving away from the browser/video installation and toward a
-standalone Rust audio instrument: Daisy groovebox, synth engine, sampler,
-effects, storage, hardware controls, and line output.
+This repository is being rebuilt into a separate standalone Rust audio
+instrument: Daisy groovebox, synth engine, sampler, effects, project/pattern
+runtime, hardware controls, and line output.
 
 The visualizer can remain a companion display or telemetry layer, but it should
 not define the core architecture.
@@ -34,13 +34,14 @@ timing and hands-on control.
 - `daisy/crates/firmware`: embedded Daisy runtime.
 - Existing voices/effects: kick, hats, FM stabs, rumble bass, sampler,
   sequencer, tape, freeze, bloom, reverb, ping-pong delay, limiter.
+- Existing pattern-bank and shared-control work as the seed of project runtime.
 - Existing USB/CDC/MIDI ideas as control and telemetry transports.
 
 ## De-Emphasize
 
 - Browser `AnalyserNode` as the primary audio intelligence.
 - Daisy-to-browser audio capture as a blocker for synth/groovebox work.
-- Visual effect tuning as the main roadmap.
+- Legacy visual effect tuning as the main roadmap.
 - Desktop/plugin runtime assumptions in firmware.
 
 ## Shared Control
@@ -61,6 +62,14 @@ TRACK kick
 PAD 36 127
 TOGGLE kick 0
 STEP bass 4 96
+BASS 4 hold
+PBASS 1 4 tie
+PATTERN 1
+CAPTURE 1
+PCOPY 1 2
+PCLEAR 2
+PFILL 1 kick 127
+PRAND 1 kick 42 64 127
 MACRO damage 64
 MACRO filter_cutoff 80
 MACRO filter_resonance 48
@@ -84,6 +93,13 @@ Develop new behavior in `daisy/crates/host` first:
 
 Move features to firmware only after they have bounded state and no realtime
 allocation/blocking story.
+
+## Pi 4 Companion Testing
+
+Use `PI4_AUDIO_TEST_DEPLOYMENT.md` for current Pi 4 deployment and setup. The Pi
+is a companion for mock SSE, sensors, Daisy CDC song-position/control, and
+visual sync. It is not the audio acceptance target; judge instrument audio from
+Daisy codec/line out.
 
 ## Firmware Rules
 

@@ -1,5 +1,9 @@
 # Pi Kiosk Bringup
 
+For the current audio-instrument fork, start with
+`PI4_AUDIO_TEST_DEPLOYMENT.md`. This document is the legacy exhibit runbook for
+bringing all Pi sensors into the browser visualizer.
+
 End-to-end runbook: bare Pi 4 → all four sensors streaming into the
 visualizer. Every phase has a verification before the next one
 starts — diagnose immediately rather than chasing compound failures.

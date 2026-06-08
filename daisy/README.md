@@ -1,6 +1,6 @@
-# ambient-viz-daisy
+# Daisy Groovebox Engine
 
-Cargo workspace for the fork's audio-first Daisy engine:
+Cargo workspace for the separate audio-instrument product fork:
 
 | Crate             | Type                        | What it is                                                                                            |
 | ----------------- | --------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -8,13 +8,18 @@ Cargo workspace for the fork's audio-first Daisy engine:
 | `crates/firmware` | embedded binary (thumbv7em) | Daisy Seed firmware. Embassy + SAI audio, USB CDC/UAC support, UART-MIDI, SD-card work, and `dsp`.    |
 | `crates/host`     | std binary (macOS)          | Local dev host. CoreAudio + CoreMIDI + `dsp`. Lets you iterate on audio logic without reflashing.     |
 
-Fork direction: the Daisy is the instrument. Video/visualizer integration is
+Product direction: the Daisy is the instrument. Video/visualizer integration is
 optional downstream telemetry, not the center of the architecture. The primary
 goal is a playable hardware groovebox/synth engine controlled by pads, encoders,
 MIDI, CDC serial, sensors, or a small companion MCU.
 
 Audio output should be excellent over the Daisy codec/line out first. USB audio,
 I²S, Pi capture, and browser analysis are secondary integration paths.
+
+Pi 4 companion setup for current audio-fork testing lives in
+`../PI4_AUDIO_TEST_DEPLOYMENT.md`. Use it for mock SSE, sensors, Daisy CDC
+song-position/control, and visual sync. Use `../PI_KIOSK_BRINGUP.md` only for
+the full legacy exhibit sensor stack.
 
 ## Dev workflow
 
@@ -149,14 +154,17 @@ daisy/
         └── src/main.rs                 # cpal sine-wave output
 ```
 
-## Roadmap
+## Product Roadmap
+
+The canonical milestone plan lives in `../AGENT_MEMORY.md`.
 
 1. **Host groovebox harness** — map keyboard/MIDI/serial controls to
-   `GrooveEvent` so patterns, pads, and macros are playable on macOS.
-2. **Control protocol** — define a small CDC/MIDI-friendly command vocabulary
-   for pads, steps, macros, transport, and selected track.
-3. **Pattern editing** — add bass ties/holds, copy/clear, pattern banks, and
-   realtime-safe mutation helpers.
+   `GrooveEvent` so patterns, pads, macros, filters, and pattern banks are
+   playable on macOS.
+2. **Control protocol** — keep a small CDC/MIDI-friendly command vocabulary for
+   pads, steps, macros, transport, selected track, filters, and pattern slots.
+3. **Pattern/project runtime** — expand the fixed pattern bank with minimal
+   project snapshots and storage/load workflows.
 4. **Synth expansion** — selectively port Nexus 12/WolfGang oscillator, filter,
    modulation, and macro ideas into small fixed-size `no_std` modules.
 5. **Hardware bridge** — map the friend's controller hardware through MIDI,
@@ -166,7 +174,3 @@ daisy/
    audio.
 7. **Optional visual sync** — send audio position/features to Pi/browser only
    after the instrument works as a standalone box.
-
-```
-
-```

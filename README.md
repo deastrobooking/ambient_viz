@@ -1,16 +1,82 @@
-# ambient_viz
+# Audio Instrument Rebuild Fork
 
-Browser-based audio visualizer for ambient / industrial / IDM material.
-Black-and-white CRT/glitch aesthetic — reference points: NIN, Aphex Twin,
-Venetian Snares.
+This repository is being rebuilt into a separate product: a standalone
+Daisy/Rust audio performance instrument. The new product center is a hardware
+groovebox/synth engine with sampler, sequencer, Spectre-style filter/effects,
+pattern banks, shared control protocol, and Daisy codec line out.
 
-> **Audio-first fork note:** this repository now also contains a Daisy/Rust
-> groovebox/synth-engine fork. For current agent handoff and audio-engine
-> direction, read `AGENTS.md`, `AGENT_MEMORY.md`, `AUDIO_ENGINE_FORK.md`, and
-> `SYNTH_SUITE_IMPORT_PLAN.md`. The browser visualizer remains useful, but it
-> is no longer the center of the fork roadmap.
+The original browser visualizer and Raspberry Pi kiosk stack remain in the
+repository as legacy/companion systems. They can still be used for projection,
+telemetry, diagnostics, or exhibit work, but they no longer define the product
+roadmap.
 
-## Layout
+## Current Product
+
+| Area | Status |
+| --- | --- |
+| Audio core | `daisy/crates/dsp`: `no_std` engine shared by host and firmware. |
+| Desktop harness | `daisy/crates/host`: macOS CoreAudio/CoreMIDI audition path. |
+| Firmware target | `daisy/crates/firmware`: Daisy Seed embedded runtime. |
+| Control protocol | `GrooveEvent` text commands for transport, pads, steps, macros, filters, and pattern bank operations. |
+| Pattern runtime | Fixed 8-slot pattern bank with capture/load/copy/clear/fill/randomize helpers. |
+| Donor references | `WolfGang_Rust`, `Nexus12`, and `Spectre-Filter` are used as selective architecture/DSP references, not merged runtimes. |
+
+Read these first:
+
+1. `AGENT_MEMORY.md` — current state and milestone plan.
+2. `AGENTS.md` — standing agent rules for this fork.
+3. `AUDIO_ENGINE_FORK.md` — product architecture summary.
+4. `SYNTH_SUITE_IMPORT_PLAN.md` — donor import boundaries.
+5. `daisy/README.md` — workspace and hardware workflow.
+6. `PI4_AUDIO_TEST_DEPLOYMENT.md` — Pi 4 companion deployment/testing guide.
+7. `BACKLOG.md` — permanent task list.
+
+## Audio Workflow
+
+```bash
+cd daisy
+
+# Fast Mac iteration
+cargo run -p host --release
+
+# Shared DSP checks
+/Users/randolphchabot/.cargo/bin/cargo test -p dsp
+/Users/randolphchabot/.cargo/bin/cargo check -p host
+```
+
+Host stdin command examples:
+
+```text
+PLAY 1
+PAD 36 127
+TOGGLE kick 0
+STEP bass 4 96
+BASS 4 hold
+PBASS 1 4 tie
+PATTERN 1
+CAPTURE 1
+PCOPY 1 2
+PFILL 1 kick 127
+PRAND 1 kick 42 64 127
+MACRO damage 64
+MACRO filter_cutoff 80
+BAND 3
+FILTER 4 q 48
+STATE
+```
+
+## Repository Layout
+
+- `daisy/` — current product core: DSP, host harness, Daisy firmware.
+- `AGENT_MEMORY.md` — canonical handoff and milestone plan.
+- `AUDIO_ENGINE_FORK.md` — concise product architecture.
+- `SYNTH_SUITE_IMPORT_PLAN.md` — rules for borrowing from Wolfgang/Nexus/Spectre.
+- `GROOVEBOX_REPURPOSE.md` — condensed donor/hardware research.
+- `PI4_AUDIO_TEST_DEPLOYMENT.md` — Pi 4 test companion setup for mock SSE,
+  sensors, Daisy CDC telemetry/control, and visual sync.
+- `BACKLOG.md` — version-controlled task list.
+
+Legacy visualizer/kiosk areas:
 
 - `static/` — everything served to the browser.
   - `index.html` — the app (HTML + CSS + JS, no build step).
@@ -33,13 +99,16 @@ Venetian Snares.
 - `PI_KIOSK_BRINGUP.md` — phased runbook for taking a bare Pi 4 to all
   four sensors streaming into the visualizer, with a verification step
   between each phase.
+- `PI4_AUDIO_TEST_DEPLOYMENT.md` — audio-fork Pi 4 deployment guide. Use this
+  for current product testing; use `PI_KIOSK_BRINGUP.md` for the full legacy
+  exhibit sensor stack.
 - `SENSOR_MAPPING.md` — how live sensor readings drive visualizer
   parameters (distance → twist amplitude, distance → bitmap
   resolution, etc.). Covers smoothing semantics, URL flags
   (`?distanceToBitmap=on`, `?debug=1`), tuning knobs, and the
   diagnostic overlay.
 
-## Two ways to run
+## Legacy Visualizer
 
 **Standalone visualizer** — open `static/index.html` directly in a
 browser. No server, no Python, no hardware. File loading is via the file
