@@ -48,6 +48,9 @@ MACRO damage 64
 MACRO filter_cutoff 80
 MACRO filter_resonance 48
 MACRO filter_motion 96
+BAND 3
+FILTER cutoff 80
+FILTER 4 q 48
 ```
 
 ## Donor Project Boundaries
