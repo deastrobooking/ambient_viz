@@ -16,6 +16,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use daisy_embassy::audio::{AudioPeripherals, HALF_DMA_BUFFER_LENGTH};
+#[cfg(not(feature = "groovebox"))]
 use daisy_embassy::led::UserLed;
 use daisy_embassy::{hal, new_daisy_board};
 use defmt::info;
@@ -23,22 +24,29 @@ use defmt::info;
 use dsp::PainMaterialVoice;
 #[cfg(feature = "freeze")]
 use dsp::freeze::{self, Freeze, GlitchTape};
+#[cfg(not(feature = "groovebox"))]
 use dsp::limiter::Limiter;
+#[cfg(not(feature = "groovebox"))]
 use dsp::tape::TapeProcessor;
 #[cfg(feature = "bell")]
 use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _};
 #[cfg(feature = "groovebox")]
-use dsp::{Engine, GrooveEvent, groove::parse_line, timeline};
+use dsp::{Engine, groove::parse_line, timeline};
 use embassy_executor::{InterruptExecutor, Spawner};
+#[cfg(not(feature = "groovebox"))]
 use embassy_futures::join::join;
+#[cfg(not(feature = "groovebox"))]
 use embassy_futures::yield_now;
 use embassy_stm32::interrupt;
 use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_time::{Delay, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embedded_alloc::LlffHeap as Heap;
+#[cfg(not(feature = "groovebox"))]
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
-use heapless::spsc::{Consumer, Producer, Queue};
+#[cfg(not(feature = "groovebox"))]
+use heapless::spsc::Consumer;
+use heapless::spsc::{Producer, Queue};
 use static_cell::StaticCell;
 
 // defmt-rtt stays the defmt global logger (info! -> RTT, unread without a
@@ -90,7 +98,9 @@ const BELL_GAIN: f32 = 0.02;
 #[cfg(feature = "voice")]
 const VOICE_GAIN: f32 = 0.04;
 
+#[cfg(not(feature = "groovebox"))]
 const RING_LEN: usize = 8192;
+#[cfg(not(feature = "groovebox"))]
 static RING: StaticCell<Queue<i16, RING_LEN>> = StaticCell::new();
 
 // Second SPSC ring: the SAI callback tees the played samples here and the USB
@@ -112,6 +122,7 @@ static PLAYED_FRAMES: AtomicU32 = AtomicU32::new(0);
 static OUT_PEAK_MILLI: AtomicU32 = AtomicU32::new(0);
 static CB_FULL_US: AtomicU32 = AtomicU32::new(0);
 static SAI_ERR: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(feature = "groovebox"))]
 static SD_UNDERRUN: AtomicU32 = AtomicU32::new(0);
 
 // USB capture-tee health (the visualizer feed). Logged per-interval with the
@@ -668,6 +679,7 @@ async fn groovebox_audio_task(
 /// Audio output, on the interrupt executor. Drains L,R pairs from the ring into
 /// each SAI block; silence on underrun. With audio here, SD read duration on
 /// the thread executor is irrelevant to refill timing.
+#[cfg(not(feature = "groovebox"))]
 #[embassy_executor::task]
 async fn audio_task(
     audio: AudioPeripherals<'static>,
@@ -932,6 +944,7 @@ async fn audio_task(
 }
 
 /// Repeating LED code: `code` quick flashes then a pause. Never returns.
+#[cfg(not(feature = "groovebox"))]
 async fn blink_code(led: &mut UserLed<'_>, code: u8) -> ! {
     loop {
         for _ in 0..code {

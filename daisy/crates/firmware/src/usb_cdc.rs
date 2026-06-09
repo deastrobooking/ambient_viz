@@ -21,7 +21,10 @@
 use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
-use dsp::{GrooveEvent, MidiByteParser, MidiMessage};
+#[cfg(not(feature = "groovebox"))]
+use dsp::{MidiByteParser, MidiMessage};
+#[cfg(feature = "groovebox")]
+use dsp::GrooveEvent;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver};
 use embassy_time::Timer;
@@ -34,13 +37,16 @@ use crate::usb_audio::{Drv, SAMPLE_RATE_HZ};
 /// How often to emit a position line.
 const EMIT_PERIOD_MS: u64 = 50;
 
+#[cfg(not(feature = "groovebox"))]
 const MIDI_CH_DEPTH: usize = 16;
 /// Decoded inbound MIDI, from the CDC read task (thread executor) to the audio
 /// task (interrupt executor). Bounded + lock-free `try_send`/`try_receive` so
 /// neither side ever blocks the other — the audio side must never block.
+#[cfg(not(feature = "groovebox"))]
 pub static MIDI_CHANNEL: Channel<CriticalSectionRawMutex, MidiMessage, MIDI_CH_DEPTH> =
     Channel::new();
 /// Audio-task end of [`MIDI_CHANNEL`].
+#[cfg(not(feature = "groovebox"))]
 pub type MidiRx = Receiver<'static, CriticalSectionRawMutex, MidiMessage, MIDI_CH_DEPTH>;
 
 /// Decoded GrooveEvents, from the CDC line-reader task to the groovebox audio
@@ -108,6 +114,7 @@ pub async fn position_emit_task(mut tx: CdcTx<'static, Drv>, loop_frames: u64) {
 
 /// Read inbound CDC bytes, frame them into MIDI messages, and forward to the
 /// audio task via [`MIDI_CHANNEL`]. Used by the legacy exhibit pipeline.
+#[cfg(not(feature = "groovebox"))]
 #[embassy_executor::task]
 pub async fn midi_in_task(mut rx: CdcRx<'static, Drv>) {
     let sender = MIDI_CHANNEL.sender();

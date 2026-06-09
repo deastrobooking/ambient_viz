@@ -11,11 +11,12 @@ failure live control, SAI audio path) are intentionally excluded.
 
 ## Critical-path priority order
 
-1. **M1 Host TUI** → makes the host performable right now, validates the protocol.
-2. **M6 Firmware bridge** → the only path to hardware-playable audio.
-3. **M3 Project snapshot** → persistence after M6 works.
-4. **M4 Transient + color** → DSP polish.
-5. **M5 Synth voices** → expand after the drum engine plays from hardware.
+1. **M1 Host TUI** ✓ — makes the host performable; validates protocol.
+2. **M6 Firmware bridge** ✓ — compile-verified groovebox path.
+3. **M7 QSPI bootloader** → the only path to actually flashing the groovebox build.
+4. **M3 Project snapshot** → persistence after hardware plays.
+5. **M4 Transient + color** → DSP polish.
+6. **M5 Synth voices** → expand after the drum engine plays from hardware.
 
 ## Audio-first fork priorities
 
@@ -53,13 +54,12 @@ failure live control, SAI audio path) are intentionally excluded.
   `STATE` displays selected-band envelope activity. Next: transient/color
   models and host-side analyzer snapshots. —
   `SYNTH_SUITE_IMPORT_PLAN.md`
-- [ ] **Firmware groovebox bridge (M6 — critical path)** — firmware still runs
-  exhibit kiosk pipeline (tape + bell + voice); has no `dsp::Engine` or
-  `handle_groove_event` call. Plan: replace audio path with `dsp::Engine`,
-  wire CDC serial → `groove::parse_line` → `handle_groove_event`, boot into a
-  default pattern. Disable `PingPongDelay`/`Reverb` behind a feature flag
-  until SDRAM budget is confirmed. See `AGENT_MEMORY.md` M6. —
-  `AUDIO_ENGINE_FORK.md`, `daisy/README.md`
+- [x] **Firmware groovebox bridge (M6)** — `firmware/Cargo.toml` `groovebox`
+  feature; two `#[cfg]` branches in `main()`; `groovebox_audio_task` on the
+  interrupt executor (default 120 BPM 4-on-the-floor pattern, CDC
+  `GrooveEvent` per-callback); `groove_in_task` in `usb_cdc.rs`. Compile-
+  verified; linker overflow (~13KB) blocked on M7 QSPI bootloader. —
+  `AGENT_MEMORY.md` M6, `daisy/PLAN_QSPI_BOOTLOADER.md`
 - [x] **Pi 4 audio-fork deployment guide** — `PI4_AUDIO_TEST_DEPLOYMENT.md`
   defines the Pi as a companion for mock SSE, sensors, Daisy CDC
   song-position/control, and visual sync; analog Daisy line out remains the

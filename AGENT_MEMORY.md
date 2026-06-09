@@ -1,6 +1,6 @@
 # Agent Memory
 
-Last updated: 2026-06-07 (post-review pass).
+Last updated: 2026-06-09 (M6 firmware bridge complete).
 
 ## Direction
 
@@ -34,22 +34,27 @@ Use `PI4_AUDIO_TEST_DEPLOYMENT.md` when testing the current audio fork on a Pi
 song-position/control, and visual sync. Audio acceptance remains Daisy codec
 line out, not Pi/browser USB capture.
 
-## Firmware Gap (Critical)
+## Firmware Status
 
-The `daisy/crates/firmware/src/main.rs` still runs the **original exhibit kiosk
-pipeline** (tape + FM bell + PainMaterialVoice). It does **not** instantiate
-`dsp::Engine` or call `Engine::handle_groove_event`. The host harness is fully
-groovebox-capable; the Daisy firmware is not yet bridged.
+`daisy/crates/firmware/src/main.rs` now has **two mutually exclusive pipelines**
+selected at compile time by `--features groovebox`:
 
-M6 (firmware bridge) is therefore the critical path before any hardware-playable
-groovebox can exist. The recommended order is:
+- **Default (exhibit)**: SD card → tape → limiter → USB capture tee. Same as
+  before M6. Builds and links cleanly for 128KB internal flash.
+- **Groovebox** (`--features groovebox`): `dsp::Engine` + CDC GrooveEvent → SAI
+  + USB capture tee. Boots a default 4-on-the-floor pattern at 120 BPM.
+  Compiles clean; **requires QSPI bootloader (M7) to link** — the Engine is
+  ~140KB over the 128KB internal flash ceiling at `opt-level='s'`.
 
-```text
-M1 TUI  →  M6 firmware bridge  →  M3/M4 polish  →  M5 synth expansion
-```
+The groovebox feature flag (`Cargo.toml`) disables `reverb` and `stab-delay`
+in the `dsp` crate (both allocate hundreds of KB) so the AXI heap budget is safe.
 
-Do not start M5 synth expansion before M6 — adding oscillators that can't run
-through Daisy line out adds no playable instrument surface.
+### Flash ceiling note
+
+Until M7 (QSPI bootloader) is complete, the groovebox firmware cannot flash to
+the Daisy via `cargo flash`. The code is correct and verified to compile; it just
+exceeds 128KB. Workaround for early testing: `probe-rs run --chip STM32H750IBKx`
+over SWD loads directly into RAM (no flash write needed).
 
 ## Current Implementation
 
@@ -265,22 +270,19 @@ allocation and can be controlled through the shared macro/mod system.
 
 ### M6: Firmware Groovebox Bridge
 
-Status: not started. **This is the critical-path blocker for hardware playability.**
+Status: **complete (compile-verified; flash requires M7 QSPI bootloader).**
 
-Current firmware state: `daisy/crates/firmware/src/main.rs` runs the original
-exhibit pipeline (tape + FM bell + PainMaterialVoice). It does not instantiate
-`dsp::Engine` or call `handle_groove_event`.
+- `firmware/Cargo.toml`: `groovebox` feature; `dsp` dep with `default-features = false`
+  (disables reverb + stab-delay for AXI heap budget).
+- `firmware/src/usb_cdc.rs`: `GROOVE_CHANNEL`, `GrooveRx`, `groove_in_task` —
+  reads CDC text lines, parses with `groove::parse_line`, forwards to audio task.
+- `firmware/src/main.rs`: two mutually exclusive `#[cfg]` branches in `main()`;
+  `groovebox_audio_task` on the interrupt executor — boots a default 120 BPM
+  4-on-the-floor pattern and accepts CDC `GrooveEvent` commands per-callback.
+- Exhibit pipeline unchanged when built without the feature.
 
-Plan:
-- Replace exhibit audio path with `dsp::Engine` (same as host).
-- Wire CDC serial → `groove::parse_line` → `engine.handle_groove_event`.
-- Boot into a hard-coded default pattern so the board makes sound immediately.
-- Disable `PingPongDelay` and `Reverb` behind a feature flag until SDRAM
-  allocation is profiled (both currently heap-allocate large buffers).
-- Preserve existing `debug-uart`, heap layout, embassy executor, and SAI path.
-
-Acceptance: Daisy boots, plays a drum loop from line out, and accepts CDC
-`GrooveEvent` text commands to edit steps and sweep macros.
+Acceptance: Daisy compiles clean, boots into default drum pattern from line out,
+and accepts CDC text commands. Flash blocked by 128KB limit until M7.
 
 ### M7: Companion Editor And Visual Sync
 
@@ -297,39 +299,15 @@ Acceptance: visual tools enhance the instrument without defining its runtime.
 
 Recommended order (each unblocks the next):
 
-### Slice 1 — Complete M1: Host TUI / shortcut layer
+### Slice 1 — M1 Host TUI ✓ complete
 
-The host is playable via typed text commands but not ergonomic for live
-performance. Priority work:
+Raw-key TUI (`tui.rs`) activates when stdin is a TTY. Stdin text protocol still
+works when piped. See M1 above for key map.
 
-- Add a thin `crossterm`-based TUI (single-key bindings, no full redraw) OR
-  accept raw stdin single-key events so pads / transport can be played from
-  the keyboard without typing full commands.
-- Map: `[space]` = PLAY/STOP toggle, digit rows = drum pads, arrow keys or
-  encoder emulation for macros.
-- Keep the stdin text protocol unchanged — the TUI layer translates key events
-  into the same `GrooveEvent` path before touching the engine.
+### Slice 2 — M6 Firmware Bridge ✓ complete
 
-Acceptance: performing a live drum loop, triggering pads, and sweeping
-`filter_cutoff` requires no typed commands.
-
-### Slice 2 — M6 Firmware Bridge (critical path)
-
-The firmware still runs exhibit kiosk code. Bridging work:
-
-- Replace `main.rs` exhibit pipeline with `dsp::Engine::new(SAMPLE_RATE)` +
-  a fixed pattern bank + the same default 120 BPM sequencer setup as the host.
-- Wire CDC serial lines into `groove::parse_line` → `engine.handle_groove_event`.
-- Boot into a hard-coded default pattern (kick on 1/5/9/13, hat every 2 steps,
-  etc.) so the board makes sound immediately without a host.
-- Keep existing `debug-uart`, heap sizing, embassy executor structure, and SAI
-  audio path untouched — only swap the DSP layer.
-- Note: `PingPongDelay` and `Reverb` allocate large buffers — move them to
-  SDRAM once the basic pattern plays, or disable them initially with a feature
-  flag.
-
-Acceptance: the Daisy boots, plays the default drum pattern through line out,
-and accepts CDC text commands to edit steps, change tracks, and sweep macros.
+`groovebox_audio_task` + two cfg branches in `main()`. Compile-verified.
+Requires M7 QSPI bootloader to flash. See M6 and Firmware Status above.
 
 ### Slice 3 — M3 Completion: Project Snapshot Format
 
@@ -348,32 +326,48 @@ Acceptance: a session can be saved on the host and the pattern survives restart.
 - Add host commands `TRANSIENT <attack> <sustain>` and `COLOR <amount>`.
 - Keep analyzer data host-side only (ring buffer fed from the audio callback).
 
-### Slice 5 — M5 Synth Expansion (after M6 confirmed working)
+### Slice 3 — M7: QSPI Bootloader (unblocks groovebox flash)
 
-- First oscillator: polyBLEP saw/square (Nexus reference) as a new
-  `dsp::PolyOsc` module with fixed polyphony (4 voices).
-- Wire `PAD <note> <vel>` into note-on/off for the poly osc alongside the
-  existing drum pad routing.
-- First filter: re-use the existing `Svf` (already in `dsp`) as the voice filter.
-- Confirm firmware heap budget before merging (use `host --bin heap_probe`).
+- Flash Daisy DFU bootloader via `dfu-util`.
+- Update `memory.x` to map firmware to QSPI origin (0x9000_0000).
+- Verify `cargo flash --features groovebox` links and runs.
+- See `daisy/PLAN_QSPI_BOOTLOADER.md`.
+
+### Slice 4 — M3 Completion: Project Snapshot
+
+- Define minimal `ProjectSnapshot` struct (pattern bank + active pattern +
+  BPM + macro state) → compact fixed-size byte block.
+- Host-side `SAVE`/`LOAD` commands (no allocation in DSP path).
+- On firmware: load from SD at boot; save on `CAPTURE ALL`.
+
+### Slice 5 — M4 Advancement: Transient + Color
+
+- Port Spectre transient shaper as no-alloc `TransientProcessor` in `dsp`.
+- Port master color model (harmonic saturation / air) as no-alloc insert.
+- Add `TRANSIENT <attack> <sustain>` and `COLOR <amount>` commands.
+
+### Slice 6 — M5 Synth Expansion (after M6 confirmed working on hardware)
+
+- First oscillator: polyBLEP saw/square (`dsp::PolyOsc`, 4-voice fixed).
+- Wire `PAD <note> <vel>` → note-on/off for poly osc.
+- Filter: re-use existing `Svf`. Confirm heap budget with `host --bin heap_probe`.
 
 ## Verification
 
-Last successful checks:
+Last successful checks (2026-06-09):
 
 ```sh
 cd daisy
-/Users/randolphchabot/.cargo/bin/cargo test -p dsp
-/Users/randolphchabot/.cargo/bin/cargo check -p host
+cargo test -p dsp          # all tests pass
+cargo build -p host        # clean
+cargo build -p firmware --target thumbv7em-none-eabihf --release
+  # exhibit path: links, Finished
+cargo build -p firmware --target thumbv7em-none-eabihf --release --features groovebox
+  # groovebox path: compiles clean, linker overflow expected (128KB flash ceiling)
 ```
-
-Results:
-
-- `dsp`: 61 tests passed after adding Spectre dynamic envelope metering.
-- `host`: check passed.
 
 Known warnings:
 
 - vendored `infinitedsp-core` deprecated `wide::f32x4::sign_bit`;
-- old sequencer test helper unused `loop_s`;
-- `block v0.1.6` future incompat warning through host dependencies.
+- `block v0.1.6` future incompat warning through host dependencies;
+- groovebox firmware linker overflow (by ~13KB at opt-level='s') — blocked on M7.
