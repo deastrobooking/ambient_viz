@@ -16,7 +16,9 @@ use alloc::vec::Vec;
 // delay's time/feedback, and `PingPongDelay` is the delay itself.
 pub use infinitedsp_core::core::audio_param::AudioParam;
 use infinitedsp_core::effects::dynamics::distortion::{Distortion, DistortionType};
+#[cfg(feature = "stab-delay")]
 pub use infinitedsp_core::effects::time::ping_pong_delay::PingPongDelay;
+#[cfg(feature = "reverb")]
 use infinitedsp_core::effects::time::reverb::Reverb;
 pub use infinitedsp_core::FrameProcessor;
 
@@ -77,15 +79,14 @@ pub struct Engine {
     stabs: fm_stab::FmStab,
     /// Mono scratch buffer for the summed stab output.
     stab_buf: Vec<f32>,
-    /// Stereo send buffer feeding the stab ping-pong delay. The dry stab is
-    /// panned hard left into this buffer so the cross-fed echoes bounce L↔R
-    /// (the classic Cybotron / Detroit-dub stab delay).
+    /// Stereo send buffer feeding the stab ping-pong delay.
+    #[cfg(feature = "stab-delay")]
     stab_send: Vec<f32>,
-    /// Ping-pong delay on the stab bus. Runs wet-only (`mix = 1.0`); its
-    /// output is the bouncing echoes alone, which we fold back into the master
-    /// *before* the reverb so each repeat trails off into the room.
+    /// Ping-pong delay on the stab bus.
+    #[cfg(feature = "stab-delay")]
     stab_delay: PingPongDelay,
     /// How much of the delay's wet echoes to fold into the master (0..1).
+    #[cfg(feature = "stab-delay")]
     stab_delay_wet: f32,
     /// Monophonic subtractive "rumble bass" — detuned saws + sub sine through a
     /// resonant LPF, gate-driven by the sequencer's bass lane. Rendered dry and
@@ -106,6 +107,7 @@ pub struct Engine {
     sequencer: sequencer::Sequencer,
     pattern_bank: sequencer::PatternBank,
     pending_pattern_slot: Option<usize>,
+    #[cfg(feature = "reverb")]
     reverb: Reverb,
     /// Resonant "bloom" bank — rings the pre-tape master into a fixed D Lydian
     /// chord, scaled by a "proximity" amount. Stands in for the exhibit's ToF
@@ -134,10 +136,12 @@ pub struct Engine {
     /// Master peak limiter on the summed (master + ghost) output.
     limiter: limiter::Limiter,
     /// Holds the dry sampler output across the reverb call so we can mix wet+dry.
+    #[cfg(feature = "reverb")]
     dry_scratch: Vec<f32>,
     /// Global sample index, fed to FrameProcessor::process for time-aware effects.
     sample_index: u64,
     /// 0.0 = fully dry, 1.0 = fully wet.
+    #[cfg(feature = "reverb")]
     reverb_wet: f32,
     /// When `false`, the step sequencer is not advanced and fires no kick /
     /// hat / stab triggers — the sampler, reverb, tape and bloom still run.
@@ -150,8 +154,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(sample_rate: f32) -> Self {
-        let mut reverb = Reverb::new();
-        reverb.set_sample_rate(sample_rate);
+        #[cfg(feature = "reverb")]
+        let mut reverb = {
+            let mut r = Reverb::new();
+            r.set_sample_rate(sample_rate);
+            r
+        };
 
         // Drive 2.0 ≈ tanh saturation that kicks in on peaks; subtle warmth,
         // not "obviously distorted". Bump drive on `kick_dist_mut()` for grit.
@@ -162,22 +170,20 @@ impl Engine {
         );
         kick_dist.set_sample_rate(sample_rate);
 
-        // Cybotron-style ping-pong on the stab bus: ~dotted-8th echoes
-        // (0.375 s) that bounce L↔R with enough feedback for a few audible
-        // repeats. `mix = 1.0` so the processed buffer carries *only* the wet
-        // echoes — we add them on top of the dry stab in the master.
-        //
-        // NOTE: the delay line allocates 2 × max_delay_s × sample_rate f32 from
-        // the global allocator. On the Daisy that's far larger than the current
-        // firmware heap — like the reverb, these buffers belong in SDRAM once
-        // the firmware audio path is wired. On the host it's free.
-        let mut stab_delay = PingPongDelay::new(
-            1.0,                        // max delay buffer, seconds
-            AudioParam::seconds(0.375), // dotted-8th-ish at techno tempo
-            AudioParam::linear(0.45),   // feedback → a few repeats
-            AudioParam::linear(1.0),    // mix = wet-only output
-        );
-        stab_delay.set_sample_rate(sample_rate);
+        // Cybotron-style ping-pong delay on the stab bus (host/reverb builds only).
+        // Allocates 2 × 1s × sample_rate f32 — too large for the Daisy AXI heap
+        // until SDRAM is mapped. Disabled via `default-features = false` in firmware.
+        #[cfg(feature = "stab-delay")]
+        let mut stab_delay = {
+            let mut d = PingPongDelay::new(
+                1.0,                        // max delay buffer, seconds
+                AudioParam::seconds(0.375), // dotted-8th-ish at techno tempo
+                AudioParam::linear(0.45),   // feedback → a few repeats
+                AudioParam::linear(1.0),    // mix = wet-only output
+            );
+            d.set_sample_rate(sample_rate);
+            d
+        };
 
         Self {
             sample_rate,
@@ -218,8 +224,11 @@ impl Engine {
                 s
             },
             stab_buf: Vec::new(),
+            #[cfg(feature = "stab-delay")]
             stab_send: Vec::new(),
+            #[cfg(feature = "stab-delay")]
             stab_delay,
+            #[cfg(feature = "stab-delay")]
             stab_delay_wet: 0.5,
             bass: bass::RumbleBass::new(sample_rate),
             bass_buf: Vec::new(),
@@ -230,6 +239,7 @@ impl Engine {
             sequencer: sequencer::Sequencer::new(sample_rate),
             pattern_bank: sequencer::PatternBank::new(),
             pending_pattern_slot: None,
+            #[cfg(feature = "reverb")]
             reverb,
             bloom: bloom::BloomBank::new(sample_rate),
             spectre_filter: spectre_filter::MasterFilter::new(sample_rate),
@@ -242,10 +252,10 @@ impl Engine {
             glitch_tape: freeze::GlitchTape::new(sample_rate),
             freeze_send: Vec::new(),
             limiter: limiter::Limiter::new(sample_rate),
+            #[cfg(feature = "reverb")]
             dry_scratch: Vec::new(),
             sample_index: 0,
-            // A wash of room by default — the cold, spacious Cybotron air. Dial
-            // with `set_reverb_wet` / the ReverbWet CC.
+            #[cfg(feature = "reverb")]
             reverb_wet: 0.18,
             sequencer_enabled: true,
             selected_track: Track::Kick,
@@ -271,6 +281,7 @@ impl Engine {
         self.sampler.stop();
     }
 
+    #[cfg(feature = "reverb")]
     pub fn set_reverb_wet(&mut self, wet: f32) {
         self.reverb_wet = wet.clamp(0.0, 1.0);
     }
@@ -304,19 +315,23 @@ impl Engine {
     }
 
     /// Mutable access to the stab ping-pong delay (delay time / feedback / mix).
+    #[cfg(feature = "stab-delay")]
     pub fn stab_delay_mut(&mut self) -> &mut PingPongDelay {
         &mut self.stab_delay
     }
 
     /// How much of the stab delay's wet echoes is folded into the master (0..1).
+    #[cfg(feature = "stab-delay")]
     pub fn set_stab_delay_wet(&mut self, wet: f32) {
         self.stab_delay_wet = wet.clamp(0.0, 1.0);
     }
+    #[cfg(feature = "stab-delay")]
     pub fn stab_delay_wet(&self) -> f32 {
         self.stab_delay_wet
     }
 
     /// Mutable access to the reverb (room size, damping).
+    #[cfg(feature = "reverb")]
     pub fn reverb_mut(&mut self) -> &mut Reverb {
         &mut self.reverb
     }
@@ -616,10 +631,14 @@ impl Engine {
                     .set_amount(if v > 0.85 { (v - 0.85) / 0.15 } else { 0.0 });
             }
             Macro::Space => {
-                self.reverb_wet = 0.05 + v * 0.45;
-                self.stab_delay_wet = v;
-                self.stab_delay
-                    .set_feedback(AudioParam::linear(0.2 + v * 0.55));
+                #[cfg(feature = "reverb")]
+                { self.reverb_wet = 0.05 + v * 0.45; }
+                #[cfg(feature = "stab-delay")]
+                {
+                    self.stab_delay_wet = v;
+                    self.stab_delay
+                        .set_feedback(AudioParam::linear(0.2 + v * 0.55));
+                }
                 self.bloom.set_amount(v);
             }
             Macro::Tone => {
@@ -731,7 +750,10 @@ impl Engine {
             Param::KickAttackFm => self.kick.set_attack_fm_amount(value),
             Param::KickSelfFm => self.kick.set_self_fm_amount(value),
             Param::KickDistDrive => self.kick_dist.set_drive(AudioParam::linear(value)),
-            Param::ReverbWet => self.reverb_wet = value.clamp(0.0, 1.0),
+            Param::ReverbWet => {
+                #[cfg(feature = "reverb")]
+                { self.reverb_wet = value.clamp(0.0, 1.0); }
+            }
             Param::StabGain => self.stabs.set_gain(value),
             Param::StabIndex => self.stabs.set_index(value),
             Param::StabDecay => self.stabs.set_decay(value),
@@ -739,13 +761,18 @@ impl Engine {
             Param::StabFeedback => self.stabs.set_feedback(value),
             Param::StabDrive => self.stabs.set_drive(value),
             Param::TapeFailure => self.tape.set_failure(value),
-            Param::StabDelayWet => self.stab_delay_wet = value.clamp(0.0, 1.0),
-            Param::StabDelayFeedback => self
-                .stab_delay
-                .set_feedback(AudioParam::linear(value.clamp(0.0, 0.95))),
-            Param::StabDelayTime => self
-                .stab_delay
-                .set_delay_time(AudioParam::seconds(value.max(0.0))),
+            Param::StabDelayWet => {
+                #[cfg(feature = "stab-delay")]
+                { self.stab_delay_wet = value.clamp(0.0, 1.0); }
+            }
+            Param::StabDelayFeedback => {
+                #[cfg(feature = "stab-delay")]
+                { self.stab_delay.set_feedback(AudioParam::linear(value.clamp(0.0, 0.95))); }
+            }
+            Param::StabDelayTime => {
+                #[cfg(feature = "stab-delay")]
+                { self.stab_delay.set_delay_time(AudioParam::seconds(value.max(0.0))); }
+            }
             Param::BassCutoff => self.bass.set_cutoff(value),
             Param::BassRes => self.bass.set_resonance(value),
             Param::BassEnvMod => self.bass.set_env_mod(value),
@@ -774,6 +801,7 @@ impl Engine {
         self.kick_buf.resize(n_frames, 0.0);
         self.hihat_buf.resize(n_frames, 0.0);
         self.stab_buf.resize(n_frames, 0.0);
+        #[cfg(feature = "stab-delay")]
         self.stab_send.resize(output.len(), 0.0);
         self.bass_buf.resize(n_frames, 0.0);
         for i in 0..n_frames {
@@ -810,10 +838,12 @@ impl Engine {
             }
             let st = self.stabs.tick();
             self.stab_buf[i] = st;
-            // Feed the delay send on the left only; the cross-feedback makes
-            // the echoes ping-pong across the stereo field.
-            self.stab_send[2 * i] = st;
-            self.stab_send[2 * i + 1] = 0.0;
+            // Feed the delay send on the left only (when stab-delay is enabled).
+            #[cfg(feature = "stab-delay")]
+            {
+                self.stab_send[2 * i] = st;
+                self.stab_send[2 * i + 1] = 0.0;
+            }
 
             // Rumble bass — gate events drive the mono voice's envelope.
             match evt.bass {
@@ -841,28 +871,28 @@ impl Engine {
             out_frame[1] += kick_mix + hat_mix + st;
         }
 
-        // 2b. Ping-pong delay on the stab send (wet-only) — fold the bouncing
-        //     echoes into the master *before* the reverb so each repeat trails
-        //     off into the room. Cybotron in a box.
-        self.stab_delay
-            .process(&mut self.stab_send, self.sample_index);
-        let delay_wet = self.stab_delay_wet;
-        for (out, &w) in output.iter_mut().zip(self.stab_send.iter()) {
-            *out += w * delay_wet;
+        // 2b. Ping-pong stab delay (disabled when `stab-delay` feature is off).
+        #[cfg(feature = "stab-delay")]
+        {
+            self.stab_delay
+                .process(&mut self.stab_send, self.sample_index);
+            let delay_wet = self.stab_delay_wet;
+            for (out, &w) in output.iter_mut().zip(self.stab_send.iter()) {
+                *out += w * delay_wet;
+            }
         }
 
-        // 3. Stash the dry signal so we can blend wet+dry after the reverb runs.
-        self.dry_scratch.resize(output.len(), 0.0);
-        self.dry_scratch.copy_from_slice(output);
-
-        // 3. Reverb replaces output with its fully-wet signal, in place.
-        self.reverb.process(output, self.sample_index);
-
-        // 4. Blend.
-        let dry_gain = 1.0 - self.reverb_wet;
-        let wet_gain = self.reverb_wet;
-        for (out, &dry) in output.iter_mut().zip(self.dry_scratch.iter()) {
-            *out = dry * dry_gain + *out * wet_gain;
+        // 3. Reverb wet+dry blend (disabled when `reverb` feature is off).
+        #[cfg(feature = "reverb")]
+        {
+            self.dry_scratch.resize(output.len(), 0.0);
+            self.dry_scratch.copy_from_slice(output);
+            self.reverb.process(output, self.sample_index);
+            let dry_gain = 1.0 - self.reverb_wet;
+            let wet_gain = self.reverb_wet;
+            for (out, &dry) in output.iter_mut().zip(self.dry_scratch.iter()) {
+                *out = dry * dry_gain + *out * wet_gain;
+            }
         }
 
         // 5b. Resonant "bloom" bank — taps the pre-tape master, rings the

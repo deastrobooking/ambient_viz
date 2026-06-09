@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "Audio + MIDI core for ambient-viz-daisy. no_std, runs on both Daisy and Mac."
 
+[features]
+# Both on by default — the macOS host uses them freely.
+# The embedded firmware turns them off (`default-features = false`) until
+# SDRAM allocation is confirmed: Reverb buffers and a 1-second PingPongDelay
+# each consume hundreds of KB that don't fit in the current 504 KB AXI heap.
+default = ["reverb", "stab-delay"]
+reverb = []
+stab-delay = []
+
 [dependencies]
 # DaisySP-equivalent no_std DSP library (reverbs, filters, delays, distortion,
 # modulation, oscillators, etc.). Requires alloc — firmware crate provides a

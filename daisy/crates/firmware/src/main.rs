@@ -26,7 +26,9 @@ use dsp::freeze::{self, Freeze, GlitchTape};
 use dsp::limiter::Limiter;
 use dsp::tape::TapeProcessor;
 #[cfg(feature = "bell")]
-use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _, PingPongDelay};
+use dsp::{AudioParam, FmPatch, FmStab, FrameProcessor as _};
+#[cfg(feature = "groovebox")]
+use dsp::{Engine, GrooveEvent, groove::parse_line, timeline};
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::join::join;
 use embassy_futures::yield_now;
@@ -236,221 +238,431 @@ async fn main(spawner: Spawner) {
     // the executor boundary — only the Send AudioPeripherals + Consumer do.
     let audio_peripherals = board.audio_peripherals;
 
-    let sdcard = sd::build_sd_card(
-        p.SPI1,
-        board.pins.d8,  // PG11 / SCK
-        board.pins.d10, // PB5  / MOSI
-        board.pins.d9,  // PB4  / MISO
-        board.pins.d7,  // PG10 / CS
-    );
+    // ── EXHIBIT pipeline: SD → tape → limiter → USB ──────────────────────────
+    #[cfg(not(feature = "groovebox"))]
+    {
+        let sdcard = sd::build_sd_card(
+            p.SPI1,
+            board.pins.d8,  // PG11 / SCK
+            board.pins.d10, // PB5  / MOSI
+            board.pins.d9,  // PB4  / MISO
+            board.pins.d7,  // PG10 / CS
+        );
 
-    // Acquire at the slow init clock, retrying a few times — cold-boot supply +
-    // card settling makes the first attempt flaky on the crowded breakout. Then
-    // bump to full speed for streaming.
-    let mut sd_ok = false;
-    for attempt in 1..=5u8 {
-        if sdcard.num_bytes().is_ok() {
-            sd_ok = true;
-            break;
+        // Acquire at the slow init clock, retrying a few times — cold-boot supply +
+        // card settling makes the first attempt flaky on the crowded breakout. Then
+        // bump to full speed for streaming.
+        let mut sd_ok = false;
+        for attempt in 1..=5u8 {
+            if sdcard.num_bytes().is_ok() {
+                sd_ok = true;
+                break;
+            }
+            dbg_uart!("SD: init attempt {} failed, retrying", attempt);
+            sdcard.mark_card_uninit();
+            Timer::after_millis(100).await;
         }
-        dbg_uart!("SD: init attempt {} failed, retrying", attempt);
-        sdcard.mark_card_uninit();
-        Timer::after_millis(100).await;
+        if !sd_ok {
+            dbg_uart!("SD: no card / init failed after 5 tries (blink 1)");
+            blink_code(&mut led, 1).await;
+        }
+        sd::set_fast(&sdcard);
+        dbg_uart!("SD: acquired at 400kHz, SPI -> 24MHz for streaming");
+        let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
+        // Retry the FAT mount + open the same way as the acquire: a marginal MBR /
+        // boot-sector / FAT read on cold boot can fail any of these (blink 2/3) even
+        // though the card acquired fine, and a re-read after a short settle recovers
+        // without a power cycle. Each step retries independently; the label-break-
+        // value keeps the borrow chain (volume <- root <- file) intact on success.
+        let volume = 'mount: {
+            for _ in 0..5 {
+                if let Ok(v) = volume_mgr.open_volume(VolumeIdx(0)) {
+                    break 'mount v;
+                }
+                Timer::after_millis(100).await;
+            }
+            dbg_uart!("SD: FAT volume mount failed after retries (blink 2)");
+            blink_code(&mut led, 2).await
+        };
+        let root = 'root: {
+            for _ in 0..5 {
+                if let Ok(r) = volume.open_root_dir() {
+                    break 'root r;
+                }
+                Timer::after_millis(100).await;
+            }
+            dbg_uart!("SD: open root dir failed after retries (blink 2)");
+            blink_code(&mut led, 2).await
+        };
+        let file = 'open: {
+            for _ in 0..5 {
+                if let Ok(f) = root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
+                    break 'open f;
+                }
+                Timer::after_millis(100).await;
+            }
+            dbg_uart!("SD: AMBIENT.RAW open failed after retries (blink 3)");
+            blink_code(&mut led, 3).await
+        };
+        dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
+        // Loop length in stereo frames (4 bytes/frame) for CDC position wrap.
+        let loop_frames = (file.length() / 4) as u64;
+
+        let q = RING.init(Queue::new());
+        let (mut producer, consumer) = q.split();
+        let usb_q = USB_RING.init(Queue::new());
+        let (usb_producer, usb_consumer) = usb_q.split();
+
+        // Spawn the audio consumer on the high-priority interrupt executor.
+        interrupt::UART4.set_priority(Priority::P6);
+        let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
+        audio_spawner.must_spawn(audio_task(
+            audio_peripherals,
+            consumer,
+            usb_producer,
+            usb_cdc::MIDI_CHANNEL.receiver(),
+        ));
+        dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
+
+        // --- USB: composite UAC1 audio source + CDC ACM over OTG-FS -------------
+        // 512-byte config descriptor: UAC source + CDC won't fit the default 256.
+        static CONFIG_DESC: StaticCell<[u8; 512]> = StaticCell::new();
+        static BOS_DESC: StaticCell<[u8; 32]> = StaticCell::new();
+        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static EP_OUT: StaticCell<[u8; usb_audio::EP_OUT_BUF]> = StaticCell::new();
+        static UAC_HANDLER: StaticCell<uac_source::AudioSourceControlHandler> =
+            StaticCell::new();
+
+        let mut usb_cfg = embassy_stm32::usb::Config::default();
+        usb_cfg.vbus_detection = false; // safe default; Daisy is bus-powered
+        let usb_driver = embassy_stm32::usb::Driver::new_fs(
+            board.usb_peripherals.usb_otg_fs,
+            usb_audio::Irqs,
+            board.usb_peripherals.pins.DP,
+            board.usb_peripherals.pins.DN,
+            EP_OUT.init([0u8; usb_audio::EP_OUT_BUF]),
+            usb_cfg,
+        );
+
+        // VID 0x1209 = pid.codes (hobby space). PID 0xDA15 instead of the 0x0001
+        // "Test PID": 0x0001 is in usb.ids, so Linux/PipeWire names the device
+        // "pid.codes Test PID" from the database rather than our product string. An
+        // unallocated PID has no usb.ids entry, so the name falls back to `product`.
+        let mut dev_cfg = embassy_usb::Config::new(0x1209, 0xDA15);
+        dev_cfg.manufacturer = Some("ambient-viz");
+        dev_cfg.product = Some("Daisy audio source");
+        dev_cfg.serial_number = Some("0001");
+        // IAD device class so the (future) composite UAC + CDC enumerates cleanly.
+        dev_cfg.device_class = 0xEF;
+        dev_cfg.device_sub_class = 0x02;
+        dev_cfg.device_protocol = 0x01;
+        dev_cfg.composite_with_iads = true;
+
+        let mut usb_builder = embassy_usb::Builder::new(
+            usb_driver,
+            dev_cfg,
+            CONFIG_DESC.init([0; 512]),
+            BOS_DESC.init([0; 32]),
+            &mut [],
+            CONTROL_BUF.init([0; 64]),
+        );
+
+        let (uac_audio_ep, _uac_feedback_ep, uac_handler) = uac_source::AudioSource::new(
+            &mut usb_builder,
+            &usb_audio::SAMPLE_RATES,
+            embassy_usb::class::uac1::SampleWidth::Width2Byte,
+            usb_audio::FEEDBACK_REFRESH_MS,
+        );
+        usb_builder.handler(UAC_HANDLER.init(uac_handler));
+
+        // CDC ACM in the same composite: full-duplex. Split into a sender
+        // (song-position out, Phase C) and a receiver (inbound sensor/freeze MIDI
+        // from the Pi → MIDI_CHANNEL → the audio task, Phase E).
+        static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
+        let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
+        let (cdc_tx, cdc_rx) = cdc.split();
+
+        let usb_device = usb_builder.build();
+        // Keep USB below the audio interrupt executor (P6) so OTG IRQs can't preempt
+        // the audio callback mid-write and starve the SAI (glitches). USB tolerates
+        // the ~callback-length delay; audio must not.
+        interrupt::OTG_FS.set_priority(Priority::P7);
+        spawner.must_spawn(usb_audio::usb_task(usb_device));
+        spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
+        spawner.must_spawn(usb_cdc::position_emit_task(cdc_tx, loop_frames));
+        spawner.must_spawn(usb_cdc::midi_in_task(cdc_rx));
+        dbg_uart!("usb: UAC source + CDC position built + tasks spawned");
+
+        // Chip-temperature telemetry on the thread executor (lowest priority, below
+        // the P6 audio interrupt executor), so its ~20 µs ADC busy-wait every 5 s is
+        // preempted by the audio callback and never glitches the SAI. Debug-only.
+        #[cfg(feature = "debug-uart")]
+        spawner.must_spawn(temp::temp_task(p.ADC3));
+
+        // Producer + heartbeat on the thread executor. Blocking SD reads here can
+        // no longer glitch the audio — the interrupt executor preempts them.
+        let heartbeat = async {
+            loop {
+                // TEMP DIAG: real-time-health readout on the LED (prod has no UART).
+                // PER-INTERVAL, not latching: we read-and-RESET SAI_ERR each beat, so
+                // a one-off startup underrun shows fast for a single beat then calms.
+                // Fast (150 ms) = the audio callback underran in the LAST interval.
+                // Reading: at idle (just the bed) it should settle to the calm 1 s
+                // pulse; if it stays fast at idle, even tape+bell overruns. Trigger
+                // the voice — if it goes fast only then, the voice is the CPU hog.
+                let period = if SAI_ERR.swap(0, Ordering::Relaxed) > 0 {
+                    150
+                } else {
+                    1000
+                };
+                led.on();
+                Timer::after_millis(period).await;
+                led.off();
+                Timer::after_millis(period).await;
+                // Safe now that dbg_uart writes per-byte (≤87 µs CS, not ~6 ms).
+                // cb_full spikes ~730 us on loss-FIR rebuild blocks but they're
+                // isolated; sai_err (SAI underruns) is the real health metric.
+                dbg_uart!(
+                    "diag: cb_full {} us | sai_err {} sd_under {} | peak {} | usb_drop {} usb_pktmax {}",
+                    CB_FULL_US.swap(0, Ordering::Relaxed),
+                    SAI_ERR.swap(0, Ordering::Relaxed),
+                    SD_UNDERRUN.swap(0, Ordering::Relaxed),
+                    OUT_PEAK_MILLI.swap(0, Ordering::Relaxed),
+                    USB_DROP.swap(0, Ordering::Relaxed),
+                    USB_PKT_MAX_FR.swap(0, Ordering::Relaxed),
+                );
+            }
+        };
+        let reader = async {
+            let mut block = [0u8; 512];
+            loop {
+                if file.is_eof() {
+                    let _ = file.seek_from_start(0);
+                }
+                let n = file.read(&mut block).unwrap_or(0);
+                if n == 0 {
+                    let _ = file.seek_from_start(0);
+                    yield_now().await;
+                    continue;
+                }
+                let mut i = 0;
+                while i + 1 < n {
+                    let s = i16::from_le_bytes([block[i], block[i + 1]]);
+                    while producer.enqueue(s).is_err() {
+                        yield_now().await;
+                    }
+                    i += 2;
+                }
+                yield_now().await;
+            }
+        };
+        join(heartbeat, reader).await;
     }
-    if !sd_ok {
-        dbg_uart!("SD: no card / init failed after 5 tries (blink 1)");
-        blink_code(&mut led, 1).await;
-    }
-    sd::set_fast(&sdcard);
-    dbg_uart!("SD: acquired at 400kHz, SPI -> 24MHz for streaming");
-    let volume_mgr = VolumeManager::new(sdcard, sd::ZeroTime);
-    // Retry the FAT mount + open the same way as the acquire: a marginal MBR /
-    // boot-sector / FAT read on cold boot can fail any of these (blink 2/3) even
-    // though the card acquired fine, and a re-read after a short settle recovers
-    // without a power cycle. Each step retries independently; the label-break-
-    // value keeps the borrow chain (volume <- root <- file) intact on success.
-    let volume = 'mount: {
-        for _ in 0..5 {
-            if let Ok(v) = volume_mgr.open_volume(VolumeIdx(0)) {
-                break 'mount v;
-            }
-            Timer::after_millis(100).await;
-        }
-        dbg_uart!("SD: FAT volume mount failed after retries (blink 2)");
-        blink_code(&mut led, 2).await
-    };
-    let root = 'root: {
-        for _ in 0..5 {
-            if let Ok(r) = volume.open_root_dir() {
-                break 'root r;
-            }
-            Timer::after_millis(100).await;
-        }
-        dbg_uart!("SD: open root dir failed after retries (blink 2)");
-        blink_code(&mut led, 2).await
-    };
-    let file = 'open: {
-        for _ in 0..5 {
-            if let Ok(f) = root.open_file_in_dir("AMBIENT.RAW", Mode::ReadOnly) {
-                break 'open f;
-            }
-            Timer::after_millis(100).await;
-        }
-        dbg_uart!("SD: AMBIENT.RAW open failed after retries (blink 3)");
-        blink_code(&mut led, 3).await
-    };
-    dbg_uart!("SD: streaming AMBIENT.RAW, {} bytes", file.length());
-    // Loop length in stereo frames (4 bytes/frame) for CDC position wrap.
-    let loop_frames = (file.length() / 4) as u64;
 
-    let q = RING.init(Queue::new());
-    let (mut producer, consumer) = q.split();
-    let usb_q = USB_RING.init(Queue::new());
-    let (usb_producer, usb_consumer) = usb_q.split();
+    // ── GROOVEBOX pipeline: dsp::Engine → CDC GrooveEvent → SAI + USB ────────
+    #[cfg(feature = "groovebox")]
+    {
+        let usb_q = USB_RING.init(Queue::new());
+        let (usb_producer, usb_consumer) = usb_q.split();
 
-    // Spawn the audio consumer on the high-priority interrupt executor.
-    interrupt::UART4.set_priority(Priority::P6);
-    let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
-    audio_spawner.must_spawn(audio_task(
-        audio_peripherals,
-        consumer,
-        usb_producer,
-        usb_cdc::MIDI_CHANNEL.receiver(),
-    ));
-    dbg_uart!("audio: task spawned (interrupt executor, UART4/P6)");
+        // Spawn the Engine audio task on the high-priority interrupt executor.
+        interrupt::UART4.set_priority(Priority::P6);
+        let audio_spawner = AUDIO_EXEC.start(interrupt::UART4);
+        audio_spawner.must_spawn(groovebox_audio_task(
+            audio_peripherals,
+            usb_producer,
+            usb_cdc::GROOVE_CHANNEL.receiver(),
+        ));
+        dbg_uart!("audio: groovebox task spawned (interrupt executor, UART4/P6)");
 
-    // --- USB: composite UAC1 audio source + CDC ACM over OTG-FS -------------
-    // 512-byte config descriptor: UAC source + CDC won't fit the default 256.
-    static CONFIG_DESC: StaticCell<[u8; 512]> = StaticCell::new();
-    static BOS_DESC: StaticCell<[u8; 32]> = StaticCell::new();
-    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-    static EP_OUT: StaticCell<[u8; usb_audio::EP_OUT_BUF]> = StaticCell::new();
-    static UAC_HANDLER: StaticCell<uac_source::AudioSourceControlHandler> = StaticCell::new();
+        // --- USB: same composite as the exhibit path ----------------------------
+        static CONFIG_DESC: StaticCell<[u8; 512]> = StaticCell::new();
+        static BOS_DESC: StaticCell<[u8; 32]> = StaticCell::new();
+        static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static EP_OUT: StaticCell<[u8; usb_audio::EP_OUT_BUF]> = StaticCell::new();
+        static UAC_HANDLER: StaticCell<uac_source::AudioSourceControlHandler> =
+            StaticCell::new();
 
-    let mut usb_cfg = embassy_stm32::usb::Config::default();
-    usb_cfg.vbus_detection = false; // safe default; Daisy is bus-powered
-    let usb_driver = embassy_stm32::usb::Driver::new_fs(
-        board.usb_peripherals.usb_otg_fs,
-        usb_audio::Irqs,
-        board.usb_peripherals.pins.DP,
-        board.usb_peripherals.pins.DN,
-        EP_OUT.init([0u8; usb_audio::EP_OUT_BUF]),
-        usb_cfg,
-    );
+        let mut usb_cfg = embassy_stm32::usb::Config::default();
+        usb_cfg.vbus_detection = false;
+        let usb_driver = embassy_stm32::usb::Driver::new_fs(
+            board.usb_peripherals.usb_otg_fs,
+            usb_audio::Irqs,
+            board.usb_peripherals.pins.DP,
+            board.usb_peripherals.pins.DN,
+            EP_OUT.init([0u8; usb_audio::EP_OUT_BUF]),
+            usb_cfg,
+        );
 
-    // VID 0x1209 = pid.codes (hobby space). PID 0xDA15 instead of the 0x0001
-    // "Test PID": 0x0001 is in usb.ids, so Linux/PipeWire names the device
-    // "pid.codes Test PID" from the database rather than our product string. An
-    // unallocated PID has no usb.ids entry, so the name falls back to `product`.
-    let mut dev_cfg = embassy_usb::Config::new(0x1209, 0xDA15);
-    dev_cfg.manufacturer = Some("ambient-viz");
-    dev_cfg.product = Some("Daisy audio source");
-    dev_cfg.serial_number = Some("0001");
-    // IAD device class so the (future) composite UAC + CDC enumerates cleanly.
-    dev_cfg.device_class = 0xEF;
-    dev_cfg.device_sub_class = 0x02;
-    dev_cfg.device_protocol = 0x01;
-    dev_cfg.composite_with_iads = true;
+        let mut dev_cfg = embassy_usb::Config::new(0x1209, 0xDA15);
+        dev_cfg.manufacturer = Some("ambient-viz");
+        dev_cfg.product = Some("Daisy groovebox");
+        dev_cfg.serial_number = Some("0002");
+        dev_cfg.device_class = 0xEF;
+        dev_cfg.device_sub_class = 0x02;
+        dev_cfg.device_protocol = 0x01;
+        dev_cfg.composite_with_iads = true;
 
-    let mut usb_builder = embassy_usb::Builder::new(
-        usb_driver,
-        dev_cfg,
-        CONFIG_DESC.init([0; 512]),
-        BOS_DESC.init([0; 32]),
-        &mut [],
-        CONTROL_BUF.init([0; 64]),
-    );
+        let mut usb_builder = embassy_usb::Builder::new(
+            usb_driver,
+            dev_cfg,
+            CONFIG_DESC.init([0; 512]),
+            BOS_DESC.init([0; 32]),
+            &mut [],
+            CONTROL_BUF.init([0; 64]),
+        );
 
-    let (uac_audio_ep, _uac_feedback_ep, uac_handler) = uac_source::AudioSource::new(
-        &mut usb_builder,
-        &usb_audio::SAMPLE_RATES,
-        embassy_usb::class::uac1::SampleWidth::Width2Byte,
-        usb_audio::FEEDBACK_REFRESH_MS,
-    );
-    usb_builder.handler(UAC_HANDLER.init(uac_handler));
+        let (uac_audio_ep, _uac_feedback_ep, uac_handler) = uac_source::AudioSource::new(
+            &mut usb_builder,
+            &usb_audio::SAMPLE_RATES,
+            embassy_usb::class::uac1::SampleWidth::Width2Byte,
+            usb_audio::FEEDBACK_REFRESH_MS,
+        );
+        usb_builder.handler(UAC_HANDLER.init(uac_handler));
 
-    // CDC ACM in the same composite: full-duplex. Split into a sender
-    // (song-position out, Phase C) and a receiver (inbound sensor/freeze MIDI
-    // from the Pi → MIDI_CHANNEL → the audio task, Phase E).
-    static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
-    let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
-    let (cdc_tx, cdc_rx) = cdc.split();
+        static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
+        let cdc = CdcAcmClass::new(&mut usb_builder, CDC_STATE.init(CdcState::new()), 64);
+        let (cdc_tx, cdc_rx) = cdc.split();
 
-    let usb_device = usb_builder.build();
-    // Keep USB below the audio interrupt executor (P6) so OTG IRQs can't preempt
-    // the audio callback mid-write and starve the SAI (glitches). USB tolerates
-    // the ~callback-length delay; audio must not.
-    interrupt::OTG_FS.set_priority(Priority::P7);
-    spawner.must_spawn(usb_audio::usb_task(usb_device));
-    spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
-    spawner.must_spawn(usb_cdc::position_emit_task(cdc_tx, loop_frames));
-    spawner.must_spawn(usb_cdc::midi_in_task(cdc_rx));
-    dbg_uart!("usb: UAC source + CDC position built + tasks spawned");
+        let usb_device = usb_builder.build();
+        interrupt::OTG_FS.set_priority(Priority::P7);
+        spawner.must_spawn(usb_audio::usb_task(usb_device));
+        spawner.must_spawn(usb_audio::stream_task(uac_audio_ep, usb_consumer));
+        // Position is PLAYED_FRAMES-derived (same as exhibit); no loop-wrap RESET
+        // since the Engine has no fixed loop length — pass 0 to skip wrap logic.
+        spawner.must_spawn(usb_cdc::position_emit_task(cdc_tx, 0));
+        spawner.must_spawn(usb_cdc::groove_in_task(cdc_rx));
+        dbg_uart!("usb: UAC source + CDC groove built + tasks spawned");
 
-    // Chip-temperature telemetry on the thread executor (lowest priority, below
-    // the P6 audio interrupt executor), so its ~20 µs ADC busy-wait every 5 s is
-    // preempted by the audio callback and never glitches the SAI. Debug-only.
-    #[cfg(feature = "debug-uart")]
-    spawner.must_spawn(temp::temp_task(p.ADC3));
+        #[cfg(feature = "debug-uart")]
+        spawner.must_spawn(temp::temp_task(p.ADC3));
 
-    // Producer + heartbeat on the thread executor. Blocking SD reads here can
-    // no longer glitch the audio — the interrupt executor preempts them.
-    let heartbeat = async {
+        // Heartbeat only — no SD reader.
         loop {
-            // TEMP DIAG: real-time-health readout on the LED (prod has no UART).
-            // PER-INTERVAL, not latching: we read-and-RESET SAI_ERR each beat, so
-            // a one-off startup underrun shows fast for a single beat then calms.
-            // Fast (150 ms) = the audio callback underran in the LAST interval.
-            // Reading: at idle (just the bed) it should settle to the calm 1 s
-            // pulse; if it stays fast at idle, even tape+bell overruns. Trigger
-            // the voice — if it goes fast only then, the voice is the CPU hog.
-            let period = if SAI_ERR.swap(0, Ordering::Relaxed) > 0 {
-                150
-            } else {
-                1000
-            };
+            let sai = SAI_ERR.swap(0, Ordering::Relaxed);
+            let period = if sai > 0 { 150 } else { 1000 };
             led.on();
             Timer::after_millis(period).await;
             led.off();
             Timer::after_millis(period).await;
-            // Safe now that dbg_uart writes per-byte (≤87 µs CS, not ~6 ms).
-            // cb_full spikes ~730 us on loss-FIR rebuild blocks but they're
-            // isolated; sai_err (SAI underruns) is the real health metric.
             dbg_uart!(
-                "diag: cb_full {} us | sai_err {} sd_under {} | peak {} | usb_drop {} usb_pktmax {}",
+                "diag: cb_full {} us | sai_err {} | peak {} | usb_drop {} usb_pktmax {}",
                 CB_FULL_US.swap(0, Ordering::Relaxed),
-                SAI_ERR.swap(0, Ordering::Relaxed),
-                SD_UNDERRUN.swap(0, Ordering::Relaxed),
+                sai,
                 OUT_PEAK_MILLI.swap(0, Ordering::Relaxed),
                 USB_DROP.swap(0, Ordering::Relaxed),
                 USB_PKT_MAX_FR.swap(0, Ordering::Relaxed),
             );
         }
-    };
-    let reader = async {
-        let mut block = [0u8; 512];
-        loop {
-            if file.is_eof() {
-                let _ = file.seek_from_start(0);
-            }
-            let n = file.read(&mut block).unwrap_or(0);
-            if n == 0 {
-                let _ = file.seek_from_start(0);
-                yield_now().await;
-                continue;
-            }
-            let mut i = 0;
-            while i + 1 < n {
-                let s = i16::from_le_bytes([block[i], block[i + 1]]);
-                while producer.enqueue(s).is_err() {
-                    yield_now().await;
-                }
-                i += 2;
-            }
-            yield_now().await;
+    }
+}
+
+/// Groovebox audio task — on the interrupt executor (UART4/P6).
+///
+/// Instantiates `dsp::Engine`, loads a default drum pattern, then renders the
+/// Engine per SAI callback.  Inbound CDC lines are decoded off-RT by
+/// `usb_cdc::groove_in_task` and forwarded here through `GROOVE_CHANNEL`;
+/// we drain the channel at the start of every callback so events are applied
+/// before the block is rendered (≤ one-block latency).
+#[cfg(feature = "groovebox")]
+#[embassy_executor::task]
+async fn groovebox_audio_task(
+    audio: AudioPeripherals<'static>,
+    mut usb_producer: Producer<'static, i16, USB_RING_LEN>,
+    groove_rx: usb_cdc::GrooveRx,
+) {
+    // Engine allocates on the AXI heap at construction time (filter banks,
+    // pattern data, etc.).  No per-callback allocation once running.
+    let mut engine = Engine::new(SAMPLE_RATE);
+    engine
+        .sequencer_mut()
+        .set_tempo(timeline::fixed_bpm(120.0), 8.0);
+
+    // Default pattern: 4-on-the-floor kick, hi-hat every 8th note, open hat on 3.
+    for cmd in &[
+        "TOGGLE kick 0",
+        "TOGGLE kick 4",
+        "TOGGLE kick 8",
+        "TOGGLE kick 12",
+        "TOGGLE chat 0",
+        "TOGGLE chat 2",
+        "TOGGLE chat 4",
+        "TOGGLE chat 6",
+        "TOGGLE chat 8",
+        "TOGGLE chat 10",
+        "TOGGLE chat 12",
+        "TOGGLE chat 14",
+        "TOGGLE ohat 8",
+        "PLAY 1",
+    ] {
+        if let Ok(evt) = parse_line(cmd) {
+            engine.handle_groove_event(evt);
+        }
+    }
+
+    let interface = audio.prepare_interface(Default::default()).await;
+    let mut interface = match interface.start_interface().await {
+        Ok(i) => i,
+        Err(_) => {
+            dbg_uart!("audio: groovebox start_interface FAILED");
+            return;
         }
     };
-    join(heartbeat, reader).await;
+    dbg_uart!(
+        "audio: groovebox ready | heap used {} KB, free {} KB of {} KB",
+        HEAP.used() / 1024,
+        HEAP.free() / 1024,
+        HEAP_SIZE / 1024
+    );
+
+    loop {
+        let _ = interface
+            .start_callback(|_input, output| {
+                let cb_t = embassy_time::Instant::now();
+                let n = output.len().min(HALF_DMA_BUFFER_LENGTH);
+                let mut buf = [0.0f32; HALF_DMA_BUFFER_LENGTH];
+
+                // Apply all queued GrooveEvents before rendering this block.
+                while let Ok(evt) = groove_rx.try_receive() {
+                    engine.handle_groove_event(evt);
+                }
+
+                engine.process(&[], &mut buf[..n]);
+
+                let mut pk = 0.0f32;
+                for &s in buf[..n].iter() {
+                    let a = if s < 0.0 { -s } else { s };
+                    if a > pk {
+                        pk = a;
+                    }
+                }
+                OUT_PEAK_MILLI.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
+
+                // f32 → SAI 24-bit + USB capture tee (same as audio_task).
+                let usb_capturing = USB_CAPTURING.load(Ordering::Relaxed);
+                let mut usb_dropped = 0u32;
+                for (i, frame) in output[..n].chunks_mut(2).enumerate() {
+                    let l = buf[2 * i];
+                    let r = buf[2 * i + 1];
+                    frame[0] = f32_to_u24(l);
+                    frame[1] = f32_to_u24(r);
+                    if usb_producer.enqueue(f32_to_i16(l)).is_err() {
+                        usb_dropped += 1;
+                    }
+                    if usb_producer.enqueue(f32_to_i16(r)).is_err() {
+                        usb_dropped += 1;
+                    }
+                }
+                if usb_capturing && usb_dropped > 0 {
+                    USB_DROP.fetch_add(usb_dropped, Ordering::Relaxed);
+                }
+
+                PLAYED_FRAMES.fetch_add((n / 2) as u32, Ordering::Relaxed);
+                CB_FULL_US.fetch_max(cb_t.elapsed().as_micros() as u32, Ordering::Relaxed);
+            })
+            .await;
+        SAI_ERR.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Audio output, on the interrupt executor. Drains L,R pairs from the ring into

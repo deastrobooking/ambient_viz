@@ -11,6 +11,11 @@ edition = "2024"
 # build (`--no-default-features`) carries zero debug UART traffic or code.
 default = ["debug-uart"]
 debug-uart = []
+# `groovebox` replaces the SD-streaming exhibit pipeline with `dsp::Engine`
+# driven by GrooveEvent commands over CDC serial. Boot plays a default drum
+# pattern; CDC text lines are decoded as the shared groove protocol and fed
+# to the engine at audio-callback time.
+groovebox = []
 # `freeze` (OFF by default) compiles the master "freeze" parallel send: the grain
 # hold ring -> glitch tape -> return summed under the master. It's opt-in because
 # we don't currently like how it sounds; without it (the default) the ring
@@ -31,7 +36,9 @@ bell = []
 voice = []
 
 [dependencies]
-dsp = { path = "../dsp" }
+# No default features: disables Reverb and PingPongDelay which over-allocate for
+# the 504 KB AXI heap. Re-enable individually once SDRAM allocation is mapped.
+dsp = { path = "../dsp", default-features = false }
 
 # Pinned to a git rev because crates.io 0.2.3 depends on embassy-stm32 ^0.5.0
 # while master has moved to 0.6.0 — mixing them produces a `links = "embassy-time"`

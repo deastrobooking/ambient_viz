@@ -21,7 +21,7 @@
 use core::fmt::Write as _;
 use core::sync::atomic::Ordering;
 
-use dsp::{MidiByteParser, MidiMessage};
+use dsp::{GrooveEvent, MidiByteParser, MidiMessage};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver};
 use embassy_time::Timer;
@@ -42,6 +42,14 @@ pub static MIDI_CHANNEL: Channel<CriticalSectionRawMutex, MidiMessage, MIDI_CH_D
     Channel::new();
 /// Audio-task end of [`MIDI_CHANNEL`].
 pub type MidiRx = Receiver<'static, CriticalSectionRawMutex, MidiMessage, MIDI_CH_DEPTH>;
+
+/// Decoded GrooveEvents, from the CDC line-reader task to the groovebox audio
+/// task. Same lock-free pattern as [`MIDI_CHANNEL`].
+#[cfg(feature = "groovebox")]
+pub static GROOVE_CHANNEL: Channel<CriticalSectionRawMutex, GrooveEvent, 16> = Channel::new();
+/// Audio-task end of [`GROOVE_CHANNEL`].
+#[cfg(feature = "groovebox")]
+pub type GrooveRx = Receiver<'static, CriticalSectionRawMutex, GrooveEvent, 16>;
 
 /// Emit song-position lines (device -> host) on the CDC sender half.
 #[embassy_executor::task]
@@ -98,11 +106,8 @@ pub async fn position_emit_task(mut tx: CdcTx<'static, Drv>, loop_frames: u64) {
     }
 }
 
-/// Read inbound bytes (host -> device) on the CDC receiver half, frame them into
-/// MIDI messages, and forward to the audio task via [`MIDI_CHANNEL`]. The Pi
-/// bridge tunnels sensor/freeze CCs as raw 3-byte frames (`[0xB0|ch, cc, val]`)
-/// — same wire format as the planned TRS-UART MIDI input. Decoding happens here
-/// (off the RT path); the audio task only drains the channel + applies.
+/// Read inbound CDC bytes, frame them into MIDI messages, and forward to the
+/// audio task via [`MIDI_CHANNEL`]. Used by the legacy exhibit pipeline.
 #[embassy_executor::task]
 pub async fn midi_in_task(mut rx: CdcRx<'static, Drv>) {
     let sender = MIDI_CHANNEL.sender();
@@ -119,6 +124,50 @@ pub async fn midi_in_task(mut rx: CdcRx<'static, Drv>) {
                             // Drop if the audio task hasn't drained yet — never
                             // block the USB read on the audio path.
                             let _ = sender.try_send(msg);
+                        }
+                    }
+                }
+                Err(_) => break, // disconnected
+            }
+        }
+    }
+}
+
+/// Read inbound CDC text lines, parse them as GrooveEvent commands, and forward
+/// to the groovebox audio task via [`GROOVE_CHANNEL`]. Used by the groovebox
+/// firmware path. The Pi or host sends the same text protocol as the macOS TUI:
+///
+/// ```text
+/// PLAY 1\n   STOP\n   TOGGLE kick 0\n   MACRO filter_cutoff 80\n   …
+/// ```
+///
+/// Line accumulation is done here (off the RT path); the audio task drains the
+/// channel per-callback and applies each event to the shared Engine.
+#[cfg(feature = "groovebox")]
+#[embassy_executor::task]
+pub async fn groove_in_task(mut rx: CdcRx<'static, Drv>) {
+    let sender = GROOVE_CHANNEL.sender();
+    let mut raw = [0u8; 64];
+    let mut line: heapless::String<128> = heapless::String::new();
+    loop {
+        rx.wait_connection().await;
+        crate::dbg_uart!("cdc: groove-in connected");
+        loop {
+            match rx.read_packet(&mut raw).await {
+                Ok(n) => {
+                    for &b in &raw[..n] {
+                        if b == b'\n' || b == b'\r' {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                                if let Ok(evt) = dsp::groove::parse_line(trimmed) {
+                                    let _ = sender.try_send(evt);
+                                }
+                            }
+                            line.clear();
+                        } else {
+                            // Silently drop bytes that overflow the line buffer
+                            // (commands longer than 128 bytes are not valid).
+                            let _ = line.push(b as char);
                         }
                     }
                 }
